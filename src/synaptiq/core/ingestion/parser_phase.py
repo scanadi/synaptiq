@@ -74,6 +74,11 @@ def get_parser(language: str) -> LanguageParser:
 
         parser = TypeScriptParser(dialect="typescript")
 
+    elif language == "tsx":
+        from synaptiq.core.parsers.typescript import TypeScriptParser
+
+        parser = TypeScriptParser(dialect="tsx")
+
     elif language == "javascript":
         from synaptiq.core.parsers.typescript import TypeScriptParser
 

@@ -280,9 +280,21 @@ class PythonParser(LanguageParser):
         superclasses = node.child_by_field_name("superclasses")
         if superclasses is not None:
             for child in superclasses.children:
-                if child.is_named and child.type == "identifier":
+                if not child.is_named:
+                    continue
+                if child.type == "identifier":
                     parent_name = child.text.decode("utf8")
                     result.heritage.append((class_name, "extends", parent_name))
+                elif child.type == "attribute":
+                    # e.g. class Foo(module.Base): — capture "module.Base"
+                    parent_name = child.text.decode("utf8")
+                    result.heritage.append((class_name, "extends", parent_name))
+                elif child.type == "subscript":
+                    # e.g. class Foo(Generic[T]): — capture "Generic"
+                    base = child.child_by_field_name("value")
+                    if base is not None:
+                        parent_name = base.text.decode("utf8")
+                        result.heritage.append((class_name, "extends", parent_name))
 
         body = node.child_by_field_name("body")
         if body is not None:
@@ -333,8 +345,21 @@ class PythonParser(LanguageParser):
             if child.type == "import":
                 past_import = True
                 continue
-            if past_import and child.type == "dotted_name":
+            if not past_import:
+                continue
+            # Handle both bare names and parenthesized import lists.
+            if child.type in ("dotted_name", "identifier"):
                 names.append(child.text.decode("utf8"))
+            elif child.type == "import_as_names":
+                for sub in child.children:
+                    if sub.type in ("dotted_name", "identifier"):
+                        names.append(sub.text.decode("utf8"))
+                    elif sub.type == "aliased_import":
+                        name_node = sub.child_by_field_name("name")
+                        if name_node:
+                            names.append(name_node.text.decode("utf8"))
+            elif child.type == "wildcard_import":
+                names.append("*")
 
         result.imports.append(
             ImportInfo(

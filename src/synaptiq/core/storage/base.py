@@ -91,6 +91,28 @@ class StorageBackend(Protocol):
         """
         ...
 
+    def traverse_with_depth(
+        self, start_id: str, depth: int, direction: str = "callers"
+    ) -> list[tuple[GraphNode, int]]:
+        """Like :meth:`traverse` but returns ``(node, hop_distance)`` pairs."""
+        ...
+
+    def get_callers_with_confidence(self, node_id: str) -> list[tuple[GraphNode, float]]:
+        """Return callers paired with the CALLS edge confidence score."""
+        ...
+
+    def get_callees_with_confidence(self, node_id: str) -> list[tuple[GraphNode, float]]:
+        """Return callees paired with the CALLS edge confidence score."""
+        ...
+
+    def get_process_memberships(self, node_ids: list[str]) -> dict[str, str]:
+        """Return ``{node_id: process_name}`` for nodes that belong to a process."""
+        ...
+
+    def load_graph(self) -> KnowledgeGraph:
+        """Load the full graph into an in-memory KnowledgeGraph."""
+        ...
+
     def execute_raw(self, query: str, parameters: dict[str, Any] | None = None) -> Any:
         """Execute a raw backend-specific query string with optional parameters."""
         ...

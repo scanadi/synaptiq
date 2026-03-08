@@ -52,9 +52,12 @@ def mock_storage():
     )
     storage.get_callers.return_value = []
     storage.get_callees.return_value = []
+    storage.get_callers_with_confidence.return_value = []
+    storage.get_callees_with_confidence.return_value = []
     storage.get_type_refs.return_value = []
     storage.vector_search.return_value = []
     storage.traverse.return_value = []
+    storage.traverse_with_depth.return_value = []
     storage.execute_raw.return_value = []
     return storage
 
@@ -62,26 +65,26 @@ def mock_storage():
 @pytest.fixture
 def mock_storage_with_relations(mock_storage):
     """Storage mock with callers, callees, and type refs populated."""
-    mock_storage.get_callers.return_value = [
-        GraphNode(
-            id="function:src/routes/auth.py:login_handler",
-            label=NodeLabel.FUNCTION,
-            name="login_handler",
-            file_path="src/routes/auth.py",
-            start_line=12,
-            end_line=40,
-        ),
-    ]
-    mock_storage.get_callees.return_value = [
-        GraphNode(
-            id="function:src/auth/crypto.py:hash_password",
-            label=NodeLabel.FUNCTION,
-            name="hash_password",
-            file_path="src/auth/crypto.py",
-            start_line=5,
-            end_line=20,
-        ),
-    ]
+    _caller = GraphNode(
+        id="function:src/routes/auth.py:login_handler",
+        label=NodeLabel.FUNCTION,
+        name="login_handler",
+        file_path="src/routes/auth.py",
+        start_line=12,
+        end_line=40,
+    )
+    _callee = GraphNode(
+        id="function:src/auth/crypto.py:hash_password",
+        label=NodeLabel.FUNCTION,
+        name="hash_password",
+        file_path="src/auth/crypto.py",
+        start_line=5,
+        end_line=20,
+    )
+    mock_storage.get_callers.return_value = [_caller]
+    mock_storage.get_callees.return_value = [_callee]
+    mock_storage.get_callers_with_confidence.return_value = [(_caller, 1.0)]
+    mock_storage.get_callees_with_confidence.return_value = [(_callee, 1.0)]
     mock_storage.get_type_refs.return_value = [
         GraphNode(
             id="class:src/models.py:User",
@@ -232,28 +235,31 @@ class TestHandleImpact:
         assert "No upstream callers found" in result or "No downstream dependencies" in result
 
     def test_with_affected_symbols(self, mock_storage):
-        """Returns formatted impact list when traverse finds nodes."""
-        mock_storage.traverse.return_value = [
-            GraphNode(
-                id="function:src/api.py:login",
-                label=NodeLabel.FUNCTION,
-                name="login",
-                file_path="src/api.py",
-                start_line=5,
-                end_line=20,
-            ),
-            GraphNode(
-                id="function:src/api.py:register",
-                label=NodeLabel.FUNCTION,
-                name="register",
-                file_path="src/api.py",
-                start_line=25,
-                end_line=50,
-            ),
+        """Returns formatted impact list when traverse_with_depth finds nodes."""
+        _login = GraphNode(
+            id="function:src/api.py:login",
+            label=NodeLabel.FUNCTION,
+            name="login",
+            file_path="src/api.py",
+            start_line=5,
+            end_line=20,
+        )
+        _register = GraphNode(
+            id="function:src/api.py:register",
+            label=NodeLabel.FUNCTION,
+            name="register",
+            file_path="src/api.py",
+            start_line=25,
+            end_line=50,
+        )
+        mock_storage.traverse_with_depth.return_value = [
+            (_login, 1),
+            (_register, 2),
         ]
+        mock_storage.get_callers_with_confidence.return_value = [(_login, 1.0)]
         result = handle_impact(mock_storage, "validate", depth=2)
         assert "Impact analysis for: validate" in result
-        assert "Total affected symbols: 2" in result
+        assert "Total: 2 symbols" in result
         assert "login" in result
         assert "register" in result
         assert "Depth: 2" in result

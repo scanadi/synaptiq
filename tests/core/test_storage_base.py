@@ -131,6 +131,22 @@ class TestStorageBackend:
             def bulk_load(self, graph):
                 pass
 
+            def traverse_with_depth(self, start_id, depth, direction="callers"):
+                return []
+
+            def get_callers_with_confidence(self, node_id):
+                return []
+
+            def get_callees_with_confidence(self, node_id):
+                return []
+
+            def get_process_memberships(self, node_ids):
+                return {}
+
+            def load_graph(self):
+                from synaptiq.core.graph.graph import KnowledgeGraph
+                return KnowledgeGraph()
+
         assert isinstance(_DummyBackend(), StorageBackend)
 
     def test_non_conforming_class_fails(self) -> None:

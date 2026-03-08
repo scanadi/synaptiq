@@ -34,6 +34,23 @@ _PYTHON_DECORATOR_PATTERNS: tuple[str, ...] = (
     "@click.command",
 )
 
+# TypeScript files where exports are true entry points (index/entry/app files).
+_TS_ENTRY_SUFFIXES: tuple[str, ...] = (
+    "index.ts", "index.tsx", "index.js", "index.jsx",
+    "main.ts", "main.tsx", "main.js",
+    "app.ts", "app.tsx", "app.js",
+    "server.ts", "server.js",
+    "handler.ts", "handler.js",
+    "route.ts", "route.tsx",
+    "page.tsx", "page.ts",
+    "layout.tsx", "layout.ts",
+)
+
+
+def _is_ts_entry_file(file_path: str) -> bool:
+    """Return ``True`` if *file_path* is a recognised TypeScript entry file."""
+    return any(file_path.endswith(suffix) for suffix in _TS_ENTRY_SUFFIXES)
+
 def find_entry_points(graph: KnowledgeGraph) -> list[GraphNode]:
     """Find functions/methods that serve as execution entry points.
 
@@ -107,12 +124,12 @@ def _matches_framework_pattern(node: GraphNode) -> bool:
             if pattern in content:
                 return True
 
-    if language in ("typescript", "ts", "") or node.file_path.endswith(
+    if language in ("typescript", "tsx", "ts", "") or node.file_path.endswith(
         (".ts", ".tsx")
     ):
         if name in ("handler", "middleware"):
             return True
-        if node.is_exported:
+        if node.is_exported and _is_ts_entry_file(node.file_path):
             return True
 
     return False

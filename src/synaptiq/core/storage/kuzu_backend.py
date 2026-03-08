@@ -75,6 +75,12 @@ def _escape(value: str) -> str:
     """Escape a string for safe inclusion in a Cypher literal."""
     return value.replace("\\", "\\\\").replace("'", "\\'")
 
+
+def escape_cypher(value: str) -> str:
+    """Public alias for escaping strings in Cypher queries."""
+    return _escape(value)
+
+
 def _table_for_id(node_id: str) -> str | None:
     """Extract the table name from a node ID by mapping its label prefix."""
     prefix = node_id.split(":", 1)[0]
@@ -347,6 +353,167 @@ class KuzuBackend:
                 )
 
         return nodes
+
+    def traverse_with_depth(
+        self, start_id: str, depth: int, direction: str = "callers"
+    ) -> list[tuple[GraphNode, int]]:
+        """Like :meth:`traverse` but returns ``(node, hop_distance)`` pairs."""
+        start_table = _table_for_id(start_id)
+        if start_table is None:
+            return []
+
+        visited: set[str] = {start_id}
+        result_list: list[tuple[GraphNode, int]] = []
+        current_ids: list[str] = [start_id]
+
+        with self._read_conn() as conn:
+            for level in range(1, depth + 1):
+                if not current_ids:
+                    break
+                neighbors = self._get_neighbors_batch(conn, current_ids, direction)
+                next_ids: list[str] = []
+                for node in neighbors:
+                    if node.id not in visited:
+                        visited.add(node.id)
+                        result_list.append((node, level))
+                        next_ids.append(node.id)
+                current_ids = next_ids
+
+        return result_list
+
+    def get_callers_with_confidence(self, node_id: str) -> list[tuple[GraphNode, float]]:
+        """Return callers paired with the CALLS edge confidence score."""
+        table = _table_for_id(node_id)
+        if table is None:
+            return []
+
+        results: list[tuple[GraphNode, float]] = []
+        with self._read_conn() as conn:
+            for src_table in _SEARCHABLE_TABLES:
+                query = (
+                    f"MATCH (caller:{src_table})-[r:CodeRelation]->(callee:{table}) "
+                    f"WHERE callee.id = $nid AND r.rel_type = 'calls' "
+                    f"RETURN caller.*, r.confidence"
+                )
+                try:
+                    result = conn.execute(query, parameters={"nid": node_id})
+                    while result.has_next():
+                        row = result.get_next()
+                        conf = float(row[-1]) if row[-1] is not None else 1.0
+                        node = self._row_to_node(row[:-1])
+                        if node is not None:
+                            results.append((node, conf))
+                except Exception:
+                    pass
+        return results
+
+    def get_callees_with_confidence(self, node_id: str) -> list[tuple[GraphNode, float]]:
+        """Return callees paired with the CALLS edge confidence score."""
+        table = _table_for_id(node_id)
+        if table is None:
+            return []
+
+        results: list[tuple[GraphNode, float]] = []
+        with self._read_conn() as conn:
+            for tgt_table in _SEARCHABLE_TABLES:
+                query = (
+                    f"MATCH (caller:{table})-[r:CodeRelation]->(callee:{tgt_table}) "
+                    f"WHERE caller.id = $nid AND r.rel_type = 'calls' "
+                    f"RETURN callee.*, r.confidence"
+                )
+                try:
+                    result = conn.execute(query, parameters={"nid": node_id})
+                    while result.has_next():
+                        row = result.get_next()
+                        conf = float(row[-1]) if row[-1] is not None else 1.0
+                        node = self._row_to_node(row[:-1])
+                        if node is not None:
+                            results.append((node, conf))
+                except Exception:
+                    pass
+        return results
+
+    def get_process_memberships(self, node_ids: list[str]) -> dict[str, str]:
+        """Return ``{node_id: process_name}`` for nodes that belong to a process."""
+        mapping: dict[str, str] = {}
+        ids_by_table: dict[str, list[str]] = {}
+        for nid in node_ids:
+            table = _table_for_id(nid)
+            if table:
+                ids_by_table.setdefault(table, []).append(nid)
+
+        with self._read_conn() as conn:
+            for table, ids in ids_by_table.items():
+                query = (
+                    f"MATCH (n:{table})-[r:CodeRelation]->(p:Process) "
+                    f"WHERE n.id IN $ids AND r.rel_type = 'step_in_process' "
+                    f"RETURN n.id, p.name"
+                )
+                try:
+                    result = conn.execute(query, parameters={"ids": ids})
+                    while result.has_next():
+                        row = result.get_next()
+                        if row[0] and row[1]:
+                            mapping[row[0]] = row[1]
+                except Exception:
+                    pass
+        return mapping
+
+    def load_graph(self) -> KnowledgeGraph:
+        """Load the full graph into an in-memory KnowledgeGraph."""
+        graph = KnowledgeGraph()
+        with self._read_conn() as conn:
+            for table in _NODE_TABLE_NAMES:
+                try:
+                    result = conn.execute(f"MATCH (n:{table}) RETURN n.*")
+                    while result.has_next():
+                        row = result.get_next()
+                        node = self._row_to_node(row)
+                        if node is not None:
+                            graph.add_node(node)
+                except Exception:
+                    logger.debug("load_graph: failed to load %s nodes", table, exc_info=True)
+
+            for src_table in _NODE_TABLE_NAMES:
+                for dst_table in _NODE_TABLE_NAMES:
+                    try:
+                        result = conn.execute(
+                            f"MATCH (a:{src_table})-[r:CodeRelation]->(b:{dst_table}) "
+                            f"RETURN a.id, b.id, r.rel_type, r.confidence, r.symbols, "
+                            f"r.strength, r.co_changes, r.step_number, r.role"
+                        )
+                        while result.has_next():
+                            row = result.get_next()
+                            from synaptiq.core.graph.model import RelType as RelTypeEnum
+                            rel_type_str = row[2] or "calls"
+                            try:
+                                rel_type = RelTypeEnum(rel_type_str)
+                            except ValueError:
+                                continue
+                            rel_id = f"{rel_type_str}:{row[0]}->{row[1]}"
+                            props: dict[str, Any] = {}
+                            if row[3] is not None:
+                                props["confidence"] = float(row[3])
+                            if row[4]:
+                                props["symbols"] = str(row[4])
+                            if row[5] is not None:
+                                props["strength"] = float(row[5])
+                            if row[6] is not None:
+                                props["co_changes"] = int(row[6])
+                            if row[7] is not None:
+                                props["step_number"] = int(row[7])
+                            if row[8]:
+                                props["role"] = str(row[8])
+                            graph.add_relationship(GraphRelationship(
+                                id=rel_id,
+                                type=rel_type,
+                                source=row[0],
+                                target=row[1],
+                                properties=props,
+                            ))
+                    except Exception:
+                        pass
+        return graph
 
     def execute_raw(
         self, query: str, parameters: dict[str, Any] | None = None

@@ -1,6 +1,6 @@
 """MCP server for Synaptiq — exposes code intelligence tools over stdio transport.
 
-Registers seven tools and three resources that give AI agents and MCP clients
+Registers fifteen tools and three resources that give AI agents and MCP clients
 access to the Synaptiq knowledge graph.  The server lazily initialises a
 :class:`KuzuBackend` from the ``.synaptiq/kuzu`` directory in the current
 working directory.
@@ -39,13 +39,21 @@ if TYPE_CHECKING:
     from synaptiq.core.daemon.socket_client import SocketClient
 
 from synaptiq.mcp.tools import (
+    handle_call_path,
+    handle_communities,
     handle_context,
+    handle_coupling,
+    handle_cycles,
     handle_cypher,
     handle_dead_code,
     handle_detect_changes,
+    handle_explain,
+    handle_file_context,
     handle_impact,
     handle_list_repos,
     handle_query,
+    handle_review_risk,
+    handle_test_impact,
 )
 
 logger = logging.getLogger(__name__)
@@ -138,7 +146,7 @@ TOOLS: list[Tool] = [
         name="synaptiq_context",
         description=(
             "Get a 360-degree view of a symbol: callers, callees, type references, "
-            "and community membership."
+            "heritage, and community membership."
         ),
         inputSchema={
             "type": "object",
@@ -154,7 +162,8 @@ TOOLS: list[Tool] = [
     Tool(
         name="synaptiq_impact",
         description=(
-            "Blast radius analysis: find all symbols affected by changing a given symbol."
+            "Blast radius analysis: find all symbols affected by changing a given symbol, "
+            "grouped by depth with confidence scores."
         ),
         inputSchema={
             "type": "object",
@@ -165,7 +174,7 @@ TOOLS: list[Tool] = [
                 },
                 "depth": {
                     "type": "integer",
-                    "description": "Maximum traversal depth (default 3).",
+                    "description": "Maximum traversal depth (default 3, max 10).",
                     "default": 3,
                 },
             },
@@ -211,6 +220,157 @@ TOOLS: list[Tool] = [
             "required": ["query"],
         },
     ),
+    Tool(
+        name="synaptiq_coupling",
+        description=(
+            "Show temporal coupling for a file: which files change together in git history, "
+            "and flag hidden dependencies (co-change without static import)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Relative file path to analyse.",
+                },
+                "min_strength": {
+                    "type": "number",
+                    "description": "Minimum coupling strength threshold (default 0.3).",
+                    "default": 0.3,
+                },
+            },
+            "required": ["file_path"],
+        },
+    ),
+    Tool(
+        name="synaptiq_call_path",
+        description=(
+            "Find the shortest call chain between two symbols via BFS traversal."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "from_symbol": {
+                    "type": "string",
+                    "description": "Name of the source symbol.",
+                },
+                "to_symbol": {
+                    "type": "string",
+                    "description": "Name of the target symbol.",
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "description": "Maximum BFS depth (default 10).",
+                    "default": 10,
+                },
+            },
+            "required": ["from_symbol", "to_symbol"],
+        },
+    ),
+    Tool(
+        name="synaptiq_communities",
+        description=(
+            "List detected communities (Leiden clusters), or drill into a specific "
+            "community to see its members and cross-community processes."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "community": {
+                    "type": "string",
+                    "description": "Optional community name to drill into.",
+                },
+            },
+        },
+    ),
+    Tool(
+        name="synaptiq_explain",
+        description=(
+            "Get a narrative explanation of a symbol: its role, callers, callees, "
+            "community, and process memberships."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "symbol": {
+                    "type": "string",
+                    "description": "Name of the symbol to explain.",
+                },
+            },
+            "required": ["symbol"],
+        },
+    ),
+    Tool(
+        name="synaptiq_review_risk",
+        description=(
+            "Assess PR risk from a git diff: scores risk based on entry point hits, "
+            "missing co-change files, downstream dependents, and community crossings."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "diff": {
+                    "type": "string",
+                    "description": "Raw git diff output.",
+                },
+            },
+            "required": ["diff"],
+        },
+    ),
+    Tool(
+        name="synaptiq_file_context",
+        description=(
+            "Get comprehensive context for a file: symbols, imports, importers, "
+            "coupling, dead code, and communities."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Relative file path to analyse.",
+                },
+            },
+            "required": ["file_path"],
+        },
+    ),
+    Tool(
+        name="synaptiq_cycles",
+        description=(
+            "Detect circular dependencies using strongly connected components (igraph)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "min_size": {
+                    "type": "integer",
+                    "description": "Minimum cycle size to report (default 2).",
+                    "default": 2,
+                },
+            },
+        },
+    ),
+    Tool(
+        name="synaptiq_test_impact",
+        description=(
+            "Find tests likely affected by code changes. Accepts either a git diff "
+            "or a list of symbol names."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "diff": {
+                    "type": "string",
+                    "description": "Raw git diff output.",
+                },
+                "symbols": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of symbol names to check test impact for.",
+                },
+            },
+        },
+    ),
 ]
 
 @server.list_tools()
@@ -234,6 +394,35 @@ def dispatch_tool(name: str, arguments: dict, storage: KuzuBackend) -> str:
         return handle_detect_changes(storage, arguments.get("diff", ""))
     elif name == "synaptiq_cypher":
         return handle_cypher(storage, arguments.get("query", ""))
+    elif name == "synaptiq_coupling":
+        return handle_coupling(
+            storage,
+            arguments.get("file_path", ""),
+            min_strength=arguments.get("min_strength", 0.3),
+        )
+    elif name == "synaptiq_call_path":
+        return handle_call_path(
+            storage,
+            arguments.get("from_symbol", ""),
+            arguments.get("to_symbol", ""),
+            max_depth=arguments.get("max_depth", 10),
+        )
+    elif name == "synaptiq_communities":
+        return handle_communities(storage, community=arguments.get("community"))
+    elif name == "synaptiq_explain":
+        return handle_explain(storage, arguments.get("symbol", ""))
+    elif name == "synaptiq_review_risk":
+        return handle_review_risk(storage, arguments.get("diff", ""))
+    elif name == "synaptiq_file_context":
+        return handle_file_context(storage, arguments.get("file_path", ""))
+    elif name == "synaptiq_cycles":
+        return handle_cycles(storage, min_size=arguments.get("min_size", 2))
+    elif name == "synaptiq_test_impact":
+        return handle_test_impact(
+            storage,
+            diff=arguments.get("diff", ""),
+            symbols=arguments.get("symbols"),
+        )
     else:
         return f"Unknown tool: {name}"
 

@@ -43,11 +43,77 @@ _KIND_TO_LABEL: dict[str, NodeLabel] = {
     "class": NodeLabel.CLASS,
 }
 
+# Names that should never produce CALLS edges.  These are language builtins,
+# stdlib utilities, framework hooks, and common JS/TS globals whose definitions
+# do not exist in the user's codebase.  Filtering them before resolution
+# prevents low-confidence global-fuzzy matches against short, common names.
+_CALL_BLOCKLIST: frozenset[str] = frozenset({
+    # Python builtins
+    "print", "len", "range", "map", "filter", "sorted", "list", "dict",
+    "set", "str", "int", "float", "bool", "type", "super", "isinstance",
+    "issubclass", "hasattr", "getattr", "setattr", "open", "iter", "next",
+    "zip", "enumerate", "any", "all", "min", "max", "sum", "abs", "round",
+    "repr", "id", "hash", "dir", "vars", "input", "format", "tuple",
+    "frozenset", "bytes", "bytearray", "memoryview", "object", "property",
+    "classmethod", "staticmethod", "delattr", "callable", "compile", "eval",
+    "exec", "globals", "locals", "breakpoint", "exit", "quit",
+    # Python stdlib — common method names that collide with user-defined symbols
+    "append", "extend", "update", "pop", "get", "items", "keys", "values",
+    "split", "join", "strip", "replace", "startswith", "endswith", "lower",
+    "upper", "encode", "decode", "read", "write", "close",
+    # JS/TS built-in globals
+    "console", "setTimeout", "setInterval", "clearTimeout", "clearInterval",
+    "JSON", "Array", "Object", "Promise", "Math", "Date", "Error", "Symbol",
+    "parseInt", "parseFloat", "isNaN", "isFinite", "encodeURIComponent",
+    "decodeURIComponent", "fetch", "require", "exports", "module",
+    "document", "window", "process", "Buffer", "URL",
+    # JS/TS dotted method names extracted as bare call names
+    "log", "error", "warn", "info", "debug",
+    "parse", "stringify",
+    "assign", "freeze",
+    "isArray", "from", "of",
+    "resolve", "reject", "race",
+    "floor", "ceil", "random",
+    # React hooks
+    "useState", "useEffect", "useRef", "useCallback", "useMemo",
+    "useContext", "useReducer", "useLayoutEffect", "useImperativeHandle",
+    "useDebugValue", "useId", "useTransition", "useDeferredValue",
+})
+
+
+def _build_import_cache(
+    file_path: str,
+    graph: KnowledgeGraph,
+) -> dict[str, set[str]]:
+    """Build {symbol_name -> set of imported file_paths} for a file.
+
+    The special key ``"*"`` contains file paths from wildcard/full-module imports.
+    """
+    source_file_id = generate_id(NodeLabel.FILE, file_path)
+    import_rels = graph.get_outgoing(source_file_id, RelType.IMPORTS)
+
+    cache: dict[str, set[str]] = {}
+    for rel in import_rels:
+        target_node = graph.get_node(rel.target)
+        if target_node is None:
+            continue
+        symbols_str = rel.properties.get("symbols", "")
+        imported_names = {s.strip() for s in symbols_str.split(",") if s.strip()}
+        if not imported_names:
+            cache.setdefault("*", set()).add(target_node.file_path)
+        else:
+            for sym_name in imported_names:
+                cache.setdefault(sym_name, set()).add(target_node.file_path)
+    return cache
+
+
 def resolve_call(
     call: CallInfo,
     file_path: str,
     call_index: dict[str, list[str]],
     graph: KnowledgeGraph,
+    caller_class_name: str | None = None,
+    import_cache: dict[str, set[str]] | None = None,
 ) -> tuple[str | None, float]:
     """Resolve a call expression to a target node ID and confidence score.
 
@@ -58,8 +124,9 @@ def resolve_call(
     2. **Import-resolved match** (confidence 1.0) -- the called name was
        imported into this file; find the symbol in the imported file.
     3. **Global fuzzy match** (confidence 0.5) -- any symbol with this name
-       anywhere in the codebase.  If multiple matches exist, the one with
-       the shortest file path is chosen (heuristic for proximity).
+       anywhere in the codebase.  If multiple matches exist, the one sharing
+       the longest directory prefix with the caller is preferred.
+       Skipped when there are more than 5 candidates (too ambiguous).
 
     For method calls (``call.receiver`` is non-empty):
     - If the receiver is ``"self"`` or ``"this"``, look for a method with
@@ -72,6 +139,9 @@ def resolve_call(
         call_index: Mapping from symbol names to node IDs built by
             :func:`build_call_index`.
         graph: The knowledge graph.
+        caller_class_name: Optional class name of the calling symbol,
+            used to scope ``self``/``this`` method resolution.
+        import_cache: Optional pre-built import cache for the file.
 
     Returns:
         A tuple of ``(node_id, confidence)`` or ``(None, 0.0)`` if the
@@ -81,7 +151,7 @@ def resolve_call(
     receiver = call.receiver
 
     if receiver in ("self", "this"):
-        result = _resolve_self_method(name, file_path, call_index, graph)
+        result = _resolve_self_method(name, file_path, call_index, graph, caller_class_name)
         if result is not None:
             return result, 1.0
 
@@ -97,24 +167,32 @@ def resolve_call(
             return nid, 1.0
 
     # 2. Import-resolved match.
-    imported_target = _resolve_via_imports(name, file_path, candidate_ids, graph)
+    effective_cache = import_cache if import_cache is not None else _build_import_cache(
+        file_path, graph
+    )
+    imported_target = _resolve_via_imports(name, candidate_ids, graph, effective_cache)
     if imported_target is not None:
         return imported_target, 1.0
 
-    # 3. Global fuzzy match -- prefer shortest file path.
-    return _pick_closest(candidate_ids, graph), 0.5
+    # 3. Global fuzzy match — skip when too many candidates (ambiguous).
+    if len(candidate_ids) > 5:
+        return None, 0.0
+    return _pick_closest(candidate_ids, graph, caller_file_path=file_path), 0.5
 
 def _resolve_self_method(
     method_name: str,
     file_path: str,
     call_index: dict[str, list[str]],
     graph: KnowledgeGraph,
+    caller_class_name: str | None = None,
 ) -> str | None:
-    """Find a method with *method_name* in the same file (same class).
+    """Find a method with *method_name* in the same file and class.
 
     When the receiver is ``self`` or ``this`` the target must be a Method
-    node defined in the same file.
+    node defined in the same file.  If *caller_class_name* is provided,
+    candidates are further filtered to the same class.
     """
+    fallback: str | None = None
     for nid in call_index.get(method_name, []):
         node = graph.get_node(nid)
         if (
@@ -122,64 +200,79 @@ def _resolve_self_method(
             and node.label == NodeLabel.METHOD
             and node.file_path == file_path
         ):
-            return nid
-    return None
+            if caller_class_name and node.class_name == caller_class_name:
+                return nid
+            if fallback is None:
+                fallback = nid
+    return fallback
 
 def _resolve_via_imports(
     name: str,
-    file_path: str,
     candidate_ids: list[str],
     graph: KnowledgeGraph,
+    import_cache: dict[str, set[str]],
 ) -> str | None:
-    """Check if *name* was imported into *file_path* and resolve to the target.
+    """Check if *name* was imported and resolve to the target using cached data.
 
-    Looks at IMPORTS relationships originating from this file's File node.
-    For each imported file, checks whether any candidate symbol is defined
-    there.  Also checks the ``symbols`` property to see if the specific
-    name was explicitly imported.
+    Uses the pre-built *import_cache* (from :func:`_build_import_cache`)
+    to avoid re-scanning IMPORTS relationships for every call in the same file.
     """
-    source_file_id = generate_id(NodeLabel.FILE, file_path)
-    import_rels = graph.get_outgoing(source_file_id, RelType.IMPORTS)
-
-    if not import_rels:
+    if not import_cache:
         return None
 
-    # Collect file paths of imported files, optionally filtering by
-    # the imported symbol names.
-    imported_file_ids: set[str] = set()
-    for rel in import_rels:
-        symbols_str = rel.properties.get("symbols", "")
-        imported_names = {s.strip() for s in symbols_str.split(",") if s.strip()}
-
-        # If the specific name was imported, or if it's a wildcard/full
-        # module import (no specific names), include this target file.
-        if not imported_names or name in imported_names:
-            target_node = graph.get_node(rel.target)
-            if target_node is not None:
-                imported_file_ids.add(target_node.file_path)
+    imported_file_paths = import_cache.get(name, set()) | import_cache.get("*", set())
+    if not imported_file_paths:
+        return None
 
     for nid in candidate_ids:
         node = graph.get_node(nid)
-        if node is not None and node.file_path in imported_file_ids:
+        if node is not None and node.file_path in imported_file_paths:
             return nid
 
     return None
 
-def _pick_closest(candidate_ids: list[str], graph: KnowledgeGraph) -> str | None:
-    """Pick the candidate with the shortest file path (proximity heuristic).
 
+def _common_prefix_len(a: str, b: str) -> int:
+    """Return the length of the common directory prefix between two paths."""
+    parts_a = a.split("/")
+    parts_b = b.split("/")
+    common = 0
+    for pa, pb in zip(parts_a, parts_b):
+        if pa == pb:
+            common += 1
+        else:
+            break
+    return common
+
+
+def _pick_closest(
+    candidate_ids: list[str],
+    graph: KnowledgeGraph,
+    caller_file_path: str = "",
+) -> str | None:
+    """Pick the candidate sharing the longest directory prefix with the caller.
+
+    Falls back to shortest file path when no caller path is provided.
     Returns ``None`` if no candidates can be resolved to actual nodes.
     """
     best_id: str | None = None
-    best_path_len = float("inf")
+    best_score: tuple[int, int] = (-1, 0)
 
     for nid in candidate_ids:
         node = graph.get_node(nid)
-        if node is not None and len(node.file_path) < best_path_len:
-            best_path_len = len(node.file_path)
+        if node is None:
+            continue
+        if caller_file_path:
+            prefix = _common_prefix_len(caller_file_path, node.file_path)
+            score = (prefix, -len(node.file_path))
+        else:
+            score = (0, -len(node.file_path))
+        if score > best_score:
+            best_score = score
             best_id = nid
 
     return best_id
+
 
 def _add_calls_edge(
     source_id: str,
@@ -253,6 +346,7 @@ def process_calls(
        target, with a ``confidence`` property.
 
     Skips calls where:
+    - The call name is in the blocklist (builtins/stdlib/globals).
     - The containing symbol cannot be determined.
     - The target cannot be resolved.
     - A relationship with the same ID already exists (deduplication).
@@ -266,7 +360,13 @@ def process_calls(
     seen: set[str] = set()
 
     for fpd in parse_data:
+        import_cache = _build_import_cache(fpd.file_path, graph)
+
         for call in fpd.parse_result.calls:
+            # Skip builtins/stdlib names unless it's a self/this method call.
+            if call.name in _CALL_BLOCKLIST and call.receiver not in ("self", "this"):
+                continue
+
             source_id = find_containing_symbol(
                 call.line, fpd.file_path, file_sym_index
             )
@@ -279,8 +379,17 @@ def process_calls(
                 )
                 continue
 
+            # Determine caller class for self/this resolution.
+            caller_class_name: str | None = None
+            if call.receiver in ("self", "this"):
+                source_node = graph.get_node(source_id)
+                if source_node is not None:
+                    caller_class_name = source_node.class_name
+
             target_id, confidence = resolve_call(
-                call, fpd.file_path, call_index, graph
+                call, fpd.file_path, call_index, graph,
+                caller_class_name=caller_class_name,
+                import_cache=import_cache,
             )
             if target_id is not None:
                 _add_calls_edge(source_id, target_id, confidence, graph, seen)
@@ -288,9 +397,12 @@ def process_calls(
             # Callback arguments: bare identifiers passed as arguments
             # (e.g. map(transform, items), Depends(get_db)).
             for arg_name in call.arguments:
+                if arg_name in _CALL_BLOCKLIST:
+                    continue
                 arg_call = CallInfo(name=arg_name, line=call.line)
                 arg_id, arg_conf = resolve_call(
-                    arg_call, fpd.file_path, call_index, graph
+                    arg_call, fpd.file_path, call_index, graph,
+                    import_cache=import_cache,
                 )
                 if arg_id is not None:
                     _add_calls_edge(source_id, arg_id, arg_conf * 0.8, graph, seen)
@@ -300,7 +412,8 @@ def process_calls(
             if receiver and receiver not in ("self", "this"):
                 receiver_call = CallInfo(name=receiver, line=call.line)
                 recv_id, recv_conf = resolve_call(
-                    receiver_call, fpd.file_path, call_index, graph
+                    receiver_call, fpd.file_path, call_index, graph,
+                    import_cache=import_cache,
                 )
                 if recv_id is not None:
                     _add_calls_edge(source_id, recv_id, recv_conf, graph, seen)
@@ -333,13 +446,15 @@ def process_calls(
                 base_name = dec_name.rsplit(".", 1)[-1] if "." in dec_name else dec_name
                 call_obj = CallInfo(name=base_name, line=symbol.start_line)
                 target_id, confidence = resolve_call(
-                    call_obj, fpd.file_path, call_index, graph
+                    call_obj, fpd.file_path, call_index, graph,
+                    import_cache=import_cache,
                 )
                 if target_id is None and "." in dec_name:
                     # Try full dotted name as well.
                     call_obj = CallInfo(name=dec_name, line=symbol.start_line)
                     target_id, confidence = resolve_call(
-                        call_obj, fpd.file_path, call_index, graph
+                        call_obj, fpd.file_path, call_index, graph,
+                        import_cache=import_cache,
                     )
                 if target_id is None:
                     continue

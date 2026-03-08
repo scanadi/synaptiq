@@ -9,6 +9,7 @@ setting ``is_dead = True`` on the corresponding graph node.
 from __future__ import annotations
 
 import logging
+from pathlib import PurePosixPath
 
 from synaptiq.core.graph.graph import KnowledgeGraph
 from synaptiq.core.graph.model import GraphNode, NodeLabel, RelType
@@ -34,9 +35,16 @@ def _is_test_class(name: str) -> bool:
 def _is_test_file(file_path: str) -> bool:
     """Return ``True`` if the file is in a test directory or is a test file.
 
-    Matches paths containing ``/tests/`` or files named ``test_*.py``.
+    Uses path component matching rather than substring matching to avoid
+    false positives (e.g. ``contest/`` matching ``/test``).
     """
-    return "/tests/" in file_path or "/test_" in file_path or file_path.endswith("conftest.py")
+    parts = PurePosixPath(file_path).parts
+    return (
+        "tests" in parts
+        or "test" in parts
+        or any(p.startswith("test_") for p in parts)
+        or file_path.endswith("conftest.py")
+    )
 
 def _is_dunder(name: str) -> bool:
     """Return ``True`` if *name* is a dunder (double-underscore) method.

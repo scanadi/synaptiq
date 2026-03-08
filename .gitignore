@@ -19,3 +19,5 @@ wheels/
 
 # OS
 .DS_Store
+.env
+og/
