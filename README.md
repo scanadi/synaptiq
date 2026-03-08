@@ -317,6 +317,16 @@ cp -r "$(python -c 'import synaptiq; import pathlib; print(pathlib.Path(synaptiq
 
 Or manually copy `.claude/skills/synaptiq/SKILL.md` from the [Synaptiq repo](https://github.com/scanadi/synaptiq/tree/main/.claude/skills/synaptiq). This teaches Claude when and how to use Synaptiq's tools, the knowledge graph schema, Cypher query patterns, and investigation workflows.
 
+#### Claude Code Plugin
+
+For a batteries-included Claude Code experience, install the [Synaptiq Claude Plugin](https://github.com/scanadi/synaptiq-claude-plugin) — it bundles the MCP server, skill, setup command, and a session hook in a single install:
+
+```bash
+claude plugins add scanadi/synaptiq-claude-plugin
+```
+
+Then run `/synaptiq:setup` to install Synaptiq, index your codebase, and configure the MCP connection automatically.
+
 ### Setup for Cursor
 
 Add to your Cursor MCP settings:
