@@ -1,0 +1,88 @@
+name: Bug Report
+description: Report a bug in Synaptiq
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please fill out the information below to help us investigate.
+
+  - type: input
+    id: version
+    attributes:
+      label: Synaptiq Version
+      description: Run `synaptiq --version` or `pip show synaptiq`
+      placeholder: "0.5.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Which part of Synaptiq is affected?
+      options:
+        - Ingestion / Indexing
+        - MCP Server
+        - CLI
+        - Graph Storage (KuzuDB)
+        - Search (hybrid/vector/FTS)
+        - Python Parser
+        - TypeScript Parser
+        - Dead Code Analysis
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear description of the bug.
+      placeholder: Describe what happened...
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      description: Minimal steps to reproduce the behavior.
+      placeholder: |
+        1. Run `synaptiq analyze ./my-project`
+        2. Run `synaptiq query "find function foo"`
+        3. See error...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What you expected to happen.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error Output / Logs
+      description: Paste any relevant error messages or logs.
+      render: shell
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: |
+        Please provide:
+        - OS (e.g., macOS 15, Ubuntu 24.04)
+        - Python version
+        - Installation method (pip, uv, pipx)
+      placeholder: |
+        - OS: macOS 15.3
+        - Python: 3.12.1
+        - Installed via: uv pip install synaptiq
+    validations:
+      required: true
