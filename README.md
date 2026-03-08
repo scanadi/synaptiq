@@ -384,38 +384,51 @@ Synaptiq is designed for environments where multiple AI agents hit the same code
 
 ### Primary/Proxy Architecture
 
-```
-                    ┌─────────────────────────────────┐
-                    │         Primary Instance         │
-                    │                                  │
-                    │  ┌─────────┐  ┌──────────────┐  │
-  Agent 1 (MCP) ──>│  │   MCP   │  │  File Watcher │  │
-                    │  │  Server  │  │  (watchfiles) │  │
-                    │  └────┬────┘  └──────┬───────┘  │
-                    │       │              │           │
-                    │       v              v           │
-                    │  ┌──────────────────────────┐   │
-                    │  │   AsyncRWLock             │   │
-                    │  │   readers: concurrent     │   │
-                    │  │   writer: exclusive        │   │
-                    │  └────────────┬──────────────┘   │
-                    │               │                  │
-                    │  ┌────────────v──────────────┐   │
-                    │  │   KuzuDB + Connection Pool │  │
-                    │  │   (8 read connections)     │  │
-                    │  └───────────────────────────┘   │
-                    │               ^                  │
-                    │  ┌────────────┴──────────────┐   │
-                    │  │   Unix Socket Server       │   │
-                    │  │   (16 concurrent slots)    │   │
-                    │  └────────────^──────────────┘   │
-                    └───────────────┼──────────────────┘
-                                    │
-               ┌────────────────────┼────────────────────┐
-               │                    │                     │
-  Agent 2 ──> Proxy 1         Agent 3 ──> Proxy 2    Agent N ──> Proxy N
-              (MCP + Socket       (MCP + Socket           ...
-               Client)             Client)
+```mermaid
+flowchart TB
+    A1(["🤖 Agent 1"])
+    A2(["🤖 Agent 2"])
+    A3(["🤖 Agent 3"])
+    AN(["🤖 Agent N"])
+
+    subgraph PRIMARY ["🟢 Primary Instance"]
+        MCP["📡 MCP Server"]
+        FW["👁️ File Watcher<br/>watchfiles"]
+        RWL{{"🔒 AsyncRWLock<br/>concurrent reads · exclusive writes"}}
+        DB[(🗄️ KuzuDB + Pool<br/>8 read connections)]
+        SOCK["🔌 Unix Socket Server<br/>16 concurrent slots"]
+        MCP --> RWL
+        FW --> RWL
+        RWL --> DB
+        SOCK --> RWL
+    end
+
+    P1["🔵 Proxy 1<br/>MCP + Socket Client"]
+    P2["🔵 Proxy 2<br/>MCP + Socket Client"]
+    PN["🔵 Proxy N ···"]
+
+    A1 -->|MCP stdio| MCP
+    A2 --> P1
+    A3 --> P2
+    AN --> PN
+    P1 -->|unix socket| SOCK
+    P2 -->|unix socket| SOCK
+    PN -->|unix socket| SOCK
+
+    style PRIMARY fill:#ecfdf5,stroke:#10b981,stroke-width:2px
+    classDef agent fill:#fbbf24,stroke:#d97706,color:#000,stroke-width:2px
+    classDef server fill:#6ee7b7,stroke:#10b981,color:#000,stroke-width:2px
+    classDef lock fill:#c4b5fd,stroke:#8b5cf6,color:#000,stroke-width:2px
+    classDef database fill:#67e8f9,stroke:#06b6d4,color:#000,stroke-width:2px
+    classDef socket fill:#fda4af,stroke:#f43f5e,color:#000,stroke-width:2px
+    classDef proxy fill:#93c5fd,stroke:#3b82f6,color:#000,stroke-width:2px
+
+    class A1,A2,A3,AN agent
+    class MCP,FW server
+    class RWL lock
+    class DB database
+    class SOCK socket
+    class P1,P2,PN proxy
 ```
 
 **How it works:**
@@ -502,43 +515,64 @@ Examples:
 
 ## 🏗 Architecture
 
-```
-Source Code (.py, .ts, .js, .tsx, .jsx)
-    |
-    v
-+----------------------------------------------+
-|         Ingestion Pipeline (11 phases)        |
-|                                               |
-|  walk -> structure -> parse -> imports -> calls|
-|  -> heritage -> types -> communities          |
-|  -> processes -> dead_code -> coupling        |
-+----------------------+------------------------+
-                       |
-                       v
-              +-----------------+
-              | KnowledgeGraph  |  (in-memory during build)
-              +--------+--------+
-                       |
-          +------------+------------+
-          v            v            v
-     +---------+ +---------+ +---------+
-     | KuzuDB  | |  FTS    | | Vector  |
-     | (graph) | | (BM25)  | | (HNSW)  |
-     +----+----+ +----+----+ +----+----+
-          +------------+------------+
-                       |
-              StorageBackend Protocol
-                       |
-              +--------+--------+
-              v                 v
-        +----------+     +----------+
-        |   MCP    |     |   CLI    |
-        |  Server  |     | (Typer)  |
-        | (stdio)  |     |          |
-        +----+-----+     +----+-----+
-             |                |
-        Claude Code      Terminal
-        / Cursor         (developer)
+```mermaid
+flowchart TB
+    SRC(["📁 Source Code<br/>.py · .ts · .js · .tsx · .jsx"])
+
+    subgraph PIPELINE ["⚙️ Ingestion Pipeline — 11 Phases"]
+        direction LR
+        W["walk"] --> S["structure"] --> P["parse"] --> I["imports"] --> C["calls"] --> H["heritage"]
+        H --> T["types"] --> CM["communities"] --> PR["processes"] --> DC["dead_code"] --> CP["coupling"]
+    end
+
+    KG(["🧠 KnowledgeGraph<br/>in-memory during build"])
+
+    subgraph STORAGE ["💾 Storage Layer"]
+        direction LR
+        KUZU[(KuzuDB<br/>graph)]
+        FTS[(FTS<br/>BM25)]
+        VEC[(Vector<br/>HNSW)]
+    end
+
+    PROTO["⬡ StorageBackend Protocol"]
+
+    subgraph INTERFACE ["🖥️ Interface Layer"]
+        direction LR
+        MCP_OUT["📡 MCP Server<br/>stdio transport"]
+        CLI_OUT["⌨️ CLI<br/>Typer + Rich"]
+    end
+
+    CLAUDE(["🤖 Claude Code · Cursor"])
+    DEV(["👤 Developer Terminal"])
+
+    SRC --> PIPELINE
+    PIPELINE --> KG
+    KG --> STORAGE
+    STORAGE --> PROTO
+    PROTO --> MCP_OUT
+    PROTO --> CLI_OUT
+    MCP_OUT --> CLAUDE
+    CLI_OUT --> DEV
+
+    style PIPELINE fill:#fff7ed,stroke:#f97316,stroke-width:2px
+    style STORAGE fill:#eff6ff,stroke:#3b82f6,stroke-width:2px
+    style INTERFACE fill:#f0fdfa,stroke:#14b8a6,stroke-width:2px
+
+    classDef source fill:#d8b4fe,stroke:#a855f7,color:#000,stroke-width:2px
+    classDef phase fill:#fed7aa,stroke:#f97316,color:#000
+    classDef kg fill:#6ee7b7,stroke:#10b981,color:#000,stroke-width:2px
+    classDef store fill:#93c5fd,stroke:#3b82f6,color:#000,stroke-width:2px
+    classDef proto fill:#cbd5e1,stroke:#64748b,color:#000,stroke-width:2px
+    classDef iface fill:#5eead4,stroke:#14b8a6,color:#000,stroke-width:2px
+    classDef user fill:#fbbf24,stroke:#d97706,color:#000,stroke-width:2px
+
+    class SRC source
+    class W,S,P,I,C,H,T,CM,PR,DC,CP phase
+    class KG kg
+    class KUZU,FTS,VEC store
+    class PROTO proto
+    class MCP_OUT,CLI_OUT iface
+    class CLAUDE,DEV user
 ```
 
 ### Tech Stack
