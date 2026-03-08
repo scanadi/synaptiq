@@ -2,8 +2,12 @@
 
 **Graph-powered code intelligence engine** — indexes your codebase into a knowledge graph and exposes it via MCP tools for AI agents and a CLI for developers.
 
+[![PyPI version](https://img.shields.io/pypi/v/synaptiq)](https://pypi.org/project/synaptiq/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://pypi.org/project/synaptiq/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
 ```
-synaptiq analyze .
+$ synaptiq analyze .
 
 Phase 1:  Walking files...               142 files found
 Phase 3:  Parsing code...                142/142
@@ -23,11 +27,11 @@ Most code intelligence tools treat your codebase as flat text. Synaptiq builds a
 
 ## Why Synaptiq?
 
-**For AI agents (Claude Code, Cursor):**
-- "What breaks if I change this function?" → blast radius via call graph + type references + git coupling
-- "What code is never called?" → dead code detection with framework-aware exemptions
-- "Show me the login flow end-to-end" → execution flow tracing from entry points through the call graph
-- "Which files always change together?" → git history change coupling analysis
+**For AI agents (Claude Code, Cursor, agent swarms):**
+- *"What breaks if I change this function?"* — blast radius via call graph + type references + git coupling
+- *"What code is never called?"* — dead code detection with framework-aware exemptions
+- *"Show me the login flow end-to-end"* — execution flow tracing from entry points through the call graph
+- *"Which files always change together?"* — git history change coupling analysis
 
 **For developers:**
 - Instant answers to architectural questions without grepping through files
@@ -39,7 +43,24 @@ Most code intelligence tools treat your codebase as flat text. Synaptiq builds a
 
 ---
 
-## Features
+## Table of Contents
+
+- [Features](#-features)
+- [Supported Languages](#-supported-languages)
+- [Installation](#-installation)
+- [Quick Start](#-quick-start)
+- [CLI Reference](#-cli-reference)
+- [MCP Integration](#-mcp-integration)
+- [Multi-Agent Concurrency](#-multi-agent-concurrency)
+- [Knowledge Graph Model](#-knowledge-graph-model)
+- [Architecture](#-architecture)
+- [Example Workflows](#-example-workflows)
+- [How It Compares](#-how-it-compares)
+- [Development](#-development)
+
+---
+
+## 🔬 Features
 
 ### 11-Phase Analysis Pipeline
 
@@ -47,17 +68,17 @@ Synaptiq doesn't just parse your code — it builds a deep structural understand
 
 | Phase | What It Does |
 |-------|-------------|
-| **File Walking** | Walks repo respecting `.gitignore`, filters by supported languages |
-| **Structure** | Creates File/Folder hierarchy with CONTAINS relationships |
-| **Parsing** | tree-sitter AST extraction — functions, classes, methods, interfaces, enums, type aliases |
-| **Import Resolution** | Resolves import statements to actual files (relative, absolute, bare specifiers) |
-| **Call Tracing** | Maps function calls with confidence scores (1.0 = exact match, 0.5 = fuzzy) |
-| **Heritage** | Tracks class inheritance (EXTENDS) and interface implementation (IMPLEMENTS) |
-| **Type Analysis** | Extracts type references from parameters, return types, and variable annotations |
-| **Community Detection** | Leiden algorithm clusters related symbols into functional communities |
-| **Process Detection** | Framework-aware entry point detection + BFS flow tracing |
-| **Dead Code Detection** | Multi-pass analysis with override, protocol, and decorator awareness |
-| **Change Coupling** | Git history analysis — finds files that always change together |
+| 1. **File Walking** | Walks repo respecting `.gitignore`, filters by supported languages |
+| 2. **Structure** | Creates File/Folder hierarchy with CONTAINS relationships |
+| 3. **Parsing** | tree-sitter AST extraction — functions, classes, methods, interfaces, enums, type aliases |
+| 4. **Import Resolution** | Resolves import statements to actual files (relative, absolute, bare specifiers) |
+| 5. **Call Tracing** | Maps function calls with confidence scores (1.0 = exact match, 0.5 = fuzzy) |
+| 6. **Heritage** | Tracks class inheritance (EXTENDS) and interface implementation (IMPLEMENTS) |
+| 7. **Type Analysis** | Extracts type references from parameters, return types, and variable annotations |
+| 8. **Community Detection** | Leiden algorithm clusters related symbols into functional communities |
+| 9. **Process Detection** | Framework-aware entry point detection + BFS flow tracing |
+| 10. **Dead Code Detection** | Multi-pass analysis with override, protocol, and decorator awareness |
+| 11. **Change Coupling** | Git history analysis — finds files that always change together |
 
 ### Hybrid Search (BM25 + Vector + RRF)
 
@@ -82,7 +103,7 @@ Finds unreachable symbols with intelligence — not just "zero callers" but a mu
 ### Impact Analysis (Blast Radius)
 
 When you're about to change a symbol, Synaptiq traces upstream through:
-- **Call graph** — every function that calls this one, recursively
+- **Call graph** — every function that calls this one, recursively (batched BFS — one query per depth level)
 - **Type references** — every function that takes, returns, or stores this type
 - **Git coupling** — files that historically change alongside this one
 
@@ -106,30 +127,23 @@ Analyzes 6 months of git history to find hidden dependencies that static analysi
 coupling(A, B) = co_changes(A, B) / max(changes(A), changes(B))
 ```
 
-Files with coupling strength ≥ 0.3 and 3+ co-changes get linked. Surfaces coupled files in impact analysis.
+Files with coupling strength >= 0.3 and 3+ co-changes get linked. Surfaces coupled files in impact analysis.
 
 ### Watch Mode
 
-Live re-indexing powered by a Rust-based file watcher (watchfiles):
+Live re-indexing powered by a Rust-based file watcher ([watchfiles](https://github.com/samuelcolvin/watchfiles)):
 
 ```bash
 $ synaptiq watch
 Watching /Users/you/project for changes...
 
-[10:32:15] src/auth/validate.py modified → re-indexed (0.3s)
-[10:33:02] 2 files modified → re-indexed (0.5s)
+[10:32:15] src/auth/validate.py modified -> re-indexed (0.3s)
+[10:33:02] 2 files modified -> re-indexed (0.5s)
 ```
 
-- File-local phases (parse, imports, calls, types) run immediately on change
-- Global phases (communities, processes, dead code) batch every 30 seconds
-
-### Multi-Instance Concurrency
-
-Synaptiq supports multiple concurrent MCP sessions (e.g., swarm sub-agents) through a primary/proxy daemon architecture:
-
-- **Primary process**: Owns the database, watcher, and socket server
-- **Proxy processes**: Forward queries over Unix socket to primary
-- **Automatic role detection**: Each instance self-detects its role at startup
+- **File-local phases** run immediately on change — parsing happens *without* holding any lock
+- **Global phases** (communities, processes, dead code) batch every 30 seconds
+- The CPU-intensive parse step and the I/O-intensive storage write are split so locks are held for the shortest possible window
 
 ### Branch Comparison
 
@@ -151,7 +165,7 @@ Symbols removed (1):
 
 ---
 
-## Supported Languages
+## 🌐 Supported Languages
 
 | Language | Extensions | Parser |
 |----------|-----------|--------|
@@ -161,7 +175,7 @@ Symbols removed (1):
 
 ---
 
-## Installation
+## 📦 Installation
 
 ```bash
 # With pip
@@ -187,7 +201,7 @@ uv run synaptiq --help
 
 ---
 
-## Quick Start
+## 🚀 Quick Start
 
 ### 1. Index Your Codebase
 
@@ -227,7 +241,7 @@ synaptiq analyze .
 
 ---
 
-## CLI Reference
+## 🖥 CLI Reference
 
 ```
 synaptiq analyze [PATH]          Index a repository (default: current directory)
@@ -256,14 +270,14 @@ synaptiq setup                   Print MCP configuration JSON
     --cursor                     For Cursor
 
 synaptiq mcp                     Start the MCP server (stdio transport)
-synaptiq serve                   Start the MCP server (same as synaptiq mcp)
+synaptiq serve                   Start MCP server with daemon features
     --watch, -w                  Enable live file watching with auto-reindex
 synaptiq --version               Print version
 ```
 
 ---
 
-## MCP Integration
+## 🤖 MCP Integration
 
 Synaptiq exposes its full intelligence as an MCP server, giving AI agents like Claude Code and Cursor deep structural understanding of your codebase.
 
@@ -290,7 +304,7 @@ Or run the setup helper:
 synaptiq setup --claude
 ```
 
-### Claude Code Skill (Optional)
+#### Claude Code Skill (Optional)
 
 For richer Claude Code integration, copy the bundled skill into your project:
 
@@ -336,9 +350,9 @@ Once connected, your AI agent gets access to these tools:
 Every tool response includes a **next-step hint** guiding the agent through a natural investigation workflow:
 
 ```
-query → "Next: Use context() on a specific symbol for the full picture."
-context → "Next: Use impact() if planning changes to this symbol."
-impact → "Tip: Review each affected symbol before making changes."
+query   -> "Next: Use context() on a specific symbol for the full picture."
+context -> "Next: Use impact() if planning changes to this symbol."
+impact  -> "Tip: Review each affected symbol before making changes."
 ```
 
 ### MCP Resources
@@ -351,7 +365,82 @@ impact → "Tip: Review each affected symbol before making changes."
 
 ---
 
-## Knowledge Graph Model
+## 🔄 Multi-Agent Concurrency
+
+Synaptiq is designed for environments where multiple AI agents hit the same codebase simultaneously — Claude Code with sub-agents, Cursor with background indexing, or any swarm-of-agents setup.
+
+### Primary/Proxy Architecture
+
+```
+                    ┌─────────────────────────────────┐
+                    │         Primary Instance         │
+                    │                                  │
+                    │  ┌─────────┐  ┌──────────────┐  │
+  Agent 1 (MCP) ──>│  │   MCP   │  │  File Watcher │  │
+                    │  │  Server  │  │  (watchfiles) │  │
+                    │  └────┬────┘  └──────┬───────┘  │
+                    │       │              │           │
+                    │       v              v           │
+                    │  ┌──────────────────────────┐   │
+                    │  │   AsyncRWLock             │   │
+                    │  │   readers: concurrent     │   │
+                    │  │   writer: exclusive        │   │
+                    │  └────────────┬──────────────┘   │
+                    │               │                  │
+                    │  ┌────────────v──────────────┐   │
+                    │  │   KuzuDB + Connection Pool │  │
+                    │  │   (8 read connections)     │  │
+                    │  └───────────────────────────┘   │
+                    │               ^                  │
+                    │  ┌────────────┴──────────────┐   │
+                    │  │   Unix Socket Server       │   │
+                    │  │   (16 concurrent slots)    │   │
+                    │  └────────────^──────────────┘   │
+                    └───────────────┼──────────────────┘
+                                    │
+               ┌────────────────────┼────────────────────┐
+               │                    │                     │
+  Agent 2 ──> Proxy 1         Agent 3 ──> Proxy 2    Agent N ──> Proxy N
+              (MCP + Socket       (MCP + Socket           ...
+               Client)             Client)
+```
+
+**How it works:**
+
+1. The first `synaptiq serve --watch` becomes the **primary** — it owns the database, runs the file watcher, and opens a Unix domain socket
+2. Subsequent instances detect the lock and become **proxies** — they forward all queries through the socket to the primary
+3. Role detection is automatic via `fcntl.flock()` — no configuration needed
+4. If the primary crashes, the OS releases the lock and the next instance takes over
+
+### Concurrency Model
+
+| Layer | Mechanism | Purpose |
+|-------|-----------|---------|
+| **Storage reads** | Connection pool (8 `kuzu.Connection` objects) | Multiple threads query in parallel |
+| **Storage writes** | Dedicated write connection + AsyncRWLock | Exclusive access during index updates |
+| **MCP dispatch** | `AsyncRWLock.reader()` with 120s timeout | Concurrent tool/resource calls |
+| **Socket server** | `asyncio.Semaphore(16)` backpressure | Limits concurrent proxy dispatches |
+| **Socket client** | Request-ID multiplexing + `asyncio.Future` | Concurrent calls on a single connection |
+| **File watcher** | Split parse/write pattern | CPU work runs lock-free; lock held only for I/O |
+| **Process lock** | `fcntl.flock()` on `.synaptiq/synaptiq.lock` | Primary election, auto-released on crash |
+| **Proxy recovery** | Auto-reconnect (3 attempts, exponential backoff) | Handles primary restarts gracefully |
+
+### Lock Strategy: Write-Preferring RWLock
+
+The `AsyncRWLock` allows multiple readers to query simultaneously while giving priority to writers:
+
+- **Reads** (agent queries): Run concurrently — multiple agents can search, inspect context, and analyze impact at the same time
+- **Writes** (file watcher updates): Get exclusive access, and pending writes block new reads to prevent writer starvation
+- **Timeout**: All lock acquisitions have a 60-second timeout to prevent deadlocks
+- **Split processing**: The watcher parses files *without* the lock (CPU-intensive), then acquires the write lock only for the storage I/O step
+
+### macOS Compatibility
+
+Unix domain socket paths are limited to 104 bytes on macOS. When the `.synaptiq/synaptiq.sock` path exceeds 100 bytes (common with deep directory nesting), Synaptiq automatically falls back to `/tmp/synaptiq-<hash>.sock` using a truncated SHA-256 hash of the data directory.
+
+---
+
+## 📊 Knowledge Graph Model
 
 ### Nodes
 
@@ -372,17 +461,17 @@ impact → "Tip: Review each affected symbol before making changes."
 
 | Type | Description | Key Properties |
 |------|-------------|----------------|
-| `CONTAINS` | Folder → File/Symbol hierarchy | — |
-| `DEFINES` | File → Symbol it defines | — |
-| `CALLS` | Symbol → Symbol it calls | `confidence` (0.0–1.0) |
-| `IMPORTS` | File → File it imports from | `symbols` (names list) |
-| `EXTENDS` | Class → Class it extends | — |
-| `IMPLEMENTS` | Class → Interface it implements | — |
-| `USES_TYPE` | Symbol → Type it references | `role` (param/return/variable) |
-| `EXPORTS` | File → Symbol it exports | — |
-| `MEMBER_OF` | Symbol → Community it belongs to | — |
-| `STEP_IN_PROCESS` | Symbol → Process it participates in | `step_number` |
-| `COUPLED_WITH` | File → File that co-changes with it | `strength`, `co_changes` |
+| `CONTAINS` | Folder -> File/Symbol hierarchy | — |
+| `DEFINES` | File -> Symbol it defines | — |
+| `CALLS` | Symbol -> Symbol it calls | `confidence` (0.0-1.0) |
+| `IMPORTS` | File -> File it imports from | `symbols` (names list) |
+| `EXTENDS` | Class -> Class it extends | — |
+| `IMPLEMENTS` | Class -> Interface it implements | — |
+| `USES_TYPE` | Symbol -> Type it references | `role` (param/return/variable) |
+| `EXPORTS` | File -> Symbol it exports | — |
+| `MEMBER_OF` | Symbol -> Community it belongs to | — |
+| `STEP_IN_PROCESS` | Symbol -> Process it participates in | `step_number` |
+| `COUPLED_WITH` | File -> File that co-changes with it | `strength`, `co_changes` |
 
 ### Node ID Format
 
@@ -393,47 +482,48 @@ Examples:
   function:src/auth/validate.py:validate_user
   class:src/models/user.py:User
   method:src/models/user.py:User.save
+  file:src/auth/validate.py:
 ```
 
 ---
 
-## Architecture
+## 🏗 Architecture
 
 ```
 Source Code (.py, .ts, .js, .tsx, .jsx)
-    │
-    ▼
-┌──────────────────────────────────────────────┐
-│         Ingestion Pipeline (11 phases)        │
-│                                               │
-│  walk → structure → parse → imports → calls   │
-│  → heritage → types → communities → processes │
-│  → dead_code → coupling                       │
-└──────────────────────┬───────────────────────┘
-                       │
-                       ▼
-              ┌─────────────────┐
-              │ KnowledgeGraph  │  (in-memory during build)
-              └────────┬────────┘
-                       │
-          ┌────────────┼────────────┐
-          ▼            ▼            ▼
-     ┌─────────┐ ┌─────────┐ ┌─────────┐
-     │ KuzuDB  │ │  FTS    │ │ Vector  │
-     │ (graph) │ │ (BM25)  │ │ (HNSW)  │
-     └────┬────┘ └────┬────┘ └────┬────┘
-          └────────────┼────────────┘
-                       │
+    |
+    v
++----------------------------------------------+
+|         Ingestion Pipeline (11 phases)        |
+|                                               |
+|  walk -> structure -> parse -> imports -> calls|
+|  -> heritage -> types -> communities          |
+|  -> processes -> dead_code -> coupling        |
++----------------------+------------------------+
+                       |
+                       v
+              +-----------------+
+              | KnowledgeGraph  |  (in-memory during build)
+              +--------+--------+
+                       |
+          +------------+------------+
+          v            v            v
+     +---------+ +---------+ +---------+
+     | KuzuDB  | |  FTS    | | Vector  |
+     | (graph) | | (BM25)  | | (HNSW)  |
+     +----+----+ +----+----+ +----+----+
+          +------------+------------+
+                       |
               StorageBackend Protocol
-                       │
-              ┌────────┴────────┐
-              ▼                 ▼
-        ┌──────────┐     ┌──────────┐
-        │   MCP    │     │   CLI    │
-        │  Server  │     │ (Typer)  │
-        │ (stdio)  │     │          │
-        └────┬─────┘     └────┬─────┘
-             │                │
+                       |
+              +--------+--------+
+              v                 v
+        +----------+     +----------+
+        |   MCP    |     |   CLI    |
+        |  Server  |     | (Typer)  |
+        | (stdio)  |     |          |
+        +----+-----+     +----+-----+
+             |                |
         Claude Code      Terminal
         / Cursor         (developer)
 ```
@@ -442,14 +532,14 @@ Source Code (.py, .ts, .js, .tsx, .jsx)
 
 | Layer | Technology | Purpose |
 |-------|-----------|---------|
-| Parsing | tree-sitter | Language-agnostic AST extraction |
-| Graph Storage | KuzuDB | Embedded graph database with Cypher, FTS, and vector support |
-| Graph Algorithms | igraph + leidenalg | Leiden community detection |
-| Embeddings | fastembed | ONNX-based 384-dim vectors (~100MB, no PyTorch) |
-| MCP Protocol | mcp SDK (FastMCP) | AI agent communication via stdio |
-| CLI | Typer + Rich | Terminal interface with progress bars |
-| File Watching | watchfiles | Rust-based file system watcher |
-| Gitignore | pathspec | Full `.gitignore` pattern matching |
+| Parsing | [tree-sitter](https://tree-sitter.github.io/) | Language-agnostic AST extraction |
+| Graph Storage | [KuzuDB](https://kuzudb.com/) | Embedded graph database with Cypher, FTS, and vector support |
+| Graph Algorithms | [igraph](https://igraph.org/) + [leidenalg](https://leidenalg.readthedocs.io/) | Leiden community detection |
+| Embeddings | [fastembed](https://github.com/qdrant/fastembed) | ONNX-based 384-dim vectors (~100MB, no PyTorch) |
+| MCP Protocol | [mcp SDK](https://modelcontextprotocol.io/) | AI agent communication via stdio |
+| CLI | [Typer](https://typer.tiangolo.com/) + [Rich](https://rich.readthedocs.io/) | Terminal interface with progress bars |
+| File Watching | [watchfiles](https://github.com/samuelcolvin/watchfiles) | Rust-based file system watcher |
+| Gitignore | [pathspec](https://github.com/cpburnz/python-pathspec) | Full `.gitignore` pattern matching |
 
 ### Storage
 
@@ -457,9 +547,10 @@ Everything lives locally in your repo:
 
 ```
 your-project/
-└── .synaptiq/
-    ├── kuzu/          # KuzuDB graph database (graph + FTS + vectors)
-    └── meta.json      # Index metadata and stats
++-- .synaptiq/
+    +-- kuzu/          # KuzuDB graph database (graph + FTS + vectors)
+    +-- meta.json      # Index metadata and stats
+    +-- synaptiq.lock  # Process lock (present while serve is running)
 ```
 
 Add `.synaptiq/` to your `.gitignore`.
@@ -468,7 +559,7 @@ The storage layer is abstracted behind a `StorageBackend` Protocol — KuzuDB is
 
 ---
 
-## Example Workflows
+## 💡 Example Workflows
 
 ### "I need to refactor the User class — what breaks?"
 
@@ -480,7 +571,9 @@ synaptiq context User
 synaptiq impact User --depth 3
 
 # Find which files always change with user.py
-synaptiq cypher "MATCH (a:File)-[r:CodeRelation]->(b:File) WHERE a.name = 'user.py' AND r.rel_type = 'coupled_with' RETURN b.name, r.strength ORDER BY r.strength DESC"
+synaptiq cypher "MATCH (a:File)-[r:CodeRelation]->(b:File) \
+  WHERE a.name = 'user.py' AND r.rel_type = 'coupled_with' \
+  RETURN b.name, r.strength ORDER BY r.strength DESC"
 ```
 
 ### "Is there dead code we should clean up?"
@@ -498,12 +591,25 @@ synaptiq cypher "MATCH (p:Process) RETURN p.name, p.properties ORDER BY p.name"
 ### "Which parts of the codebase are most tightly coupled?"
 
 ```bash
-synaptiq cypher "MATCH (a:File)-[r:CodeRelation]->(b:File) WHERE r.rel_type = 'coupled_with' RETURN a.name, b.name, r.strength ORDER BY r.strength DESC LIMIT 20"
+synaptiq cypher "MATCH (a:File)-[r:CodeRelation]->(b:File) \
+  WHERE r.rel_type = 'coupled_with' \
+  RETURN a.name, b.name, r.strength \
+  ORDER BY r.strength DESC LIMIT 20"
+```
+
+### "What changed in this PR and what does it affect?"
+
+```bash
+# Structural diff
+synaptiq diff main..feature
+
+# Or pipe a git diff through detect_changes (via MCP)
+git diff main | synaptiq detect-changes
 ```
 
 ---
 
-## How It Compares
+## ⚖ How It Compares
 
 | Capability | grep/ripgrep | LSP | Synaptiq |
 |-----------|-------------|-----|----------|
@@ -512,32 +618,78 @@ synaptiq cypher "MATCH (a:File)-[r:CodeRelation]->(b:File) WHERE r.rel_type = 'c
 | Find all callers | No | Partial | Yes (full call graph with confidence) |
 | Type relationships | No | Yes | Yes (param/return/variable roles) |
 | Dead code detection | No | No | Yes (multi-pass, framework-aware) |
-| Execution flow tracing | No | No | Yes (entry point → flow) |
+| Execution flow tracing | No | No | Yes (entry point -> flow) |
 | Community detection | No | No | Yes (Leiden algorithm) |
 | Change coupling (git) | No | No | Yes (6-month co-change analysis) |
 | Impact analysis | No | No | Yes (calls + types + git coupling) |
 | AI agent integration | No | Partial | Yes (full MCP server) |
+| Multi-agent concurrency | No | No | Yes (RWLock + connection pool) |
 | Structural branch diff | No | No | Yes (node/edge level) |
 | Watch mode | No | Yes | Yes (Rust-based, 500ms debounce) |
 | Works offline | Yes | Yes | Yes |
 
 ---
 
-## Development
+## 🛠 Development
 
 ```bash
 git clone https://github.com/scanadi/synaptiq.git
 cd synaptiq
 uv sync --all-extras
 
-# Run tests
+# Run tests (581 tests)
 uv run pytest
 
+# Run only fast unit tests (skip e2e)
+uv run pytest tests/core/ tests/cli/ tests/mcp/
+
 # Lint
-uv run ruff check src/
+uv run ruff check src/ tests/
+
+# Format
+uv run ruff format src/ tests/
 
 # Run from source
 uv run synaptiq --help
+```
+
+### Project Structure
+
+```
+src/synaptiq/
++-- cli/main.py                    # Typer CLI (analyze, query, serve, watch, ...)
++-- mcp/
+|   +-- server.py                  # MCP server (tools + resources + dispatch)
+|   +-- tools.py                   # Tool handler implementations
+|   +-- resources.py               # Resource handler implementations
++-- core/
+|   +-- ingestion/
+|   |   +-- pipeline.py            # 11-phase pipeline orchestrator
+|   |   +-- walker.py              # File discovery respecting .gitignore
+|   |   +-- structure.py           # Folder/File hierarchy
+|   |   +-- parser_phase.py        # tree-sitter AST extraction
+|   |   +-- imports.py             # Import resolution
+|   |   +-- calls.py               # Call tracing with confidence
+|   |   +-- heritage.py            # Inheritance and implementation
+|   |   +-- types.py               # Type reference extraction
+|   |   +-- community.py           # Leiden clustering
+|   |   +-- processes.py           # Entry point + flow detection
+|   |   +-- dead_code.py           # Multi-pass dead code analysis
+|   |   +-- coupling.py            # Git co-change analysis
+|   |   +-- watcher.py             # File watcher with split parse/write
+|   +-- storage/
+|   |   +-- base.py                # StorageBackend protocol
+|   |   +-- kuzu_backend.py        # KuzuDB implementation + connection pool
+|   +-- daemon/
+|   |   +-- rwlock.py              # Write-preferring AsyncRWLock
+|   |   +-- lock.py                # fcntl.flock() based process lock
+|   |   +-- socket_server.py       # Unix socket server (primary)
+|   |   +-- socket_client.py       # Unix socket client (proxy)
+|   +-- search/hybrid.py           # BM25 + vector + fuzzy fusion
+|   +-- parsers/                   # Language-specific tree-sitter parsers
++-- config/
+    +-- languages.py               # Language registry
+    +-- ignore.py                  # Gitignore loading
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for detailed contribution guidelines.
