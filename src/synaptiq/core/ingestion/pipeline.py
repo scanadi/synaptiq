@@ -161,34 +161,17 @@ def run_pipeline(
 
     return graph, result
 
-def reindex_files(
+def parse_files(
     file_entries: list[FileEntry],
     repo_path: Path,
-    storage: StorageBackend,
 ) -> KnowledgeGraph:
-    """Re-index specific files through phases 2-7 (file-local phases).
+    """Parse files through phases 2-7 without touching storage.
 
-    Removes old nodes for these files from storage, re-parses them,
-    and inserts updated nodes/relationships. Returns the partial graph
-    for further processing (global phases, embeddings).
+    This is the CPU-intensive part of re-indexing that does NOT require
+    database access and can run without holding any locks.
 
-    Parameters
-    ----------
-    file_entries:
-        The files to re-index (already read from disk).
-    repo_path:
-        Root directory of the repository.
-    storage:
-        An already-initialised storage backend.
-
-    Returns
-    -------
-    KnowledgeGraph
-        The partial in-memory graph containing only the reindexed files.
+    Returns the partial in-memory graph.
     """
-    for entry in file_entries:
-        storage.remove_nodes_by_file(entry.path)
-
     graph = KnowledgeGraph()
 
     process_structure(file_entries, graph)
@@ -198,11 +181,25 @@ def reindex_files(
     process_heritage(parse_data, graph)
     process_types(parse_data, graph)
 
+    return graph
+
+
+def apply_reindex(
+    file_entries: list[FileEntry],
+    storage: StorageBackend,
+    graph: KnowledgeGraph,
+) -> None:
+    """Apply a pre-parsed graph to storage (delete old, insert new).
+
+    This is the I/O-intensive part that requires database access and
+    MUST be called under an exclusive write lock.
+    """
+    for entry in file_entries:
+        storage.remove_nodes_by_file(entry.path)
+
     storage.add_nodes(list(graph.iter_nodes()))
     storage.add_relationships(list(graph.iter_relationships()))
     storage.rebuild_fts_indexes()
-
-    return graph
 
 def build_graph(repo_path: Path) -> KnowledgeGraph:
     """Run phases 1-11 and return the in-memory graph (no storage load).

@@ -4,6 +4,10 @@ Accepts line-delimited JSON requests and dispatches them through a
 caller-provided function.  Used by the primary instance to serve
 queries from proxy instances.
 
+Read operations acquire a shared read lock so multiple agents can
+query concurrently.  Write operations (via the watcher) acquire an
+exclusive write lock.
+
 Protocol
 --------
 Request:  ``{"id": "<uuid>", "method": "<method>", "params": {...}}\n``
@@ -19,7 +23,15 @@ import logging
 from pathlib import Path
 from typing import Callable
 
+from synaptiq.core.daemon.rwlock import AsyncRWLock
+
 logger = logging.getLogger(__name__)
+
+# Timeout for dispatching a single request (seconds).
+DISPATCH_TIMEOUT = 120.0
+
+# Maximum number of concurrent socket dispatch operations.
+MAX_CONCURRENT_DISPATCHES = 16
 
 
 class SocketServer:
@@ -30,12 +42,14 @@ class SocketServer:
         socket_path: Path,
         dispatch: Callable[[str, dict], str],
         *,
-        lock: asyncio.Lock | None = None,
+        rwlock: AsyncRWLock | None = None,
     ) -> None:
         self._socket_path = socket_path
         self._dispatch = dispatch
-        self._lock = lock
+        self._rwlock = rwlock
         self._server: asyncio.AbstractServer | None = None
+        # Semaphore to limit concurrent dispatches.
+        self._semaphore = asyncio.Semaphore(MAX_CONCURRENT_DISPATCHES)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -111,12 +125,19 @@ class SocketServer:
         params = request.get("params", {})
 
         try:
-            if self._lock is not None:
-                async with self._lock:
-                    result = await asyncio.to_thread(self._dispatch, method, params)
-            else:
-                result = await asyncio.to_thread(self._dispatch, method, params)
+            async with self._semaphore:
+                coro = asyncio.to_thread(self._dispatch, method, params)
+                if self._rwlock is not None:
+                    async with self._rwlock.reader():
+                        result = await asyncio.wait_for(coro, timeout=DISPATCH_TIMEOUT)
+                else:
+                    result = await asyncio.wait_for(coro, timeout=DISPATCH_TIMEOUT)
             return json.dumps({"id": req_id, "result": result}) + "\n"
+        except asyncio.TimeoutError:
+            return json.dumps({
+                "id": req_id,
+                "error": {"code": -2, "message": "Request timed out"},
+            }) + "\n"
         except Exception as exc:
             return json.dumps({
                 "id": req_id,

@@ -3,16 +3,27 @@
 Uses fcntl.flock() for OS-level exclusive locking. The lock file lives at
 .synaptiq/synaptiq.lock and contains JSON with PID, socket path, and timestamp.
 The OS automatically releases the flock when the process crashes or exits.
+
+Socket Path
+-----------
+On macOS the AF_UNIX path limit is 104 bytes.  When the data directory path
+is long, the socket is placed in ``/tmp/synaptiq-<hash>.sock`` to stay within
+the limit.  The socket path is stored in the lock file so proxies always
+know where to connect.
 """
 
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+
+# macOS AF_UNIX limit is 104 bytes; leave a safety margin.
+_MAX_SOCKET_PATH_LEN = 100
 
 
 @dataclass
@@ -43,6 +54,20 @@ class LockInfo:
         }
 
 
+def _compute_socket_path(data_dir: Path) -> Path:
+    """Compute a socket path that fits within OS limits.
+
+    Prefers ``<data_dir>/synaptiq.sock`` when it fits.  Falls back to
+    ``/tmp/synaptiq-<hash>.sock`` for long paths (macOS 104-byte limit).
+    """
+    local = data_dir / "synaptiq.sock"
+    if len(str(local)) <= _MAX_SOCKET_PATH_LEN:
+        return local
+    # Use a hash of the data directory to create a short, unique path.
+    dir_hash = hashlib.sha256(str(data_dir).encode()).hexdigest()[:12]
+    return Path(f"/tmp/synaptiq-{dir_hash}.sock")
+
+
 class LockManager:
     """Manages the .synaptiq/synaptiq.lock file using fcntl.flock().
 
@@ -55,7 +80,7 @@ class LockManager:
     def __init__(self, data_dir: Path) -> None:
         self._data_dir = data_dir
         self._lock_path = data_dir / "synaptiq.lock"
-        self._socket_path = data_dir / "synaptiq.sock"
+        self._socket_path = _compute_socket_path(data_dir)
         self._fd: int | None = None
 
     @property

@@ -93,7 +93,7 @@ class TestLockManagerRead:
             existing = mgr2.read_existing()
             assert existing is not None
             assert existing.pid == os.getpid()
-            assert existing.socket == str(data_dir / "synaptiq.sock")
+            assert existing.socket == str(mgr1.socket_path)
         finally:
             mgr1.release()
 

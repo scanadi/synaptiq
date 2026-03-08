@@ -5,6 +5,11 @@ access to the Synaptiq knowledge graph.  The server lazily initialises a
 :class:`KuzuBackend` from the ``.synaptiq/kuzu`` directory in the current
 working directory.
 
+Concurrency
+-----------
+Uses an :class:`AsyncRWLock` so multiple read queries can run in parallel.
+Write operations (file watcher) acquire an exclusive write lock.
+
 Usage::
 
     # MCP server only
@@ -25,6 +30,8 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Resource, TextContent, Tool
 
+from synaptiq.core.daemon.rwlock import AsyncRWLock
+from synaptiq.core.daemon.socket_server import DISPATCH_TIMEOUT
 from synaptiq.core.storage.kuzu_backend import KuzuBackend
 from synaptiq.mcp.resources import get_dead_code_list, get_overview, get_schema
 
@@ -46,7 +53,7 @@ logger = logging.getLogger(__name__)
 server = Server("synaptiq")
 
 _storage: KuzuBackend | None = None
-_lock: asyncio.Lock | None = None
+_rwlock: AsyncRWLock | None = None
 _proxy_client: "SocketClient | None" = None
 
 
@@ -62,10 +69,19 @@ def set_storage(storage: KuzuBackend) -> None:
     _storage = storage
 
 
-def set_lock(lock: asyncio.Lock) -> None:
-    """Inject a shared lock for coordinating storage access with the file watcher."""
-    global _lock  # noqa: PLW0603
-    _lock = lock
+def set_rwlock(rwlock: AsyncRWLock) -> None:
+    """Inject a shared RWLock for coordinating storage access with the file watcher."""
+    global _rwlock  # noqa: PLW0603
+    _rwlock = rwlock
+
+
+async def _dispatch_under_read_lock(fn: object, *args: object) -> str:
+    """Run *fn* in a thread with timeout, optionally under a shared read lock."""
+    coro = asyncio.to_thread(fn, *args)
+    if _rwlock is not None:
+        async with _rwlock.reader():
+            return await asyncio.wait_for(coro, timeout=DISPATCH_TIMEOUT)
+    return await asyncio.wait_for(coro, timeout=DISPATCH_TIMEOUT)
 
 
 def _get_storage() -> KuzuBackend:
@@ -230,13 +246,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         return [TextContent(type="text", text=result)]
 
     storage = _get_storage()
-
-    if _lock is not None:
-        async with _lock:
-            result = await asyncio.to_thread(dispatch_tool, name, arguments, storage)
-    else:
-        result = dispatch_tool(name, arguments, storage)
-
+    result = await _dispatch_under_read_lock(dispatch_tool, name, arguments, storage)
     return [TextContent(type="text", text=result)]
 
 @server.list_resources()
@@ -281,12 +291,7 @@ async def read_resource(uri) -> str:
         return await _proxy_client.read_resource(str(uri))
 
     storage = _get_storage()
-    uri_str = str(uri)
-
-    if _lock is not None:
-        async with _lock:
-            return await asyncio.to_thread(dispatch_resource, uri_str, storage)
-    return dispatch_resource(uri_str, storage)
+    return await _dispatch_under_read_lock(dispatch_resource, str(uri), storage)
 
 async def main() -> None:
     """Run the Synaptiq MCP server over stdio transport."""

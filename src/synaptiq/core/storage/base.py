@@ -91,8 +91,8 @@ class StorageBackend(Protocol):
         """
         ...
 
-    def execute_raw(self, query: str) -> Any:
-        """Execute a raw backend-specific query string."""
+    def execute_raw(self, query: str, parameters: dict[str, Any] | None = None) -> Any:
+        """Execute a raw backend-specific query string with optional parameters."""
         ...
 
     def fts_search(self, query: str, limit: int) -> list[SearchResult]:

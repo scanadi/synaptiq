@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from synaptiq.core.ingestion.pipeline import reindex_files, run_pipeline
+from synaptiq.core.ingestion.pipeline import apply_reindex, parse_files, run_pipeline
 from synaptiq.core.ingestion.walker import FileEntry, read_file
-from synaptiq.core.ingestion.watcher import _reindex_files
+from synaptiq.core.ingestion.watcher import _apply_deletions, _prepare_entries
 from synaptiq.core.storage.kuzu_backend import KuzuBackend
 
 # ---------------------------------------------------------------------------
@@ -45,6 +45,30 @@ def storage(tmp_path: Path) -> KuzuBackend:
     backend.initialize(db_path)
     yield backend
     backend.close()
+
+
+def _reindex_files_compat(
+    changed_paths: list[Path],
+    repo_path: Path,
+    storage: KuzuBackend,
+    gitignore_patterns: list[str] | None = None,
+) -> int:
+    """Compatibility wrapper matching the old _reindex_files interface.
+
+    Combines _prepare_entries + _apply_deletions + reindex_files.
+    """
+    entries, deleted = _prepare_entries(
+        changed_paths, repo_path, gitignore_patterns
+    )
+
+    if deleted:
+        _apply_deletions(storage, deleted)
+
+    if entries:
+        graph = parse_files(entries, repo_path)
+        apply_reindex(entries, storage, graph)
+
+    return len(entries)
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +141,8 @@ class TestReindexFiles:
             content=(tmp_repo / "src" / "app.py").read_text(),
             language="python",
         )
-        reindex_files([entry], tmp_repo, storage)
+        graph = parse_files([entry], tmp_repo)
+        apply_reindex([entry], storage, graph)
 
         # Verify updated node.
         node = storage.get_node("function:src/app.py:hello")
@@ -145,7 +170,8 @@ class TestReindexFiles:
             content=(tmp_repo / "src" / "app.py").read_text(),
             language="python",
         )
-        reindex_files([entry], tmp_repo, storage)
+        graph = parse_files([entry], tmp_repo)
+        apply_reindex([entry], storage, graph)
 
         # Both symbols should exist.
         assert storage.get_node("function:src/app.py:hello") is not None
@@ -169,19 +195,20 @@ class TestReindexFiles:
             content=(tmp_repo / "src" / "app.py").read_text(),
             language="python",
         )
-        reindex_files([entry], tmp_repo, storage)
+        graph = parse_files([entry], tmp_repo)
+        apply_reindex([entry], storage, graph)
 
         # Old symbol should be gone.
         assert storage.get_node("function:src/app.py:hello") is None
 
 
 # ---------------------------------------------------------------------------
-# Tests: _reindex_files (watcher helper)
+# Tests: watcher helpers (_prepare_entries + _apply_deletions)
 # ---------------------------------------------------------------------------
 
 
 class TestWatcherReindexFiles:
-    """_reindex_files filters and processes changed paths."""
+    """Watcher helpers filter and process changed paths."""
 
     def test_reindexes_changed_files(
         self, tmp_repo: Path, storage: KuzuBackend
@@ -195,7 +222,7 @@ class TestWatcherReindexFiles:
             encoding="utf-8",
         )
 
-        count = _reindex_files([app_path], tmp_repo, storage)
+        count = _reindex_files_compat([app_path], tmp_repo, storage)
 
         assert count == 1
         node = storage.get_node("function:src/app.py:hello")
@@ -213,7 +240,7 @@ class TestWatcherReindexFiles:
         cached = cache_dir / "module.cpython-311.pyc"
         cached.write_bytes(b"\x00")
 
-        count = _reindex_files([cached], tmp_repo, storage)
+        count = _reindex_files_compat([cached], tmp_repo, storage)
 
         assert count == 0
 
@@ -225,7 +252,7 @@ class TestWatcherReindexFiles:
         readme = tmp_repo / "README.md"
         readme.write_text("# hello", encoding="utf-8")
 
-        count = _reindex_files([readme], tmp_repo, storage)
+        count = _reindex_files_compat([readme], tmp_repo, storage)
 
         assert count == 0
 
@@ -240,7 +267,7 @@ class TestWatcherReindexFiles:
 
         deleted_path.unlink()
 
-        count = _reindex_files([deleted_path], tmp_repo, storage)
+        count = _reindex_files_compat([deleted_path], tmp_repo, storage)
 
         # Returns 0 because file no longer exists (was handled as deletion).
         assert count == 0
@@ -260,7 +287,7 @@ class TestWatcherReindexFiles:
             encoding="utf-8",
         )
 
-        count = _reindex_files(
+        count = _reindex_files_compat(
             [tmp_repo / "src" / "app.py", tmp_repo / "src" / "utils.py"],
             tmp_repo,
             storage,

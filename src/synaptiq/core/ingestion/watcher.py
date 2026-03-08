@@ -3,8 +3,9 @@
 Uses ``watchfiles`` (Rust-backed) for efficient file system monitoring with
 native debouncing.  Changes are processed in tiers:
 
-- **File-local** (immediate): Phases 2-7 on changed files only.
-- **Global** (30s batch): Community detection, process detection, dead code.
+- **File-local** (immediate): Parse without lock, then write under write lock.
+- **Global** (30s batch): Build full graph without lock, then bulk_load under
+  write lock. Only the storage write holds the lock, not the 11-phase pipeline.
 - **Embeddings** (60s batch): Re-embed changed symbols.
 """
 
@@ -17,6 +18,7 @@ from pathlib import Path
 
 from synaptiq.config.ignore import load_gitignore, should_ignore
 from synaptiq.config.languages import is_supported
+from synaptiq.core.daemon.rwlock import AsyncRWLock
 from synaptiq.core.ingestion.walker import FileEntry, read_file
 from synaptiq.core.storage.base import StorageBackend
 
@@ -26,28 +28,35 @@ logger = logging.getLogger(__name__)
 GLOBAL_PHASE_INTERVAL = 30
 EMBEDDING_INTERVAL = 60
 
-def _reindex_files(
+
+async def _run_under_write_lock(
+    rwlock: AsyncRWLock | None, fn: object, *args: object
+) -> None:
+    """Run *fn* in a thread, optionally under an exclusive write lock."""
+    if rwlock is not None:
+        async with rwlock.writer():
+            await asyncio.to_thread(fn, *args)
+    else:
+        await asyncio.to_thread(fn, *args)
+
+def _prepare_entries(
     changed_paths: list[Path],
     repo_path: Path,
-    storage: StorageBackend,
     gitignore_patterns: list[str] | None = None,
-) -> int:
-    """Re-index changed files through file-local phases.
+) -> tuple[list[FileEntry], list[str]]:
+    """Prepare file entries and deleted paths from changed paths.
 
-    Filters out ignored and unsupported files, reads them, then runs
-    the mini-pipeline via ``reindex_files()``.
-
-    Returns the number of files actually reindexed.
+    Returns (entries_to_parse, deleted_relative_paths).
     """
-    from synaptiq.core.ingestion.pipeline import reindex_files
-
     entries: list[FileEntry] = []
+    deleted: list[str] = []
+
     for abs_path in changed_paths:
         if not abs_path.is_file():
-            # File was deleted — remove from storage.
+            # File was deleted — record for removal from storage.
             try:
                 relative = str(abs_path.relative_to(repo_path))
-                storage.remove_nodes_by_file(relative)
+                deleted.append(relative)
             except (ValueError, OSError):
                 pass
             continue
@@ -67,29 +76,27 @@ def _reindex_files(
         if entry is not None:
             entries.append(entry)
 
-    if entries:
-        reindex_files(entries, repo_path, storage)
+    return entries, deleted
 
-    return len(entries)
 
-def _run_global_phases(storage: StorageBackend, repo_path: Path) -> None:
-    """Run global analysis phases (communities, processes, dead code).
+def _apply_deletions(
+    storage: StorageBackend,
+    deleted_paths: list[str],
+) -> None:
+    """Remove nodes for deleted files from storage."""
+    for rel_path in deleted_paths:
+        try:
+            storage.remove_nodes_by_file(rel_path)
+        except Exception:
+            pass
 
-    Rebuilds the full in-memory graph from storage is not practical for
-    incremental mode, so we run a full pipeline refresh.  In practice this
-    is fast because the storage is already populated.
-    """
-    from synaptiq.core.ingestion.pipeline import run_pipeline
-
-    run_pipeline(repo_path, storage=storage, full=True)
-    logger.info("Global phases completed")
 
 async def watch_repo(
     repo_path: Path,
     storage: StorageBackend,
     *,
     stop_event: asyncio.Event | None = None,
-    lock: asyncio.Lock | None = None,
+    rwlock: AsyncRWLock | None = None,
 ) -> None:
     """Main watch loop — monitor files and re-index on changes.
 
@@ -102,18 +109,13 @@ async def watch_repo(
     stop_event:
         Optional event to signal shutdown (useful for testing).
         When set, the watch loop exits gracefully.
-    lock:
-        Optional async lock for coordinating storage access with
+    rwlock:
+        Optional RWLock for coordinating storage access with
         concurrent readers (e.g. the MCP server in combined mode).
     """
     import watchfiles
 
-    async def _run_sync(fn, *args):
-        """Run a sync function in a thread, optionally under the lock."""
-        if lock is not None:
-            async with lock:
-                return await asyncio.to_thread(fn, *args)
-        return await asyncio.to_thread(fn, *args)
+    from synaptiq.core.ingestion.pipeline import apply_reindex, parse_files, run_pipeline
 
     gitignore = load_gitignore(repo_path)
     dirty = False
@@ -137,17 +139,40 @@ async def watch_repo(
         if not changed_paths:
             continue
 
-        count = await _run_sync(_reindex_files, changed_paths, repo_path, storage, gitignore)
-        if count > 0:
-            files_changed += count
+        # Step 1: Prepare entries and identify deletions (no lock needed).
+        entries, deleted = await asyncio.to_thread(
+            _prepare_entries, changed_paths, repo_path, gitignore
+        )
+
+        # Step 2: Handle deletions under write lock.
+        if deleted:
+            await _run_under_write_lock(rwlock, _apply_deletions, storage, deleted)
+
+        # Step 3: Parse files WITHOUT lock (CPU-intensive, no DB access).
+        if entries:
+            graph = await asyncio.to_thread(parse_files, entries, repo_path)
+
+            # Step 4: Apply to storage UNDER write lock (I/O only).
+            await _run_under_write_lock(rwlock, apply_reindex, entries, storage, graph)
+
+            files_changed += len(entries)
             dirty = True
-            logger.info("Reindexed %d file(s)", count)
+            logger.info("Reindexed %d file(s)", len(entries))
 
         now = time.monotonic()
         if dirty and (now - last_global) >= GLOBAL_PHASE_INTERVAL:
             logger.info("Running global analysis phases...")
-            await _run_sync(_run_global_phases, storage, repo_path)
+
+            # Build full graph WITHOUT lock (CPU-intensive 11-phase pipeline).
+            full_graph, _ = await asyncio.to_thread(
+                run_pipeline, repo_path, None, True
+            )
+
+            # Apply to storage UNDER write lock (only the bulk_load step).
+            await _run_under_write_lock(rwlock, storage.bulk_load, full_graph)
+
             dirty = False
-            last_global = now
+            last_global = time.monotonic()
+            logger.info("Global phases completed")
 
     logger.info("Watch stopped. Total files reindexed: %d", files_changed)

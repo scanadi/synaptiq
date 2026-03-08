@@ -19,7 +19,7 @@ class TestServeModeDetection:
 
         assert lock_info is not None
         assert lock_info.pid == os.getpid()
-        assert lock_info.socket == str(tmp_path / "synaptiq.sock")
+        assert lock_info.socket == str(lock_mgr.socket_path)
 
         lock_mgr.release()
 
@@ -39,7 +39,7 @@ class TestServeModeDetection:
         existing = proxy.read_existing()
         assert existing is not None
         assert existing.pid == os.getpid()
-        assert existing.socket == str(tmp_path / "synaptiq.sock")
+        assert existing.socket == str(primary.socket_path)
 
         primary.release()
 
@@ -82,4 +82,4 @@ class TestServeModeDetection:
         lock_mgr.release()
 
         assert not (tmp_path / "synaptiq.lock").exists()
-        assert not (tmp_path / "synaptiq.sock").exists()
+        assert not lock_mgr.socket_path.exists()

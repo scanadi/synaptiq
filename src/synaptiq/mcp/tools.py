@@ -224,6 +224,9 @@ def handle_detect_changes(storage: StorageBackend, diff: str) -> str:
     Parses the diff to find changed files and line ranges, then queries
     the storage backend to identify which symbols those lines belong to.
 
+    Uses parameterized queries to prevent Cypher injection from crafted
+    file paths in the diff.
+
     Args:
         storage: The storage backend.
         diff: Raw git diff output string.
@@ -261,12 +264,19 @@ def handle_detect_changes(storage: StorageBackend, diff: str) -> str:
     for file_path, ranges in changed_files.items():
         affected_symbols = []
         try:
-            rows = storage.execute_raw(
-                f"MATCH (n) WHERE n.file_path = '{file_path.replace(chr(39), '')}' "
-                f"AND n.start_line > 0 "
-                f"RETURN n.id, n.name, n.file_path, n.start_line, n.end_line"
-            )
-            for row in rows or []:
+            # Query only symbol tables (not Folder/Community/Process).
+            rows = []
+            for label in ("Function", "Class", "Method", "Interface", "Enum", "TypeAlias"):
+                rows.extend(
+                    storage.execute_raw(
+                        f"MATCH (n:{label}) WHERE n.file_path = $fp "
+                        "AND n.start_line > 0 "
+                        "RETURN n.id, n.name, n.file_path, n.start_line, n.end_line",
+                        parameters={"fp": file_path},
+                    )
+                    or []
+                )
+            for row in rows:
                 node_id = row[0] or ""
                 name = row[1] or ""
                 start_line = row[3] or 0
@@ -295,8 +305,11 @@ def handle_detect_changes(storage: StorageBackend, diff: str) -> str:
     lines.append("Next: Use impact() on affected symbols to see downstream effects.")
     return "\n".join(lines)
 
+# Write keywords that are blocked in user-supplied Cypher queries.
+# CALL is intentionally NOT blocked — it's needed for read-only built-in
+# functions like QUERY_FTS_INDEX, TABLE_INFO, etc.
 _WRITE_KEYWORDS = re.compile(
-    r"\b(DELETE|DROP|CREATE|SET|REMOVE|MERGE|DETACH|INSTALL|LOAD|COPY|CALL)\b",
+    r"\b(DELETE|DROP|CREATE|SET|REMOVE|MERGE|DETACH|INSTALL|LOAD|COPY)\b",
     re.IGNORECASE,
 )
 

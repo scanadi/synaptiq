@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -63,6 +64,7 @@ def analyze(
     full: bool = typer.Option(False, "--full", help="Perform a full re-index."),
 ) -> None:
     """Index a repository into a knowledge graph."""
+    from synaptiq.core.daemon.lock import LockManager
     from synaptiq.core.ingestion.pipeline import PipelineResult, run_pipeline
     from synaptiq.core.storage.kuzu_backend import KuzuBackend
 
@@ -71,68 +73,89 @@ def analyze(
         console.print(f"[red]Error:[/red] {repo_path} is not a directory.")
         raise typer.Exit(code=1)
 
-    console.print(f"[bold]Indexing[/bold] {repo_path}")
-
     data_dir = repo_path / ".synaptiq"
     data_dir.mkdir(parents=True, exist_ok=True)
-    db_path = data_dir / "kuzu"
 
-    storage = KuzuBackend()
-    storage.initialize(db_path)
+    # Acquire lock to prevent concurrent access to the database.
+    lock_mgr = LockManager(data_dir)
+    lock_info = lock_mgr.try_acquire()
+    if lock_info is None:
+        existing = lock_mgr.read_existing()
+        if existing is not None and not existing.is_stale():
+            console.print(
+                f"[red]Error:[/red] synaptiq is running (PID {existing.pid}). "
+                f"Stop it first or use the MCP tools for queries."
+            )
+        else:
+            console.print(
+                "[red]Error:[/red] Another synaptiq process is running. "
+                "Wait for it to finish."
+            )
+        raise typer.Exit(code=1)
 
-    result: PipelineResult | None = None
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-        transient=True,
-    ) as progress:
-        task = progress.add_task("Starting...", total=None)
+    try:
+        console.print(f"[bold]Indexing[/bold] {repo_path}")
 
-        def on_progress(phase: str, pct: float) -> None:
-            progress.update(task, description=f"{phase} ({pct:.0%})")
+        db_path = data_dir / "kuzu"
 
-        _, result = run_pipeline(
-            repo_path=repo_path,
-            storage=storage,
-            full=full,
-            progress_callback=on_progress,
-        )
+        storage = KuzuBackend()
+        storage.initialize(db_path)
 
-    meta = {
-        "version": __version__,
-        "name": repo_path.name,
-        "path": str(repo_path),
-        "stats": {
-            "files": result.files,
-            "symbols": result.symbols,
-            "relationships": result.relationships,
-            "clusters": result.clusters,
-            "flows": result.processes,
-            "dead_code": result.dead_code,
-            "coupled_pairs": result.coupled_pairs,
-        },
-        "last_indexed_at": datetime.now(tz=timezone.utc).isoformat(),
-    }
-    meta_path = data_dir / "meta.json"
-    meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+        result: PipelineResult | None = None
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+            transient=True,
+        ) as progress:
+            task = progress.add_task("Starting...", total=None)
 
-    console.print()
-    console.print("[bold green]Indexing complete.[/bold green]")
-    console.print(f"  Files:          {result.files}")
-    console.print(f"  Symbols:        {result.symbols}")
-    console.print(f"  Relationships:  {result.relationships}")
-    if result.clusters > 0:
-        console.print(f"  Clusters:       {result.clusters}")
-    if result.processes > 0:
-        console.print(f"  Flows:          {result.processes}")
-    if result.dead_code > 0:
-        console.print(f"  Dead code:      {result.dead_code}")
-    if result.coupled_pairs > 0:
-        console.print(f"  Coupled pairs:  {result.coupled_pairs}")
-    console.print(f"  Duration:       {result.duration_seconds:.2f}s")
+            def on_progress(phase: str, pct: float) -> None:
+                progress.update(task, description=f"{phase} ({pct:.0%})")
 
-    storage.close()
+            _, result = run_pipeline(
+                repo_path=repo_path,
+                storage=storage,
+                full=full,
+                progress_callback=on_progress,
+            )
+
+        meta = {
+            "version": __version__,
+            "name": repo_path.name,
+            "path": str(repo_path),
+            "stats": {
+                "files": result.files,
+                "symbols": result.symbols,
+                "relationships": result.relationships,
+                "clusters": result.clusters,
+                "flows": result.processes,
+                "dead_code": result.dead_code,
+                "coupled_pairs": result.coupled_pairs,
+            },
+            "last_indexed_at": datetime.now(tz=timezone.utc).isoformat(),
+        }
+        meta_path = data_dir / "meta.json"
+        meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+
+        console.print()
+        console.print("[bold green]Indexing complete.[/bold green]")
+        console.print(f"  Files:          {result.files}")
+        console.print(f"  Symbols:        {result.symbols}")
+        console.print(f"  Relationships:  {result.relationships}")
+        if result.clusters > 0:
+            console.print(f"  Clusters:       {result.clusters}")
+        if result.processes > 0:
+            console.print(f"  Flows:          {result.processes}")
+        if result.dead_code > 0:
+            console.print(f"  Dead code:      {result.dead_code}")
+        if result.coupled_pairs > 0:
+            console.print(f"  Coupled pairs:  {result.coupled_pairs}")
+        console.print(f"  Duration:       {result.duration_seconds:.2f}s")
+
+        storage.close()
+    finally:
+        lock_mgr.release()
 
 @app.command()
 def status() -> None:
@@ -280,30 +303,42 @@ def watch() -> None:
     """Watch mode — re-index on file changes."""
     import asyncio
 
-    from synaptiq.core.ingestion.pipeline import run_pipeline
+    from synaptiq.core.daemon.lock import LockManager
     from synaptiq.core.ingestion.watcher import watch_repo
-    from synaptiq.core.storage.kuzu_backend import KuzuBackend
 
     repo_path = Path.cwd().resolve()
     data_dir = repo_path / ".synaptiq"
     data_dir.mkdir(parents=True, exist_ok=True)
-    db_path = data_dir / "kuzu"
 
-    storage = KuzuBackend()
-    storage.initialize(db_path)
-
-    if not (data_dir / "meta.json").exists():
-        console.print("[bold]Running initial index...[/bold]")
-        run_pipeline(repo_path, storage, full=True)
-
-    console.print(f"[bold]Watching[/bold] {repo_path} for changes (Ctrl+C to stop)")
+    # Acquire lock to prevent concurrent access to the database.
+    lock_mgr = LockManager(data_dir)
+    lock_info = lock_mgr.try_acquire()
+    if lock_info is None:
+        existing = lock_mgr.read_existing()
+        if existing is not None and not existing.is_stale():
+            console.print(
+                f"[red]Error:[/red] synaptiq is running (PID {existing.pid}). "
+                f"Stop it first."
+            )
+        else:
+            console.print(
+                "[red]Error:[/red] Another synaptiq process is running. "
+                "Wait for it to finish."
+            )
+        raise typer.Exit(code=1)
 
     try:
-        asyncio.run(watch_repo(repo_path, storage))
-    except KeyboardInterrupt:
-        console.print("\n[bold]Watch stopped.[/bold]")
+        storage = _init_storage_with_index(repo_path, data_dir)
+        console.print(f"[bold]Watching[/bold] {repo_path} for changes (Ctrl+C to stop)")
+
+        try:
+            asyncio.run(watch_repo(repo_path, storage))
+        except KeyboardInterrupt:
+            console.print("\n[bold]Watch stopped.[/bold]")
+        finally:
+            storage.close()
     finally:
-        storage.close()
+        lock_mgr.release()
 
 @app.command()
 def diff(
@@ -340,7 +375,6 @@ def serve(
 ) -> None:
     """Start MCP server, optionally with live file watching."""
     import asyncio
-    import sys
 
     from synaptiq.mcp.server import main as mcp_main
 
@@ -358,7 +392,7 @@ def serve(
     lock_info = lock_mgr.try_acquire()
 
     if lock_info is None:
-        # Another instance holds the lock — check if healthy or stale
+        # Another instance holds the lock — check if healthy or stale.
         existing = lock_mgr.read_existing()
         if existing is not None and existing.is_stale():
             lock_mgr.force_cleanup()
@@ -367,37 +401,43 @@ def serve(
     if lock_info is not None:
         _serve_primary(repo_path, data_dir, lock_mgr)
     else:
-        # Re-read in case the lock changed hands during stale cleanup.
-        existing = lock_mgr.read_existing()
+        existing = existing or lock_mgr.read_existing()
         if existing is None:
             print("Error: cannot read lock info from primary", file=sys.stderr)
             raise typer.Exit(code=1)
         _serve_proxy(existing.socket)
 
 
+def _init_storage_with_index(repo_path: Path, data_dir: Path, *, output=console):
+    """Initialise KuzuDB and run the first index if no meta.json exists."""
+    from synaptiq.core.ingestion.pipeline import run_pipeline
+    from synaptiq.core.storage.kuzu_backend import KuzuBackend
+
+    storage = KuzuBackend()
+    storage.initialize(data_dir / "kuzu")
+
+    if not (data_dir / "meta.json").exists():
+        output.print("[bold]Running initial index...[/bold]")
+        run_pipeline(repo_path, storage, full=True)
+
+    return storage
+
+
 def _serve_primary(repo_path: Path, data_dir: Path, lock_mgr) -> None:
     """Run as primary: DB + watcher + MCP + socket server."""
     import asyncio
-    import sys
 
+    from synaptiq.core.daemon.rwlock import AsyncRWLock
     from synaptiq.core.daemon.socket_server import SocketServer
-    from synaptiq.core.ingestion.pipeline import run_pipeline
     from synaptiq.core.ingestion.watcher import watch_repo
-    from synaptiq.core.storage.kuzu_backend import KuzuBackend
-    from synaptiq.mcp.server import dispatch_resource, dispatch_tool, set_lock, set_storage
+    from synaptiq.mcp.server import dispatch_resource, dispatch_tool, set_rwlock, set_storage
     from synaptiq.mcp.server import server as mcp_server
 
-    db_path = data_dir / "kuzu"
-    storage = KuzuBackend()
-    storage.initialize(db_path)
+    storage = _init_storage_with_index(repo_path, data_dir)
 
-    if not (data_dir / "meta.json").exists():
-        print("Running initial index...", file=sys.stderr)
-        run_pipeline(repo_path, storage, full=True)
-
-    lock = asyncio.Lock()
+    rwlock = AsyncRWLock()
     set_storage(storage)
-    set_lock(lock)
+    set_rwlock(rwlock)
 
     def dispatch(method: str, params: dict) -> str:
         if method == "ping":
@@ -408,7 +448,7 @@ def _serve_primary(repo_path: Path, data_dir: Path, lock_mgr) -> None:
             return dispatch_resource(params.get("uri", ""), storage)
         return f"Unknown method: {method}"
 
-    socket_server = SocketServer(lock_mgr.socket_path, dispatch, lock=lock)
+    socket_server = SocketServer(lock_mgr.socket_path, dispatch, rwlock=rwlock)
 
     async def _run() -> None:
         from mcp.server.stdio import stdio_server
@@ -421,7 +461,7 @@ def _serve_primary(repo_path: Path, data_dir: Path, lock_mgr) -> None:
                     stop.set()
                 await asyncio.gather(
                     _mcp_then_stop(),
-                    watch_repo(repo_path, storage, stop_event=stop, lock=lock),
+                    watch_repo(repo_path, storage, stop_event=stop, rwlock=rwlock),
                 )
         finally:
             await socket_server.stop()
@@ -445,8 +485,6 @@ def _serve_proxy(socket_path: str) -> None:
     client = SocketClient(Path(socket_path))
 
     async def _run() -> None:
-        import sys
-
         from mcp.server.stdio import stdio_server
 
         from synaptiq.mcp.server import server as mcp_server

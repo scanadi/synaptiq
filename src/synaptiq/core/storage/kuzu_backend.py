@@ -4,6 +4,13 @@ Implements the :class:`StorageBackend` protocol using KuzuDB, an embedded
 graph database that speaks Cypher. Each :class:`NodeLabel` maps to a
 separate node table, and a single ``CodeRelation`` relationship table group
 covers all source-to-target combinations.
+
+Concurrency
+-----------
+Read methods use a thread-safe connection pool (``_read_conn`` context
+manager) so multiple threads can query in parallel. Write methods use a
+dedicated ``self._conn`` handle — callers must ensure exclusivity via an
+external ``AsyncRWLock``.
 """
 
 from __future__ import annotations
@@ -12,9 +19,10 @@ import csv
 import hashlib
 import logging
 import tempfile
-from collections import deque
+import threading
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import kuzu
 
@@ -74,6 +82,10 @@ def _table_for_id(node_id: str) -> str | None:
 
 _EMBEDDING_PROPERTIES = "node_id STRING, vec DOUBLE[], PRIMARY KEY(node_id)"
 
+# Maximum number of read connections to keep in the pool.
+_MAX_POOL_SIZE = 8
+
+
 class KuzuBackend:
     """StorageBackend implementation backed by KuzuDB.
 
@@ -89,6 +101,9 @@ class KuzuBackend:
     def __init__(self) -> None:
         self._db: kuzu.Database | None = None
         self._conn: kuzu.Connection | None = None
+        # Thread-safe pool of read connections.
+        self._read_pool: list[kuzu.Connection] = []
+        self._pool_lock = threading.Lock()
 
     def initialize(self, path: Path, *, read_only: bool = False) -> None:
         """Open or create the KuzuDB database at *path* and set up the schema.
@@ -106,11 +121,20 @@ class KuzuBackend:
             self._create_schema()
 
     def close(self) -> None:
-        """Release the connection and database handles.
+        """Release all connections and the database handle.
 
-        Explicitly deletes the connection and database objects to ensure
+        Explicitly deletes connection and database objects to ensure
         KuzuDB releases file locks and flushes data.
         """
+        # Close pooled read connections first.
+        with self._pool_lock:
+            for conn in self._read_pool:
+                try:
+                    del conn
+                except Exception:
+                    pass
+            self._read_pool.clear()
+
         if self._conn is not None:
             try:
                 del self._conn
@@ -123,6 +147,38 @@ class KuzuBackend:
             except Exception:
                 pass
             self._db = None
+
+    # ------------------------------------------------------------------
+    # Connection pool for concurrent reads
+    # ------------------------------------------------------------------
+
+    def _acquire_read_conn(self) -> kuzu.Connection:
+        """Get a connection from the pool or create a new one (thread-safe)."""
+        with self._pool_lock:
+            if self._read_pool:
+                return self._read_pool.pop()
+        assert self._db is not None, "Backend not initialized"
+        return kuzu.Connection(self._db)
+
+    def _release_read_conn(self, conn: kuzu.Connection) -> None:
+        """Return a connection to the pool."""
+        with self._pool_lock:
+            if len(self._read_pool) < _MAX_POOL_SIZE:
+                self._read_pool.append(conn)
+            # else: let it be GC'd
+
+    @contextmanager
+    def _read_conn(self) -> Iterator[kuzu.Connection]:
+        """Context manager for read connections from the pool."""
+        conn = self._acquire_read_conn()
+        try:
+            yield conn
+        finally:
+            self._release_read_conn(conn)
+
+    # ------------------------------------------------------------------
+    # Write operations (use self._conn — must be externally serialized)
+    # ------------------------------------------------------------------
 
     def add_nodes(self, nodes: list[GraphNode]) -> None:
         """Insert nodes into their respective label tables."""
@@ -151,26 +207,29 @@ class KuzuBackend:
                 logger.debug("Failed to remove nodes from table %s", table, exc_info=True)
         return 0
 
+    # ------------------------------------------------------------------
+    # Read operations (use pooled connections — safe for concurrent use)
+    # ------------------------------------------------------------------
+
     def get_node(self, node_id: str) -> GraphNode | None:
         """Return a single node by ID, or ``None`` if not found."""
-        assert self._conn is not None
         table = _table_for_id(node_id)
         if table is None:
             return None
 
         query = f"MATCH (n:{table}) WHERE n.id = $nid RETURN n.*"
-        try:
-            result = self._conn.execute(query, parameters={"nid": node_id})
-            if result.has_next():
-                row = result.get_next()
-                return self._row_to_node(row, node_id)
-        except Exception:
-            logger.debug("get_node failed for %s", node_id, exc_info=True)
+        with self._read_conn() as conn:
+            try:
+                result = conn.execute(query, parameters={"nid": node_id})
+                if result.has_next():
+                    row = result.get_next()
+                    return self._row_to_node(row, node_id)
+            except Exception:
+                logger.debug("get_node failed for %s", node_id, exc_info=True)
         return None
 
     def get_callers(self, node_id: str) -> list[GraphNode]:
         """Return nodes that CALL the node identified by *node_id*."""
-        assert self._conn is not None
         table = _table_for_id(node_id)
         if table is None:
             return []
@@ -184,7 +243,6 @@ class KuzuBackend:
 
     def get_callees(self, node_id: str) -> list[GraphNode]:
         """Return nodes called by the node identified by *node_id*."""
-        assert self._conn is not None
         table = _table_for_id(node_id)
         if table is None:
             return []
@@ -198,7 +256,6 @@ class KuzuBackend:
 
     def get_type_refs(self, node_id: str) -> list[GraphNode]:
         """Return nodes referenced via USES_TYPE from *node_id*."""
-        assert self._conn is not None
         table = _table_for_id(node_id)
         if table is None:
             return []
@@ -211,51 +268,102 @@ class KuzuBackend:
         return self._query_nodes(query, parameters={"nid": node_id})
 
     def traverse(self, start_id: str, depth: int, direction: str = "callers") -> list[GraphNode]:
-        """BFS traversal through CALLS edges up to *depth* hops.
+        """Batched BFS traversal through CALLS edges up to *depth* hops.
+
+        Instead of querying one node at a time (N+1 pattern), queries all
+        nodes at the current BFS level in a single Cypher call per level.
+        This reduces round-trips from O(nodes) to O(depth).
 
         Args:
             direction: ``"callers"`` follows incoming CALLS (blast radius),
                        ``"callees"`` follows outgoing CALLS (dependencies).
         """
-        assert self._conn is not None
-        if _table_for_id(start_id) is None:
+        start_table = _table_for_id(start_id)
+        if start_table is None:
             return []
 
-        visited: set[str] = set()
+        visited: set[str] = {start_id}
         result_list: list[GraphNode] = []
-        queue: deque[tuple[str, int]] = deque([(start_id, 0)])
+        current_ids: list[str] = [start_id]
 
-        while queue:
-            current_id, current_depth = queue.popleft()
-            if current_id in visited:
-                continue
-            visited.add(current_id)
+        with self._read_conn() as conn:
+            for _level in range(depth):
+                if not current_ids:
+                    break
 
-            if current_id != start_id:
-                node = self.get_node(current_id)
-                if node is not None:
-                    result_list.append(node)
-
-            if current_depth < depth:
-                neighbors = (
-                    self.get_callers(current_id)
-                    if direction == "callers"
-                    else self.get_callees(current_id)
+                # Batch query: get all neighbors of current level at once.
+                neighbors = self._get_neighbors_batch(
+                    conn, current_ids, direction
                 )
-                for neighbor in neighbors:
-                    if neighbor.id not in visited:
-                        queue.append((neighbor.id, current_depth + 1))
+
+                next_ids: list[str] = []
+                for node in neighbors:
+                    if node.id not in visited:
+                        visited.add(node.id)
+                        result_list.append(node)
+                        next_ids.append(node.id)
+
+                current_ids = next_ids
 
         return result_list
 
-    def execute_raw(self, query: str) -> list[list[Any]]:
-        """Execute a raw Cypher query and return all result rows."""
-        assert self._conn is not None
-        result = self._conn.execute(query)
-        rows: list[list[Any]] = []
-        while result.has_next():
-            rows.append(result.get_next())
-        return rows
+    def _get_neighbors_batch(
+        self,
+        conn: kuzu.Connection,
+        node_ids: list[str],
+        direction: str,
+    ) -> list[GraphNode]:
+        """Get all CALLS neighbors of *node_ids* in a single query per table."""
+        nodes: list[GraphNode] = []
+        ids_by_table: dict[str, list[str]] = {}
+        for nid in node_ids:
+            table = _table_for_id(nid)
+            if table:
+                ids_by_table.setdefault(table, []).append(nid)
+
+        for table, ids in ids_by_table.items():
+            if direction == "callers":
+                query = (
+                    f"MATCH (caller)-[r:CodeRelation]->(callee:{table}) "
+                    f"WHERE callee.id IN $ids AND r.rel_type = 'calls' "
+                    f"RETURN caller.*"
+                )
+            else:
+                query = (
+                    f"MATCH (caller:{table})-[r:CodeRelation]->(callee) "
+                    f"WHERE caller.id IN $ids AND r.rel_type = 'calls' "
+                    f"RETURN callee.*"
+                )
+            try:
+                result = conn.execute(query, parameters={"ids": ids})
+                while result.has_next():
+                    row = result.get_next()
+                    node = self._row_to_node(row)
+                    if node is not None:
+                        nodes.append(node)
+            except Exception:
+                logger.debug(
+                    "_get_neighbors_batch failed for table %s", table, exc_info=True
+                )
+
+        return nodes
+
+    def execute_raw(
+        self, query: str, parameters: dict[str, Any] | None = None
+    ) -> list[list[Any]]:
+        """Execute a raw Cypher query and return all result rows.
+
+        Args:
+            query: Cypher query string. Use ``$param`` placeholders for
+                user-supplied values.
+            parameters: Optional parameter dict for parameterized queries.
+        """
+        with self._read_conn() as conn:
+            result = conn.execute(query, parameters=parameters or {})
+            rows: list[list[Any]] = []
+            while result.has_next():
+                rows.append(result.get_next())
+            return rows
 
     def exact_name_search(self, name: str, limit: int = 5) -> list[SearchResult]:
         """Search for nodes with an exact name match across all searchable tables.
@@ -263,39 +371,39 @@ class KuzuBackend:
         Returns results sorted by label priority (functions/methods first),
         preferring source files over test files.
         """
-        assert self._conn is not None
         candidates: list[SearchResult] = []
 
-        for table in _SEARCHABLE_TABLES:
-            cypher = (
-                f"MATCH (n:{table}) WHERE n.name = $name "
-                f"RETURN n.id, n.name, n.file_path, n.content, n.signature "
-                f"LIMIT {limit}"
-            )
-            try:
-                result = self._conn.execute(cypher, parameters={"name": name})
-                while result.has_next():
-                    row = result.get_next()
-                    node_id = row[0] or ""
-                    node_name = row[1] or ""
-                    file_path = row[2] or ""
-                    content = row[3] or ""
-                    signature = row[4] or ""
-                    label_prefix = node_id.split(":", 1)[0] if node_id else ""
-                    snippet = content[:200] if content else signature[:200]
-                    score = 2.0 if "/tests/" not in file_path else 1.0
-                    candidates.append(
-                        SearchResult(
-                            node_id=node_id,
-                            score=score,
-                            node_name=node_name,
-                            file_path=file_path,
-                            label=label_prefix,
-                            snippet=snippet,
+        with self._read_conn() as conn:
+            for table in _SEARCHABLE_TABLES:
+                cypher = (
+                    f"MATCH (n:{table}) WHERE n.name = $name "
+                    f"RETURN n.id, n.name, n.file_path, n.content, n.signature "
+                    f"LIMIT {limit}"
+                )
+                try:
+                    result = conn.execute(cypher, parameters={"name": name})
+                    while result.has_next():
+                        row = result.get_next()
+                        node_id = row[0] or ""
+                        node_name = row[1] or ""
+                        file_path = row[2] or ""
+                        content = row[3] or ""
+                        signature = row[4] or ""
+                        label_prefix = node_id.split(":", 1)[0] if node_id else ""
+                        snippet = content[:200] if content else signature[:200]
+                        score = 2.0 if "/tests/" not in file_path else 1.0
+                        candidates.append(
+                            SearchResult(
+                                node_id=node_id,
+                                score=score,
+                                node_name=node_name,
+                                file_path=file_path,
+                                label=label_prefix,
+                                snippet=snippet,
+                            )
                         )
-                    )
-            except Exception:
-                logger.debug("exact_name_search failed on table %s", table, exc_info=True)
+                except Exception:
+                    logger.debug("exact_name_search failed on table %s", table, exc_info=True)
 
         candidates.sort(key=lambda r: (-r.score, r.node_id))
         return candidates[:limit]
@@ -309,53 +417,53 @@ class KuzuBackend:
 
         Returns the top *limit* results sorted by score descending.
         """
-        assert self._conn is not None
         escaped_q = _escape(query)
         candidates: list[SearchResult] = []
 
-        for table in _SEARCHABLE_TABLES:
-            idx_name = f"{table.lower()}_fts"
-            cypher = (
-                f"CALL QUERY_FTS_INDEX('{table}', '{idx_name}', '{escaped_q}') "
-                f"RETURN node.id, node.name, node.file_path, node.content, "
-                f"node.signature, score "
-                f"ORDER BY score DESC LIMIT {limit}"
-            )
-            try:
-                result = self._conn.execute(cypher)
-                while result.has_next():
-                    row = result.get_next()
-                    node_id = row[0] or ""
-                    name = row[1] or ""
-                    file_path = row[2] or ""
-                    content = row[3] or ""
-                    signature = row[4] or ""
-                    bm25_score = float(row[5]) if row[5] is not None else 0.0
+        with self._read_conn() as conn:
+            for table in _SEARCHABLE_TABLES:
+                idx_name = f"{table.lower()}_fts"
+                cypher = (
+                    f"CALL QUERY_FTS_INDEX('{table}', '{idx_name}', '{escaped_q}') "
+                    f"RETURN node.id, node.name, node.file_path, node.content, "
+                    f"node.signature, score "
+                    f"ORDER BY score DESC LIMIT {limit}"
+                )
+                try:
+                    result = conn.execute(cypher)
+                    while result.has_next():
+                        row = result.get_next()
+                        node_id = row[0] or ""
+                        name = row[1] or ""
+                        file_path = row[2] or ""
+                        content = row[3] or ""
+                        signature = row[4] or ""
+                        bm25_score = float(row[5]) if row[5] is not None else 0.0
 
-                    # Demote test file results — mirrors exact_name_search penalty.
-                    if "/tests/" in file_path or "/test_" in file_path:
-                        bm25_score *= 0.5
+                        # Demote test file results — mirrors exact_name_search penalty.
+                        if "/tests/" in file_path or "/test_" in file_path:
+                            bm25_score *= 0.5
 
-                    label_prefix = node_id.split(":", 1)[0] if node_id else ""
+                        label_prefix = node_id.split(":", 1)[0] if node_id else ""
 
-                    # Boost top-level definitions in source files.
-                    if label_prefix in ("function", "class") and "/tests/" not in file_path:
-                        bm25_score *= 1.2
+                        # Boost top-level definitions in source files.
+                        if label_prefix in ("function", "class") and "/tests/" not in file_path:
+                            bm25_score *= 1.2
 
-                    snippet = content[:200] if content else signature[:200]
+                        snippet = content[:200] if content else signature[:200]
 
-                    candidates.append(
-                        SearchResult(
-                            node_id=node_id,
-                            score=bm25_score,
-                            node_name=name,
-                            file_path=file_path,
-                            label=label_prefix,
-                            snippet=snippet,
+                        candidates.append(
+                            SearchResult(
+                                node_id=node_id,
+                                score=bm25_score,
+                                node_name=name,
+                                file_path=file_path,
+                                label=label_prefix,
+                                snippet=snippet,
+                            )
                         )
-                    )
-            except Exception:
-                logger.debug("fts_search failed on table %s", table, exc_info=True)
+                except Exception:
+                    logger.debug("fts_search failed on table %s", table, exc_info=True)
 
         candidates.sort(key=lambda r: (-r.score, r.node_id))
         return candidates[:limit]
@@ -369,43 +477,43 @@ class KuzuBackend:
         *max_distance* edits of *query*.  Converts edit distance to a
         score (0 edits = 1.0, *max_distance* edits = 0.3).
         """
-        assert self._conn is not None
         escaped_q = _escape(query.lower())
         candidates: list[SearchResult] = []
 
-        for table in _SEARCHABLE_TABLES:
-            cypher = (
-                f"MATCH (n:{table}) "
-                f"WHERE levenshtein(lower(n.name), '{escaped_q}') <= {max_distance} "
-                f"RETURN n.id, n.name, n.file_path, n.content, "
-                f"levenshtein(lower(n.name), '{escaped_q}') AS dist "
-                f"ORDER BY dist LIMIT {limit}"
-            )
-            try:
-                result = self._conn.execute(cypher)
-                while result.has_next():
-                    row = result.get_next()
-                    node_id = row[0] or ""
-                    name = row[1] or ""
-                    file_path = row[2] or ""
-                    content = row[3] or ""
-                    dist = int(row[4]) if row[4] is not None else max_distance
+        with self._read_conn() as conn:
+            for table in _SEARCHABLE_TABLES:
+                cypher = (
+                    f"MATCH (n:{table}) "
+                    f"WHERE levenshtein(lower(n.name), '{escaped_q}') <= {max_distance} "
+                    f"RETURN n.id, n.name, n.file_path, n.content, "
+                    f"levenshtein(lower(n.name), '{escaped_q}') AS dist "
+                    f"ORDER BY dist LIMIT {limit}"
+                )
+                try:
+                    result = conn.execute(cypher)
+                    while result.has_next():
+                        row = result.get_next()
+                        node_id = row[0] or ""
+                        name = row[1] or ""
+                        file_path = row[2] or ""
+                        content = row[3] or ""
+                        dist = int(row[4]) if row[4] is not None else max_distance
 
-                    score = max(0.3, 1.0 - (dist * 0.3))
-                    label_prefix = node_id.split(":", 1)[0] if node_id else ""
+                        score = max(0.3, 1.0 - (dist * 0.3))
+                        label_prefix = node_id.split(":", 1)[0] if node_id else ""
 
-                    candidates.append(
-                        SearchResult(
-                            node_id=node_id,
-                            score=score,
-                            node_name=name,
-                            file_path=file_path,
-                            label=label_prefix,
-                            snippet=content[:200] if content else "",
+                        candidates.append(
+                            SearchResult(
+                                node_id=node_id,
+                                score=score,
+                                node_name=name,
+                                file_path=file_path,
+                                label=label_prefix,
+                                snippet=content[:200] if content else "",
+                            )
                         )
-                    )
-            except Exception:
-                logger.debug("fuzzy_search failed on table %s", table, exc_info=True)
+                except Exception:
+                    logger.debug("fuzzy_search failed on table %s", table, exc_info=True)
 
         candidates.sort(key=lambda r: (-r.score, r.node_id))
         return candidates[:limit]
@@ -440,49 +548,49 @@ class KuzuBackend:
         no Python-side computation or full-table load required.  Joins with
         node tables to fetch metadata in a single query.
         """
-        assert self._conn is not None
         # Vector literals must be inlined — KuzuDB parameterized queries
         # cannot distinguish DOUBLE[] from LIST for array_cosine_similarity.
         vec_literal = "[" + ", ".join(str(v) for v in vector) + "]"
 
-        try:
-            result = self._conn.execute(
-                f"MATCH (e:Embedding) "
-                f"RETURN e.node_id, "
-                f"array_cosine_similarity(e.vec, {vec_literal}) AS sim "
-                f"ORDER BY sim DESC LIMIT {limit}"
-            )
-        except Exception:
-            logger.debug("vector_search failed", exc_info=True)
-            return []
-
-        emb_rows: list[tuple[str, float]] = []
-        while result.has_next():
-            row = result.get_next()
-            emb_rows.append((row[0] or "", float(row[1]) if row[1] is not None else 0.0))
-
-        if not emb_rows:
-            return []
-
-        node_cache: dict[str, GraphNode] = {}
-        node_ids = [r[0] for r in emb_rows]
-        ids_by_table: dict[str, list[str]] = {}
-        for nid in node_ids:
-            table = _table_for_id(nid)
-            if table:
-                ids_by_table.setdefault(table, []).append(nid)
-
-        for table, ids in ids_by_table.items():
+        with self._read_conn() as conn:
             try:
-                q = f"MATCH (n:{table}) WHERE n.id IN $ids RETURN n.*"
-                res = self._conn.execute(q, parameters={"ids": ids})
-                while res.has_next():
-                    row = res.get_next()
-                    node = self._row_to_node(row)
-                    if node:
-                        node_cache[node.id] = node
+                result = conn.execute(
+                    f"MATCH (e:Embedding) "
+                    f"RETURN e.node_id, "
+                    f"array_cosine_similarity(e.vec, {vec_literal}) AS sim "
+                    f"ORDER BY sim DESC LIMIT {limit}"
+                )
             except Exception:
-                logger.debug("Batch node fetch failed for table %s", table, exc_info=True)
+                logger.debug("vector_search failed", exc_info=True)
+                return []
+
+            emb_rows: list[tuple[str, float]] = []
+            while result.has_next():
+                row = result.get_next()
+                emb_rows.append((row[0] or "", float(row[1]) if row[1] is not None else 0.0))
+
+            if not emb_rows:
+                return []
+
+            node_cache: dict[str, GraphNode] = {}
+            node_ids = [r[0] for r in emb_rows]
+            ids_by_table: dict[str, list[str]] = {}
+            for nid in node_ids:
+                table = _table_for_id(nid)
+                if table:
+                    ids_by_table.setdefault(table, []).append(nid)
+
+            for table, ids in ids_by_table.items():
+                try:
+                    q = f"MATCH (n:{table}) WHERE n.id IN $ids RETURN n.*"
+                    res = conn.execute(q, parameters={"ids": ids})
+                    while res.has_next():
+                        row = res.get_next()
+                        node = self._row_to_node(row)
+                        if node:
+                            node_cache[node.id] = node
+                except Exception:
+                    logger.debug("Batch node fetch failed for table %s", table, exc_info=True)
 
         results: list[SearchResult] = []
         for node_id, sim in emb_rows:
@@ -501,25 +609,20 @@ class KuzuBackend:
         return results
 
     def get_indexed_files(self) -> dict[str, str]:
-        """Return ``{file_path: sha256(content)}`` for all File nodes.
-
-        Attempts to read pre-computed ``content_hash`` first. Falls back
-        to computing the hash from content for databases that predate the
-        schema addition.
-        """
-        assert self._conn is not None
+        """Return ``{file_path: sha256(content)}`` for all File nodes."""
         mapping: dict[str, str] = {}
-        try:
-            result = self._conn.execute(
-                "MATCH (n:File) RETURN n.file_path, n.content"
-            )
-            while result.has_next():
-                row = result.get_next()
-                fp = row[0] or ""
-                content = row[1] or ""
-                mapping[fp] = hashlib.sha256(content.encode()).hexdigest()
-        except Exception:
-            logger.debug("get_indexed_files failed", exc_info=True)
+        with self._read_conn() as conn:
+            try:
+                result = conn.execute(
+                    "MATCH (n:File) RETURN n.file_path, n.content"
+                )
+                while result.has_next():
+                    row = result.get_next()
+                    fp = row[0] or ""
+                    content = row[1] or ""
+                    mapping[fp] = hashlib.sha256(content.encode()).hexdigest()
+            except Exception:
+                logger.debug("get_indexed_files failed", exc_info=True)
         return mapping
 
     def bulk_load(self, graph: KnowledgeGraph) -> None:
@@ -796,17 +899,17 @@ class KuzuBackend:
         self, query: str, parameters: dict[str, Any] | None = None
     ) -> list[GraphNode]:
         """Execute a query returning ``n.*`` columns and convert to GraphNode list."""
-        assert self._conn is not None
         nodes: list[GraphNode] = []
-        try:
-            result = self._conn.execute(query, parameters=parameters or {})
-            while result.has_next():
-                row = result.get_next()
-                node = self._row_to_node(row)
-                if node is not None:
-                    nodes.append(node)
-        except Exception:
-            logger.debug("_query_nodes failed: %s", query, exc_info=True)
+        with self._read_conn() as conn:
+            try:
+                result = conn.execute(query, parameters=parameters or {})
+                while result.has_next():
+                    row = result.get_next()
+                    node = self._row_to_node(row)
+                    if node is not None:
+                        nodes.append(node)
+            except Exception:
+                logger.debug("_query_nodes failed: %s", query, exc_info=True)
         return nodes
 
     @staticmethod
