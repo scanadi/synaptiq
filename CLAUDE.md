@@ -37,7 +37,23 @@ uv run ruff check --fix src/ tests/
 
 # Format
 uv run ruff format src/ tests/
+
+# Release (bumps version, commits, tags, pushes → triggers PyPI publish)
+./scripts/release.sh patch        # 0.5.0 → 0.5.1
+./scripts/release.sh minor        # 0.5.0 → 0.6.0
+./scripts/release.sh major        # 0.5.0 → 1.0.0
+./scripts/release.sh 0.7.0        # explicit version
+./scripts/release.sh patch --dry  # preview only
 ```
+
+## Release Process
+
+Releases are automated via `scripts/release.sh` + GitHub Actions (`.github/workflows/publish.yml`).
+
+1. **`scripts/release.sh <bump>`** — updates version in `pyproject.toml` and `src/synaptiq/__init__.py`, commits, creates annotated tag, pushes to origin.
+2. **GitHub Actions** — triggered by `v*` tag push, runs tests, then builds and publishes to PyPI via OIDC trusted publishing (no API tokens).
+
+Guards: must be on `main`, clean working tree, synced with remote, tag must not exist.
 
 ## Architecture
 
