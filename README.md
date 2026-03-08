@@ -519,47 +519,36 @@ Examples:
 flowchart TB
     SRC(["📁 Source Code<br/>.py · .ts · .js · .tsx · .jsx"])
 
-    subgraph PIPELINE ["⚙️ Ingestion Pipeline — 11 Phases"]
-        direction LR
-        W["walk"] --> S["structure"] --> P["parse"] --> I["imports"] --> C["calls"] --> H["heritage"]
-        H --> T["types"] --> CM["communities"] --> PR["processes"] --> DC["dead_code"] --> CP["coupling"]
-    end
+    PIPELINE["⚙️ Ingestion Pipeline — 11 Phases<br/>walk → structure → parse → imports → calls<br/>heritage → types → communities<br/>processes → dead_code → coupling"]
 
     KG(["🧠 KnowledgeGraph<br/>in-memory during build"])
 
-    subgraph STORAGE ["💾 Storage Layer"]
-        direction LR
-        KUZU[(KuzuDB<br/>graph)]
-        FTS[(FTS<br/>BM25)]
-        VEC[(Vector<br/>HNSW)]
-    end
+    KUZU[(KuzuDB<br/>graph)]
+    FTS[(FTS<br/>BM25)]
+    VEC[(Vector<br/>HNSW)]
 
     PROTO["⬡ StorageBackend Protocol"]
 
-    subgraph INTERFACE ["🖥️ Interface Layer"]
-        direction LR
-        MCP_OUT["📡 MCP Server<br/>stdio transport"]
-        CLI_OUT["⌨️ CLI<br/>Typer + Rich"]
-    end
+    MCP_OUT["📡 MCP Server<br/>stdio transport"]
+    CLI_OUT["⌨️ CLI<br/>Typer + Rich"]
 
     CLAUDE(["🤖 Claude Code · Cursor"])
     DEV(["👤 Developer Terminal"])
 
-    SRC --> PIPELINE
-    PIPELINE --> KG
-    KG --> STORAGE
-    STORAGE --> PROTO
+    SRC --> PIPELINE --> KG
+    KG --> KUZU
+    KG --> FTS
+    KG --> VEC
+    KUZU --> PROTO
+    FTS --> PROTO
+    VEC --> PROTO
     PROTO --> MCP_OUT
     PROTO --> CLI_OUT
     MCP_OUT --> CLAUDE
     CLI_OUT --> DEV
 
-    style PIPELINE fill:#fff7ed,stroke:#f97316,stroke-width:2px
-    style STORAGE fill:#eff6ff,stroke:#3b82f6,stroke-width:2px
-    style INTERFACE fill:#f0fdfa,stroke:#14b8a6,stroke-width:2px
-
     classDef source fill:#d8b4fe,stroke:#a855f7,color:#000,stroke-width:2px
-    classDef phase fill:#fed7aa,stroke:#f97316,color:#000
+    classDef pipeline fill:#fed7aa,stroke:#f97316,color:#000,stroke-width:2px
     classDef kg fill:#6ee7b7,stroke:#10b981,color:#000,stroke-width:2px
     classDef store fill:#93c5fd,stroke:#3b82f6,color:#000,stroke-width:2px
     classDef proto fill:#cbd5e1,stroke:#64748b,color:#000,stroke-width:2px
@@ -567,7 +556,7 @@ flowchart TB
     classDef user fill:#fbbf24,stroke:#d97706,color:#000,stroke-width:2px
 
     class SRC source
-    class W,S,P,I,C,H,T,CM,PR,DC,CP phase
+    class PIPELINE pipeline
     class KG kg
     class KUZU,FTS,VEC store
     class PROTO proto
