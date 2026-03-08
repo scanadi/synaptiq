@@ -178,10 +178,13 @@ Symbols removed (1):
 ## 📦 Installation
 
 ```bash
+# With uv (recommended) — installs as a global CLI tool
+uv tool install synaptiq
+
 # With pip
 pip install synaptiq
 
-# With uv (recommended)
+# As a project dependency
 uv add synaptiq
 
 # With Neo4j backend support
