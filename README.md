@@ -290,6 +290,16 @@ Or run the setup helper:
 synaptiq setup --claude
 ```
 
+### Claude Code Skill (Optional)
+
+For richer Claude Code integration, copy the bundled skill into your project:
+
+```bash
+cp -r "$(python -c 'import synaptiq; import pathlib; print(pathlib.Path(synaptiq.__file__).parent.parent.parent)')"/.claude/skills/synaptiq .claude/skills/
+```
+
+Or manually copy `.claude/skills/synaptiq/SKILL.md` from the [Synaptiq repo](https://github.com/scanadi/synaptiq/tree/main/.claude/skills/synaptiq). This teaches Claude when and how to use Synaptiq's tools, the knowledge graph schema, Cypher query patterns, and investigation workflows.
+
 ### Setup for Cursor
 
 Add to your Cursor MCP settings:
