@@ -1,0 +1,73 @@
+[project]
+name = "synaptiq"
+version = "0.3.0"
+description = "Graph-powered code intelligence engine — indexes codebases into a knowledge graph, exposed via MCP tools for AI agents and a CLI for developers."
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Stevica Canadi", email = "stevica.canadi@gmail.com" }
+]
+keywords = ["code-intelligence", "knowledge-graph", "mcp", "tree-sitter", "static-analysis", "dead-code", "claude-code"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Code Generators",
+]
+requires-python = ">=3.11"
+dependencies = [
+    "typer>=0.15.0",
+    "rich>=13.0.0",
+    "tree-sitter>=0.25.0",
+    "tree-sitter-python>=0.23.0",
+    "tree-sitter-javascript>=0.23.0",
+    "tree-sitter-typescript>=0.23.0",
+    "kuzu>=0.11.0",
+    "igraph>=1.0.0",
+    "leidenalg>=0.11.0",
+    "fastembed>=0.7.0",
+    "mcp>=1.0.0",
+    "watchfiles>=1.0.0",
+    "pathspec>=1.0.4",
+]
+
+[project.urls]
+Homepage = "https://github.com/scanadi/synaptiq"
+Repository = "https://github.com/scanadi/synaptiq"
+Issues = "https://github.com/scanadi/synaptiq/issues"
+
+[project.optional-dependencies]
+neo4j = ["neo4j>=5.0.0"]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0.0",
+    "ruff>=0.9.0",
+]
+
+[project.scripts]
+synaptiq = "synaptiq.cli.main:app"
+
+[tool.uv.build-backend]
+module-name = "synaptiq"
+
+
+[build-system]
+requires = ["uv_build>=0.9.21,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
