@@ -16,6 +16,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from synaptiq import __version__
 
 console = Console()
+_stderr_console = Console(stderr=True)
 
 
 def _write_meta(data_dir: Path, repo_path: Path, result: object) -> None:
@@ -519,7 +520,7 @@ def _serve_primary(repo_path: Path, data_dir: Path, lock_mgr) -> None:
     from synaptiq.mcp.server import dispatch_resource, dispatch_tool, set_rwlock, set_storage
     from synaptiq.mcp.server import server as mcp_server
 
-    storage = _init_storage_with_index(repo_path, data_dir)
+    storage = _init_storage_with_index(repo_path, data_dir, output=_stderr_console)
 
     rwlock = AsyncRWLock()
     set_storage(storage)
