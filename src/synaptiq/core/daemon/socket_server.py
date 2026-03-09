@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 # Timeout for dispatching a single request (seconds).
 DISPATCH_TIMEOUT = 120.0
+WRITE_DISPATCH_TIMEOUT = 600.0
 
 # Maximum number of concurrent socket dispatch operations.
 MAX_CONCURRENT_DISPATCHES = 16
@@ -43,10 +44,12 @@ class SocketServer:
         dispatch: Callable[[str, dict], str],
         *,
         rwlock: AsyncRWLock | None = None,
+        write_methods: set[str] | None = None,
     ) -> None:
         self._socket_path = socket_path
         self._dispatch = dispatch
         self._rwlock = rwlock
+        self._write_methods = write_methods or set()
         self._server: asyncio.AbstractServer | None = None
         # Semaphore to limit concurrent dispatches.
         self._semaphore = asyncio.Semaphore(MAX_CONCURRENT_DISPATCHES)
@@ -127,11 +130,17 @@ class SocketServer:
         try:
             async with self._semaphore:
                 coro = asyncio.to_thread(self._dispatch, method, params)
+                is_write = method in self._write_methods
+                timeout = WRITE_DISPATCH_TIMEOUT if is_write else DISPATCH_TIMEOUT
                 if self._rwlock is not None:
-                    async with self._rwlock.reader():
-                        result = await asyncio.wait_for(coro, timeout=DISPATCH_TIMEOUT)
+                    if is_write:
+                        async with self._rwlock.writer():
+                            result = await asyncio.wait_for(coro, timeout=timeout)
+                    else:
+                        async with self._rwlock.reader():
+                            result = await asyncio.wait_for(coro, timeout=timeout)
                 else:
-                    result = await asyncio.wait_for(coro, timeout=DISPATCH_TIMEOUT)
+                    result = await asyncio.wait_for(coro, timeout=timeout)
             return json.dumps({"id": req_id, "result": result}) + "\n"
         except asyncio.TimeoutError:
             return json.dumps({

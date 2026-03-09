@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 # Timeout for individual requests (seconds).
 REQUEST_TIMEOUT = 60.0
+REINDEX_TIMEOUT = 600.0
 
 # Reconnection settings.
 MAX_RECONNECT_ATTEMPTS = 3
@@ -169,7 +170,9 @@ class SocketClient:
     # Low-level request/response
     # ------------------------------------------------------------------
 
-    async def _request(self, method: str, params: dict) -> str:
+    async def _request(
+        self, method: str, params: dict, *, timeout: float | None = None
+    ) -> str:
         """Send a JSON request and wait for the matching response.
 
         Uses request-ID multiplexing so concurrent calls are safe.
@@ -214,7 +217,7 @@ class SocketClient:
                     raise ConnectionError(f"Connection lost: {exc}") from exc
 
             try:
-                response = await asyncio.wait_for(fut, timeout=REQUEST_TIMEOUT)
+                response = await asyncio.wait_for(fut, timeout=timeout or REQUEST_TIMEOUT)
             except asyncio.TimeoutError:
                 self._pending.pop(req_id, None)
                 raise
@@ -242,3 +245,7 @@ class SocketClient:
     async def read_resource(self, uri: str) -> str:
         """Forward a resource read to the primary daemon."""
         return await self._request("resource", {"uri": uri})
+
+    async def reindex(self, *, full: bool = True) -> str:
+        """Request a full reindex from the primary daemon."""
+        return await self._request("reindex", {"full": full}, timeout=REINDEX_TIMEOUT)

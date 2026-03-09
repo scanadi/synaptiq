@@ -17,6 +17,27 @@ from synaptiq import __version__
 
 console = Console()
 
+
+def _write_meta(data_dir: Path, repo_path: Path, result: object) -> None:
+    """Write meta.json with index stats."""
+    meta = {
+        "version": __version__,
+        "name": repo_path.name,
+        "path": str(repo_path),
+        "stats": {
+            "files": result.files,
+            "symbols": result.symbols,
+            "relationships": result.relationships,
+            "clusters": result.clusters,
+            "flows": result.processes,
+            "dead_code": result.dead_code,
+            "coupled_pairs": result.coupled_pairs,
+        },
+        "last_indexed_at": datetime.now(tz=timezone.utc).isoformat(),
+    }
+    (data_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+
+
 def _load_storage(repo_path: Path | None = None) -> "KuzuBackend":  # noqa: F821
     """Load the KuzuDB backend for the given or current repo."""
     from synaptiq.core.storage.kuzu_backend import KuzuBackend
@@ -82,16 +103,21 @@ def analyze(
     if lock_info is None:
         existing = lock_mgr.read_existing()
         if existing is not None and not existing.is_stale():
+            # Server is running — delegate reindex via its Unix socket.
             console.print(
-                f"[red]Error:[/red] synaptiq is running (PID {existing.pid}). "
-                f"Stop it first or use the MCP tools for queries."
+                f"[bold]Server running (PID {existing.pid}), requesting reindex...[/bold]"
             )
-        else:
+            _reindex_via_server(existing.socket, full=full)
+            return
+        # Stale lock — clean up and retry.
+        lock_mgr.force_cleanup()
+        lock_info = lock_mgr.try_acquire()
+        if lock_info is None:
             console.print(
-                "[red]Error:[/red] Another synaptiq process is running. "
-                "Wait for it to finish."
+                "[red]Error:[/red] Could not acquire lock. "
+                "Another process may be starting."
             )
-        raise typer.Exit(code=1)
+            raise typer.Exit(code=1)
 
     try:
         console.print(f"[bold]Indexing[/bold] {repo_path}")
@@ -120,23 +146,7 @@ def analyze(
                 progress_callback=on_progress,
             )
 
-        meta = {
-            "version": __version__,
-            "name": repo_path.name,
-            "path": str(repo_path),
-            "stats": {
-                "files": result.files,
-                "symbols": result.symbols,
-                "relationships": result.relationships,
-                "clusters": result.clusters,
-                "flows": result.processes,
-                "dead_code": result.dead_code,
-                "coupled_pairs": result.coupled_pairs,
-            },
-            "last_indexed_at": datetime.now(tz=timezone.utc).isoformat(),
-        }
-        meta_path = data_dir / "meta.json"
-        meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+        _write_meta(data_dir, repo_path, result)
 
         console.print()
         console.print("[bold green]Indexing complete.[/bold green]")
@@ -372,11 +382,23 @@ def serve(
     watch: bool = typer.Option(
         False, "--watch", "-w", help="Enable file watching with auto-reindex."
     ),
+    path: Optional[Path] = typer.Option(
+        None, "--path", "-p", help="Project directory to index (defaults to cwd)."
+    ),
 ) -> None:
     """Start MCP server, optionally with live file watching."""
     import asyncio
+    import os
 
     from synaptiq.mcp.server import main as mcp_main
+
+    # When --path is given, change cwd so all downstream code resolves correctly.
+    if path is not None:
+        resolved = path.resolve()
+        if not resolved.is_dir():
+            console.print(f"[red]Error:[/red] {resolved} is not a directory.")
+            raise typer.Exit(code=1)
+        os.chdir(resolved)
 
     if not watch:
         asyncio.run(mcp_main())
@@ -418,9 +440,73 @@ def _init_storage_with_index(repo_path: Path, data_dir: Path, *, output=console)
 
     if not (data_dir / "meta.json").exists():
         output.print("[bold]Running initial index...[/bold]")
-        run_pipeline(repo_path, storage, full=True)
+        _, result = run_pipeline(repo_path, storage, full=True)
+        _write_meta(data_dir, repo_path, result)
 
     return storage
+
+
+def _reindex_via_server(socket_path: str, *, full: bool = True) -> None:
+    """Send a reindex request to a running synaptiq server via its Unix socket."""
+    import asyncio
+
+    from synaptiq.core.daemon.socket_client import SocketClient
+
+    async def _do() -> str:
+        client = SocketClient(Path(socket_path))
+        await client.connect()
+        try:
+            return await client.reindex(full=full)
+        finally:
+            await client.close()
+
+    console.print("[dim]Waiting for reindex to complete...[/dim]")
+    try:
+        result_str = asyncio.run(_do())
+    except (ConnectionError, RuntimeError) as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    result = json.loads(result_str)
+    stats = result.get("stats", {})
+
+    console.print()
+    console.print("[bold green]Reindex complete (via server).[/bold green]")
+    for key in ("files", "symbols", "relationships", "clusters", "flows", "dead_code",
+                "coupled_pairs"):
+        val = stats.get(key, 0)
+        if val > 0:
+            label = key.replace("_", " ").title()
+            console.print(f"  {label + ':':<16}{val}")
+    if "duration" in result:
+        console.print(f"  {'Duration:':<16}{result['duration']:.2f}s")
+
+
+def _handle_reindex(
+    repo_path: Path, data_dir: Path, storage: object, full: bool = True
+) -> str:
+    """Run a full reindex — called from the socket server dispatch."""
+    import time
+
+    from synaptiq.core.ingestion.pipeline import run_pipeline
+
+    start = time.monotonic()
+    _, result = run_pipeline(repo_path, storage, full=full)
+    _write_meta(data_dir, repo_path, result)
+    duration = time.monotonic() - start
+
+    return json.dumps({
+        "stats": {
+            "files": result.files,
+            "symbols": result.symbols,
+            "relationships": result.relationships,
+            "clusters": result.clusters,
+            "flows": result.processes,
+            "dead_code": result.dead_code,
+            "coupled_pairs": result.coupled_pairs,
+        },
+        "duration": round(duration, 2),
+    })
 
 
 def _serve_primary(repo_path: Path, data_dir: Path, lock_mgr) -> None:
@@ -442,13 +528,19 @@ def _serve_primary(repo_path: Path, data_dir: Path, lock_mgr) -> None:
     def dispatch(method: str, params: dict) -> str:
         if method == "ping":
             return "pong"
+        if method == "reindex":
+            return _handle_reindex(
+                repo_path, data_dir, storage, full=params.get("full", True)
+            )
         if method == "tool":
             return dispatch_tool(params.get("name", ""), params.get("arguments", {}), storage)
         if method == "resource":
             return dispatch_resource(params.get("uri", ""), storage)
         return f"Unknown method: {method}"
 
-    socket_server = SocketServer(lock_mgr.socket_path, dispatch, rwlock=rwlock)
+    socket_server = SocketServer(
+        lock_mgr.socket_path, dispatch, rwlock=rwlock, write_methods={"reindex"}
+    )
 
     async def _run() -> None:
         from mcp.server.stdio import stdio_server
