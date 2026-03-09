@@ -92,7 +92,7 @@ def analyze(
 
     repo_path = path.resolve()
     if not repo_path.is_dir():
-        console.print(f"[red]Error:[/red] {repo_path} is not a directory.")
+        _stderr_console.print(f"[red]Error:[/red] {repo_path} is not a directory.")
         raise typer.Exit(code=1)
 
     data_dir = repo_path / ".synaptiq"
@@ -397,7 +397,7 @@ def serve(
     if path is not None:
         resolved = path.resolve()
         if not resolved.is_dir():
-            console.print(f"[red]Error:[/red] {resolved} is not a directory.")
+            _stderr_console.print(f"[red]Error:[/red] {resolved} is not a directory.")
             raise typer.Exit(code=1)
         os.chdir(resolved)
 
