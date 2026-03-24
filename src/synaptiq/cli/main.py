@@ -622,12 +622,23 @@ def _serve_primary(repo_path: Path, data_dir: Path, lock_mgr) -> None:
         await socket_server.start()
         try:
             async with stdio_server() as (read, write):
-                async def _mcp_then_stop():
-                    await mcp_server.run(read, write, mcp_server.create_initialization_options())
-                    stop.set()
+                mcp_task = asyncio.create_task(
+                    mcp_server.run(read, write, mcp_server.create_initialization_options())
+                )
+                watch_task = asyncio.create_task(
+                    watch_repo(repo_path, storage, stop_event=stop, rwlock=rwlock)
+                )
+
+                async def _wait_stop():
+                    await stop.wait()
+                    mcp_task.cancel()
+                    watch_task.cancel()
+
+                # MCP exit → stop everything; signal → stop event → cancel both.
+                mcp_task.add_done_callback(lambda _: stop.set())
                 await asyncio.gather(
-                    _mcp_then_stop(),
-                    watch_repo(repo_path, storage, stop_event=stop, rwlock=rwlock),
+                    mcp_task, watch_task, _wait_stop(),
+                    return_exceptions=True,
                 )
         finally:
             await socket_server.stop()
