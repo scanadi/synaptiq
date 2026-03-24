@@ -57,9 +57,9 @@ Guards: must be on `main`, clean working tree, synced with remote, tag must not 
 
 ## Architecture
 
-### 11-Phase Ingestion Pipeline
+### Ingestion Pipeline
 
-The core of Synaptiq is `src/synaptiq/core/ingestion/pipeline.py` which orchestrates 11 sequential phases:
+The core of Synaptiq is `src/synaptiq/core/ingestion/pipeline.py` which orchestrates 11 analysis phases plus an optional embedding phase:
 
 1. `walker.py` — file discovery respecting `.gitignore`
 2. `structure.py` — folder/file hierarchy (CONTAINS edges)
@@ -72,6 +72,7 @@ The core of Synaptiq is `src/synaptiq/core/ingestion/pipeline.py` which orchestr
 9. `processes.py` — framework-aware entry point detection + BFS flow tracing
 10. `dead_code.py` — multi-pass dead code analysis with exemptions for decorators, protocols, overrides
 11. `coupling.py` — git history co-change analysis (COUPLED_WITH edges)
+12. Embeddings (optional) — fastembed BAAI/bge-small-en-v1.5 384-dim vectors for semantic search. Skippable via `--no-embeddings` flag on `analyze`.
 
 ### Storage Layer
 
@@ -94,11 +95,11 @@ The `serve` command auto-detects role at startup. Design doc: `docs/plans/2026-0
 
 ### MCP Server
 
-`src/synaptiq/mcp/server.py` exposes tools (query, context, impact, dead_code, detect_changes, cypher, list_repos) and resources (overview, dead-code, schema) via FastMCP stdio transport. Proxy mode forwards calls through `SocketClient`.
+`src/synaptiq/mcp/server.py` exposes tools (query, context, impact, dead_code, detect_changes, cypher, list_repos) and resources (overview, dead-code, schema) via MCP. Supports both stdio and Streamable HTTP transport (`--transport http`). HTTP transport is implemented in `src/synaptiq/mcp/http_transport.py` using Starlette + uvicorn. Proxy mode forwards calls through `SocketClient`.
 
 ### CLI
 
-`src/synaptiq/cli/main.py` — single Typer app with commands: analyze, status, list, clean, query, context, impact, dead-code, cypher, watch, diff, setup, serve/mcp.
+`src/synaptiq/cli/main.py` — single Typer app with commands: analyze, status, list, clean, query, context, impact, dead-code, cypher, watch, diff, setup, serve/mcp. Includes a non-blocking PyPI update notifier (`cli/update_check.py`) that caches checks for 24h.
 
 ### Parsers
 

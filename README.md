@@ -1,4 +1,4 @@
-# Synaptiq
+![Synaptiq](assets/logo.png)
 
 **Graph-powered code intelligence engine** — indexes your codebase into a knowledge graph and exposes it via MCP tools for AI agents and a CLI for developers.
 
@@ -249,6 +249,7 @@ synaptiq analyze .
 ```
 synaptiq analyze [PATH]          Index a repository (default: current directory)
     --full                       Force full rebuild (skip incremental)
+    --no-embeddings              Skip embedding generation for faster indexing
 
 synaptiq status                  Show index status for current repo
 synaptiq list                    List all indexed repositories
@@ -271,10 +272,15 @@ synaptiq diff BASE..HEAD         Structural branch comparison
 synaptiq setup                   Print MCP configuration JSON
     --claude                     For Claude Code
     --cursor                     For Cursor
+    --http                       Show HTTP transport config
+    --port N                     Port for HTTP config (default: 8080)
 
 synaptiq mcp                     Start the MCP server (stdio transport)
 synaptiq serve                   Start MCP server with daemon features
     --watch, -w                  Enable live file watching with auto-reindex
+    --transport, -t TRANSPORT    Transport: stdio (default) or http
+    --host HOST                  Host for HTTP transport (default: 127.0.0.1)
+    --port PORT                  Port for HTTP transport (default: 8080)
 synaptiq --version               Print version
 ```
 
@@ -305,6 +311,26 @@ Or run the setup helper:
 
 ```bash
 synaptiq setup --claude
+```
+
+#### HTTP Transport
+
+For remote or browser-based MCP clients, Synaptiq supports Streamable HTTP transport:
+
+```bash
+# Start with HTTP transport
+synaptiq serve --watch --transport http --port 8080
+
+# Get the MCP config snippet
+synaptiq setup --http --port 8080
+```
+
+```json
+{
+  "synaptiq": {
+    "url": "http://127.0.0.1:8080/mcp"
+  }
+}
 ```
 
 #### Claude Code Skill (Optional)
@@ -529,7 +555,7 @@ flowchart TB
 
     PROTO["⬡ StorageBackend Protocol"]
 
-    MCP_OUT["📡 MCP Server<br/>stdio transport"]
+    MCP_OUT["📡 MCP Server<br/>stdio + HTTP transport"]
     CLI_OUT["⌨️ CLI<br/>Typer + Rich"]
 
     CLAUDE(["🤖 Claude Code · Cursor"])
@@ -572,7 +598,7 @@ flowchart TB
 | Graph Storage | [KuzuDB](https://kuzudb.com/) | Embedded graph database with Cypher, FTS, and vector support |
 | Graph Algorithms | [igraph](https://igraph.org/) + [leidenalg](https://leidenalg.readthedocs.io/) | Leiden community detection |
 | Embeddings | [fastembed](https://github.com/qdrant/fastembed) | ONNX-based 384-dim vectors (~100MB, no PyTorch) |
-| MCP Protocol | [mcp SDK](https://modelcontextprotocol.io/) | AI agent communication via stdio |
+| MCP Protocol | [mcp SDK](https://modelcontextprotocol.io/) | AI agent communication via stdio and HTTP |
 | CLI | [Typer](https://typer.tiangolo.com/) + [Rich](https://rich.readthedocs.io/) | Terminal interface with progress bars |
 | File Watching | [watchfiles](https://github.com/samuelcolvin/watchfiles) | Rust-based file system watcher |
 | Gitignore | [pathspec](https://github.com/cpburnz/python-pathspec) | Full `.gitignore` pattern matching |
@@ -693,9 +719,12 @@ uv run synaptiq --help
 
 ```
 src/synaptiq/
-+-- cli/main.py                    # Typer CLI (analyze, query, serve, watch, ...)
++-- cli/
+|   +-- main.py                    # Typer CLI (analyze, query, serve, watch, ...)
+|   +-- update_check.py            # Non-blocking PyPI update notifier
 +-- mcp/
 |   +-- server.py                  # MCP server (tools + resources + dispatch)
+|   +-- http_transport.py          # Streamable HTTP MCP transport (Starlette + uvicorn)
 |   +-- tools.py                   # Tool handler implementations
 |   +-- resources.py               # Resource handler implementations
 +-- core/

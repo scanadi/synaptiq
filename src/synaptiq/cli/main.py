@@ -33,6 +33,7 @@ def _write_meta(data_dir: Path, repo_path: Path, result: object) -> None:
             "flows": result.processes,
             "dead_code": result.dead_code,
             "coupled_pairs": result.coupled_pairs,
+            "embeddings": result.embeddings,
         },
         "last_indexed_at": datetime.now(tz=timezone.utc).isoformat(),
     }
@@ -55,17 +56,20 @@ def _load_storage(repo_path: Path | None = None) -> "KuzuBackend":  # noqa: F821
     storage.initialize(db_path, read_only=True)
     return storage
 
+
 app = typer.Typer(
     name="synaptiq",
     help="Synaptiq — Graph-powered code intelligence engine.",
     no_args_is_help=True,
 )
 
+
 def _version_callback(value: bool) -> None:
     """Print the version and exit."""
     if value:
         console.print(f"Synaptiq v{__version__}")
         raise typer.Exit()
+
 
 @app.callback()
 def main(
@@ -79,11 +83,23 @@ def main(
     ),
 ) -> None:
     """Synaptiq — Graph-powered code intelligence engine."""
+    # Update check — skip for MCP transport commands (stdout is the protocol).
+    if len(sys.argv) < 2 or sys.argv[1] not in ("serve", "mcp"):
+        from synaptiq.cli.update_check import check_for_update_message, trigger_background_check
+
+        msg = check_for_update_message()
+        if msg:
+            _stderr_console.print(f"[dim]{msg}[/dim]")
+        trigger_background_check()
+
 
 @app.command()
 def analyze(
     path: Path = typer.Argument(Path("."), help="Path to the repository to index."),
     full: bool = typer.Option(False, "--full", help="Perform a full re-index."),
+    no_embeddings: bool = typer.Option(
+        False, "--no-embeddings", help="Skip embedding generation for faster indexing."
+    ),
 ) -> None:
     """Index a repository into a knowledge graph."""
     from synaptiq.core.daemon.lock import LockManager
@@ -115,8 +131,7 @@ def analyze(
         lock_info = lock_mgr.try_acquire()
         if lock_info is None:
             console.print(
-                "[red]Error:[/red] Could not acquire lock. "
-                "Another process may be starting."
+                "[red]Error:[/red] Could not acquire lock. Another process may be starting."
             )
             raise typer.Exit(code=1)
 
@@ -131,9 +146,7 @@ def analyze(
         except RuntimeError as exc:
             msg = str(exc).lower()
             if "primary key" in msg or "corrupt" in msg:
-                _stderr_console.print(
-                    "[yellow]Corrupted index detected, rebuilding...[/yellow]"
-                )
+                _stderr_console.print("[yellow]Corrupted index detected, rebuilding...[/yellow]")
                 storage.close()
                 if db_path.is_dir():
                     shutil.rmtree(db_path, ignore_errors=True)
@@ -164,6 +177,7 @@ def analyze(
                 storage=storage,
                 full=full,
                 progress_callback=on_progress,
+                skip_embeddings=no_embeddings,
             )
 
         _write_meta(data_dir, repo_path, result)
@@ -181,11 +195,14 @@ def analyze(
             console.print(f"  Dead code:      {result.dead_code}")
         if result.coupled_pairs > 0:
             console.print(f"  Coupled pairs:  {result.coupled_pairs}")
+        if result.embeddings > 0:
+            console.print(f"  Embeddings:     {result.embeddings}")
         console.print(f"  Duration:       {result.duration_seconds:.2f}s")
 
         storage.close()
     finally:
         lock_mgr.release()
+
 
 @app.command()
 def status() -> None:
@@ -218,6 +235,7 @@ def status() -> None:
     if stats.get("coupled_pairs", 0) > 0:
         console.print(f"  Coupled pairs:  {stats['coupled_pairs']}")
 
+
 @app.command(name="list")
 def list_repos() -> None:
     """List all indexed repositories."""
@@ -225,6 +243,7 @@ def list_repos() -> None:
 
     result = handle_list_repos()
     console.print(result)
+
 
 @app.command()
 def clean(
@@ -235,9 +254,7 @@ def clean(
     data_dir = repo_path / ".synaptiq"
 
     if not data_dir.exists():
-        console.print(
-            f"[red]Error:[/red] No index found at {repo_path}. Nothing to clean."
-        )
+        console.print(f"[red]Error:[/red] No index found at {repo_path}. Nothing to clean.")
         raise typer.Exit(code=1)
 
     if not force:
@@ -248,6 +265,7 @@ def clean(
 
     shutil.rmtree(data_dir)
     console.print(f"[green]Deleted[/green] {data_dir}")
+
 
 @app.command()
 def query(
@@ -262,6 +280,7 @@ def query(
     console.print(result)
     storage.close()
 
+
 @app.command()
 def context(
     name: str = typer.Argument(..., help="Symbol name to inspect."),
@@ -273,6 +292,7 @@ def context(
     result = handle_context(storage, name)
     console.print(result)
     storage.close()
+
 
 @app.command()
 def impact(
@@ -287,6 +307,7 @@ def impact(
     console.print(result)
     storage.close()
 
+
 @app.command(name="dead-code")
 def dead_code() -> None:
     """List all detected dead code."""
@@ -296,6 +317,7 @@ def dead_code() -> None:
     result = handle_dead_code(storage)
     console.print(result)
     storage.close()
+
 
 @app.command()
 def cypher(
@@ -309,24 +331,43 @@ def cypher(
     console.print(result)
     storage.close()
 
+
 @app.command()
 def setup(
     claude: bool = typer.Option(False, "--claude", help="Configure MCP for Claude Code."),
     cursor: bool = typer.Option(False, "--cursor", help="Configure MCP for Cursor."),
+    http: bool = typer.Option(False, "--http", help="Show HTTP transport config instead of stdio."),
+    port: int = typer.Option(8080, "--port", help="Port for HTTP transport config."),
 ) -> None:
     """Configure MCP for Claude Code / Cursor."""
-    mcp_config = {
-        "command": "synaptiq",
-        "args": ["serve", "--watch"],
-    }
+    if http:
+        mcp_config = {
+            "url": f"http://127.0.0.1:{port}/mcp",
+        }
+    else:
+        mcp_config = {
+            "command": "synaptiq",
+            "args": ["serve", "--watch"],
+        }
 
     if claude or (not claude and not cursor):
         console.print("[bold]Add to your Claude Code MCP config:[/bold]")
         console.print(json.dumps({"synaptiq": mcp_config}, indent=2))
+        if http:
+            console.print(
+                "\n[dim]Start the server with: synaptiq serve --watch "
+                f"--transport http --port {port}[/dim]"
+            )
 
     if cursor or (not claude and not cursor):
         console.print("[bold]Add to your Cursor MCP config:[/bold]")
         console.print(json.dumps({"synaptiq": mcp_config}, indent=2))
+        if http:
+            console.print(
+                "\n[dim]Start the server with: synaptiq serve --watch "
+                f"--transport http --port {port}[/dim]"
+            )
+
 
 @app.command()
 def watch() -> None:
@@ -347,13 +388,11 @@ def watch() -> None:
         existing = lock_mgr.read_existing()
         if existing is not None and not existing.is_stale():
             console.print(
-                f"[red]Error:[/red] synaptiq is running (PID {existing.pid}). "
-                f"Stop it first."
+                f"[red]Error:[/red] synaptiq is running (PID {existing.pid}). Stop it first."
             )
         else:
             console.print(
-                "[red]Error:[/red] Another synaptiq process is running. "
-                "Wait for it to finish."
+                "[red]Error:[/red] Another synaptiq process is running. Wait for it to finish."
             )
         raise typer.Exit(code=1)
 
@@ -369,6 +408,7 @@ def watch() -> None:
             storage.close()
     finally:
         lock_mgr.release()
+
 
 @app.command()
 def diff(
@@ -388,6 +428,7 @@ def diff(
 
     console.print(format_diff(result))
 
+
 @app.command()
 def mcp() -> None:
     """Start MCP server (stdio transport)."""
@@ -397,6 +438,7 @@ def mcp() -> None:
 
     asyncio.run(mcp_main())
 
+
 @app.command()
 def serve(
     watch: bool = typer.Option(
@@ -405,12 +447,23 @@ def serve(
     path: Optional[Path] = typer.Option(
         None, "--path", "-p", help="Project directory to index (defaults to cwd)."
     ),
+    transport: str = typer.Option(
+        "stdio", "--transport", "-t", help="Transport protocol: stdio or http."
+    ),
+    host: str = typer.Option("127.0.0.1", "--host", help="Host for HTTP transport."),
+    port: int = typer.Option(8080, "--port", help="Port for HTTP transport."),
 ) -> None:
     """Start MCP server, optionally with live file watching."""
     import asyncio
     import os
 
     from synaptiq.mcp.server import main as mcp_main
+
+    if transport not in ("stdio", "http"):
+        _stderr_console.print(
+            f"[red]Error:[/red] Unknown transport '{transport}'. Use 'stdio' or 'http'."
+        )
+        raise typer.Exit(code=1)
 
     # When --path is given, change cwd so all downstream code resolves correctly.
     if path is not None:
@@ -421,7 +474,10 @@ def serve(
         os.chdir(resolved)
 
     if not watch:
-        asyncio.run(mcp_main())
+        if transport == "http":
+            _serve_http_standalone(host, port)
+        else:
+            asyncio.run(mcp_main())
         return
 
     from synaptiq.core.daemon.lock import LockManager
@@ -441,7 +497,7 @@ def serve(
             lock_info = lock_mgr.try_acquire()
 
     if lock_info is not None:
-        _serve_primary(repo_path, data_dir, lock_mgr)
+        _serve_primary(repo_path, data_dir, lock_mgr, transport=transport, host=host, port=port)
     else:
         existing = existing or lock_mgr.read_existing()
         if existing is None:
@@ -539,8 +595,15 @@ def _reindex_via_server(socket_path: str, *, full: bool = True) -> None:
 
     console.print()
     console.print("[bold green]Reindex complete (via server).[/bold green]")
-    for key in ("files", "symbols", "relationships", "clusters", "flows", "dead_code",
-                "coupled_pairs"):
+    for key in (
+        "files",
+        "symbols",
+        "relationships",
+        "clusters",
+        "flows",
+        "dead_code",
+        "coupled_pairs",
+    ):
         val = stats.get(key, 0)
         if val > 0:
             label = key.replace("_", " ").title()
@@ -549,9 +612,7 @@ def _reindex_via_server(socket_path: str, *, full: bool = True) -> None:
         console.print(f"  {'Duration:':<16}{result['duration']:.2f}s")
 
 
-def _handle_reindex(
-    repo_path: Path, data_dir: Path, storage: object, full: bool = True
-) -> str:
+def _handle_reindex(repo_path: Path, data_dir: Path, storage: object, full: bool = True) -> str:
     """Run a full reindex — called from the socket server dispatch."""
     import time
 
@@ -562,21 +623,44 @@ def _handle_reindex(
     _write_meta(data_dir, repo_path, result)
     duration = time.monotonic() - start
 
-    return json.dumps({
-        "stats": {
-            "files": result.files,
-            "symbols": result.symbols,
-            "relationships": result.relationships,
-            "clusters": result.clusters,
-            "flows": result.processes,
-            "dead_code": result.dead_code,
-            "coupled_pairs": result.coupled_pairs,
-        },
-        "duration": round(duration, 2),
-    })
+    return json.dumps(
+        {
+            "stats": {
+                "files": result.files,
+                "symbols": result.symbols,
+                "relationships": result.relationships,
+                "clusters": result.clusters,
+                "flows": result.processes,
+                "dead_code": result.dead_code,
+                "coupled_pairs": result.coupled_pairs,
+            },
+            "duration": round(duration, 2),
+        }
+    )
 
 
-def _serve_primary(repo_path: Path, data_dir: Path, lock_mgr) -> None:
+def _serve_http_standalone(host: str, port: int) -> None:
+    """Run the MCP server over HTTP transport without file watching."""
+    import uvicorn
+
+    from synaptiq.mcp.http_transport import create_starlette_app
+    from synaptiq.mcp.server import server as mcp_server
+
+    _stderr_console.print(f"[bold]Synaptiq MCP server (HTTP)[/bold] http://{host}:{port}/mcp")
+
+    app, _session_mgr = create_starlette_app(mcp_server)
+    uvicorn.run(app, host=host, port=port, log_level="warning")
+
+
+def _serve_primary(
+    repo_path: Path,
+    data_dir: Path,
+    lock_mgr,
+    *,
+    transport: str = "stdio",
+    host: str = "127.0.0.1",
+    port: int = 8080,
+) -> None:
     """Run as primary: DB + watcher + MCP + socket server."""
     import asyncio
 
@@ -596,9 +680,7 @@ def _serve_primary(repo_path: Path, data_dir: Path, lock_mgr) -> None:
         if method == "ping":
             return "pong"
         if method == "reindex":
-            return _handle_reindex(
-                repo_path, data_dir, storage, full=params.get("full", True)
-            )
+            return _handle_reindex(repo_path, data_dir, storage, full=params.get("full", True))
         if method == "tool":
             return dispatch_tool(params.get("name", ""), params.get("arguments", {}), storage)
         if method == "resource":
@@ -612,7 +694,6 @@ def _serve_primary(repo_path: Path, data_dir: Path, lock_mgr) -> None:
     async def _run() -> None:
         import signal
 
-        from mcp.server.stdio import stdio_server
         stop = asyncio.Event()
 
         loop = asyncio.get_running_loop()
@@ -621,25 +702,60 @@ def _serve_primary(repo_path: Path, data_dir: Path, lock_mgr) -> None:
 
         await socket_server.start()
         try:
-            async with stdio_server() as (read, write):
-                mcp_task = asyncio.create_task(
-                    mcp_server.run(read, write, mcp_server.create_initialization_options())
+            if transport == "http":
+                import uvicorn
+
+                from synaptiq.mcp.http_transport import create_starlette_app
+
+                _stderr_console.print(
+                    f"[bold]Synaptiq MCP server (HTTP)[/bold] http://{host}:{port}/mcp"
                 )
+                app, _session_mgr = create_starlette_app(mcp_server)
+                config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+                uv_server = uvicorn.Server(config)
+
+                mcp_task = asyncio.create_task(uv_server.serve())
                 watch_task = asyncio.create_task(
                     watch_repo(repo_path, storage, stop_event=stop, rwlock=rwlock)
                 )
 
                 async def _wait_stop():
                     await stop.wait()
+                    uv_server.should_exit = True
                     mcp_task.cancel()
                     watch_task.cancel()
 
-                # MCP exit → stop everything; signal → stop event → cancel both.
                 mcp_task.add_done_callback(lambda _: stop.set())
                 await asyncio.gather(
-                    mcp_task, watch_task, _wait_stop(),
+                    mcp_task,
+                    watch_task,
+                    _wait_stop(),
                     return_exceptions=True,
                 )
+            else:
+                from mcp.server.stdio import stdio_server
+
+                async with stdio_server() as (read, write):
+                    mcp_task = asyncio.create_task(
+                        mcp_server.run(read, write, mcp_server.create_initialization_options())
+                    )
+                    watch_task = asyncio.create_task(
+                        watch_repo(repo_path, storage, stop_event=stop, rwlock=rwlock)
+                    )
+
+                    async def _wait_stop():
+                        await stop.wait()
+                        mcp_task.cancel()
+                        watch_task.cancel()
+
+                    # MCP exit → stop everything; signal → stop event → cancel both.
+                    mcp_task.add_done_callback(lambda _: stop.set())
+                    await asyncio.gather(
+                        mcp_task,
+                        watch_task,
+                        _wait_stop(),
+                        return_exceptions=True,
+                    )
         finally:
             await socket_server.stop()
 

@@ -53,9 +53,11 @@ class PipelineResult:
     processes: int = 0
     dead_code: int = 0
     coupled_pairs: int = 0
+    embeddings: int = 0
     duration_seconds: float = 0.0
     incremental: bool = False
     changed_files: int = 0
+
 
 _SYMBOL_LABELS: frozenset[NodeLabel] = frozenset(NodeLabel) - {
     NodeLabel.FILE,
@@ -64,11 +66,13 @@ _SYMBOL_LABELS: frozenset[NodeLabel] = frozenset(NodeLabel) - {
     NodeLabel.PROCESS,
 }
 
+
 def run_pipeline(
     repo_path: Path,
     storage: StorageBackend | None = None,
     full: bool = False,
     progress_callback: Callable[[str, float], None] | None = None,
+    skip_embeddings: bool = False,
 ) -> tuple[KnowledgeGraph, PipelineResult]:
     """Run phases 1-11 of the ingestion pipeline.
 
@@ -89,6 +93,9 @@ def run_pipeline(
     progress_callback:
         Optional ``(phase_name, progress)`` callback where *progress* is a
         float in ``[0.0, 1.0]``.
+    skip_embeddings:
+        When ``True``, skip embedding generation after storage loading.
+        Useful for faster iteration when vector search is not needed.
 
     Returns
     -------
@@ -155,11 +162,22 @@ def run_pipeline(
         storage.bulk_load(graph)
         report("Loading to storage", 1.0)
 
+        if not skip_embeddings:
+            report("Generating embeddings", 0.0)
+            from synaptiq.core.embeddings.embedder import embed_graph
+
+            embeddings = embed_graph(graph)
+            if embeddings:
+                storage.store_embeddings(embeddings)
+            result.embeddings = len(embeddings)
+            report("Generating embeddings", 1.0)
+
     result.symbols = sum(1 for n in graph.iter_nodes() if n.label in _SYMBOL_LABELS)
     result.relationships = graph.relationship_count
     result.duration_seconds = time.monotonic() - start
 
     return graph, result
+
 
 def parse_files(
     file_entries: list[FileEntry],
@@ -200,6 +218,7 @@ def apply_reindex(
     storage.add_nodes(list(graph.iter_nodes()))
     storage.add_relationships(list(graph.iter_relationships()))
     storage.rebuild_fts_indexes()
+
 
 def build_graph(repo_path: Path) -> KnowledgeGraph:
     """Run phases 1-11 and return the in-memory graph (no storage load).
