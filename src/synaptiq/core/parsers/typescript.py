@@ -112,6 +112,19 @@ class TypeScriptParser(LanguageParser):
             self._maybe_extract_module_exports(node, source, result)
         elif ntype == "method_definition":
             self._extract_method(node, source, result)
+        elif ntype == "jsx_self_closing_element":
+            self._extract_jsx_reference(node, source, result)
+        elif ntype == "jsx_opening_element":
+            self._extract_jsx_reference(node, source, result)
+        elif ntype == "jsx_expression":
+            self._extract_jsx_expression_references(node, source, result)
+        elif ntype == "pair":
+            self._extract_object_property_callback(node, source, result)
+        elif ntype == "shorthand_property_identifier":
+            # { handleClick } is shorthand for { handleClick: handleClick }
+            name = node.text.decode()
+            line = node.start_point[0] + 1
+            result.calls.append(CallInfo(name=name, line=line))
 
         for child in node.children:
             self._walk(child, source, result, visited)
@@ -147,6 +160,32 @@ class TypeScriptParser(LanguageParser):
                         name_node = spec.child_by_field_name("name")
                         if name_node is not None:
                             result.exports.append(name_node.text.decode())
+            elif child.type == "identifier":
+                # export default SomeIdentifier
+                result.exports.append(child.text.decode())
+
+        # Check for re-export source: export { ... } from './module' or export * from './module'
+        source_node = node.child_by_field_name("source")
+        if source_node is not None:
+            module_str = self._string_value(source_node)
+            if module_str:
+                # This is a re-export — also emit an import so IMPORTS edges are created
+                names: list[str] = []
+                for child in node.children:
+                    if child.type == "export_clause":
+                        for spec in child.children:
+                            if spec.type == "export_specifier":
+                                name_node = spec.child_by_field_name("name")
+                                if name_node is not None:
+                                    names.append(name_node.text.decode())
+                # export * from '...' has no export_clause — wildcard re-export
+                result.imports.append(
+                    ImportInfo(
+                        module=module_str,
+                        names=names,
+                        is_relative=module_str.startswith("."),
+                    )
+                )
 
     def _maybe_extract_module_exports(
         self, node: Node, source: str, result: ParseResult
@@ -486,6 +525,21 @@ class TypeScriptParser(LanguageParser):
                         arguments=arguments,
                     )
                 )
+        elif func_node.type == "import":
+            # Dynamic import: import('./Foo') — emit an import so IMPORTS edges are created
+            args = node.child_by_field_name("arguments")
+            if args:
+                for arg_child in args.children:
+                    if arg_child.type == "string":
+                        module_str = self._string_value(arg_child)
+                        if module_str:
+                            result.imports.append(
+                                ImportInfo(
+                                    module=module_str,
+                                    names=[],
+                                    is_relative=module_str.startswith("."),
+                                )
+                            )
         elif func_node.type == "identifier":
             name = func_node.text.decode()
             # Skip require() since it's handled as an import.
@@ -524,6 +578,69 @@ class TypeScriptParser(LanguageParser):
                         arguments=arguments,
                     )
                 )
+
+    def _extract_jsx_reference(
+        self, node: Node, source: str, result: ParseResult
+    ) -> None:
+        """Handle ``<Component />`` and ``<Component>`` — emit a CallInfo for the tag name.
+
+        Skips lowercase tags (native HTML elements like ``<div>``, ``<span>``).
+        """
+        for child in node.children:
+            if child.type == "identifier":
+                name = child.text.decode()
+                if name[0].isupper():  # React components are PascalCase
+                    line = node.start_point[0] + 1
+                    result.calls.append(CallInfo(name=name, line=line))
+                break
+            elif child.type == "member_expression":
+                # e.g., <motion.div> or <Foo.Bar>
+                obj = child.child_by_field_name("object")
+                prop = child.child_by_field_name("property")
+                if obj and prop:
+                    line = node.start_point[0] + 1
+                    result.calls.append(CallInfo(
+                        name=prop.text.decode(),
+                        line=line,
+                        receiver=obj.text.decode(),
+                    ))
+                break
+
+    def _extract_jsx_expression_references(
+        self, node: Node, source: str, result: ParseResult
+    ) -> None:
+        """Extract identifier references from JSX expressions like ``{handleClick}``."""
+        for child in node.children:
+            if child.type == "identifier":
+                name = child.text.decode()
+                # Skip common non-function values (booleans, common variables)
+                if not name[0].isupper() and not name.startswith("_"):
+                    line = node.start_point[0] + 1
+                    result.calls.append(CallInfo(name=name, line=line))
+            elif child.type == "member_expression":
+                obj = child.child_by_field_name("object")
+                prop = child.child_by_field_name("property")
+                if obj and prop:
+                    line = node.start_point[0] + 1
+                    result.calls.append(CallInfo(
+                        name=prop.text.decode(),
+                        line=line,
+                        receiver=obj.text.decode(),
+                    ))
+
+    def _extract_object_property_callback(
+        self, node: Node, source: str, result: ParseResult
+    ) -> None:
+        """Extract callback references from object properties like ``{ onSuccess: handleFn }``."""
+        key_node = node.child_by_field_name("key")
+        value_node = node.child_by_field_name("value")
+        if key_node is None or value_node is None:
+            return
+        # Only extract if the value is a bare identifier (not a complex expression)
+        if value_node.type == "identifier":
+            name = value_node.text.decode()
+            line = node.start_point[0] + 1
+            result.calls.append(CallInfo(name=name, line=line))
 
     @staticmethod
     def _extract_identifier_arguments(call_node: Node) -> list[str]:

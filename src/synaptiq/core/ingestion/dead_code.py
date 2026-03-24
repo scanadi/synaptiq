@@ -22,7 +22,7 @@ _SYMBOL_LABELS: tuple[NodeLabel, ...] = (
     NodeLabel.CLASS,
 )
 
-_CONSTRUCTOR_NAMES: frozenset[str] = frozenset({"__init__", "__new__"})
+_CONSTRUCTOR_NAMES: frozenset[str] = frozenset({"__init__", "__new__", "constructor"})
 
 def _is_test_class(name: str) -> bool:
     """Return ``True`` if *name* follows pytest class convention (``Test*``).
@@ -32,6 +32,20 @@ def _is_test_class(name: str) -> bool:
     """
     return len(name) > 4 and name.startswith("Test") and name[4].isupper()
 
+def _has_test_suffix(filename: str) -> bool:
+    """Return ``True`` if the filename has a test/spec/stories suffix.
+
+    Matches Jest/Vitest (``*.test.ts``, ``*.spec.tsx``) and Storybook
+    (``*.stories.tsx``) naming conventions common in TypeScript/React projects.
+    """
+    base = filename
+    for ext in (".ts", ".tsx", ".js", ".jsx", ".mts", ".mjs"):
+        if base.endswith(ext):
+            base = base[: -len(ext)]
+            break
+    return base.endswith((".test", ".spec", ".stories"))
+
+
 def _is_test_file(file_path: str) -> bool:
     """Return ``True`` if the file is in a test directory or is a test file.
 
@@ -39,11 +53,16 @@ def _is_test_file(file_path: str) -> bool:
     false positives (e.g. ``contest/`` matching ``/test``).
     """
     parts = PurePosixPath(file_path).parts
+    filename = parts[-1] if parts else ""
     return (
         "tests" in parts
         or "test" in parts
+        or "__tests__" in parts
+        or "__mocks__" in parts
+        or "__fixtures__" in parts
         or any(p.startswith("test_") for p in parts)
         or file_path.endswith("conftest.py")
+        or _has_test_suffix(filename)
     )
 
 def _is_dunder(name: str) -> bool:
@@ -130,7 +149,7 @@ def _is_exempt(
 
     - It is marked as an entry point.
     - It is marked as exported (may be used externally).
-    - It is a constructor (``__init__`` / ``__new__``).
+    - It is a constructor (``__init__`` / ``__new__`` / ``constructor``).
     - It is a test function (name starts with ``test_``).
     - It is a test class (name starts with ``Test``).
     - It lives in a test file (fixtures, helpers are not dead code).

@@ -505,3 +505,94 @@ class TestProtocolConformance:
         partial_method = g.get_node(partial_method_id)
         assert partial_method is not None
         assert partial_method.is_dead is True
+
+
+# ---------------------------------------------------------------------------
+# TypeScript constructor tests
+# ---------------------------------------------------------------------------
+
+
+class TestSkipsTypeScriptConstructors:
+    """TypeScript ``constructor`` methods are never flagged as dead."""
+
+    def test_ts_constructor_not_dead(self) -> None:
+        g = KnowledgeGraph()
+        _add_file_node(g, "src/models.ts")
+        node_id = _add_symbol_node(
+            g,
+            NodeLabel.METHOD,
+            "src/models.ts",
+            "constructor",
+            class_name="MyClass",
+        )
+
+        process_dead_code(g)
+
+        node = g.get_node(node_id)
+        assert node is not None
+        assert node.is_dead is False
+
+
+# ---------------------------------------------------------------------------
+# Test file suffix tests (Jest/Vitest/Storybook conventions)
+# ---------------------------------------------------------------------------
+
+
+class TestSkipsTestFileSuffixes:
+    """Symbols in files with .test.ts, .spec.tsx, .stories.tsx suffixes are NOT flagged."""
+
+    @pytest.mark.parametrize(
+        "file_path",
+        [
+            "src/components/Button.test.ts",
+            "src/components/Button.test.tsx",
+            "src/components/Button.spec.ts",
+            "src/components/Button.spec.tsx",
+            "src/components/Button.stories.tsx",
+            "src/utils/helpers.test.js",
+            "src/utils/helpers.spec.jsx",
+        ],
+    )
+    def test_test_suffix_files_not_dead(self, file_path: str) -> None:
+        g = KnowledgeGraph()
+        _add_file_node(g, file_path)
+        node_id = _add_symbol_node(
+            g, NodeLabel.FUNCTION, file_path, "someHelper"
+        )
+
+        process_dead_code(g)
+
+        node = g.get_node(node_id)
+        assert node is not None
+        assert node.is_dead is False
+
+
+# ---------------------------------------------------------------------------
+# __tests__, __mocks__, __fixtures__ directory tests
+# ---------------------------------------------------------------------------
+
+
+class TestSkipsMockAndFixtureDirectories:
+    """Symbols in __tests__/, __mocks__/, __fixtures__/ paths are NOT flagged."""
+
+    @pytest.mark.parametrize(
+        "file_path",
+        [
+            "src/__tests__/Button.tsx",
+            "src/components/__tests__/Form.test.ts",
+            "src/__mocks__/api.ts",
+            "src/__fixtures__/data.ts",
+        ],
+    )
+    def test_test_directories_not_dead(self, file_path: str) -> None:
+        g = KnowledgeGraph()
+        _add_file_node(g, file_path)
+        node_id = _add_symbol_node(
+            g, NodeLabel.FUNCTION, file_path, "mockHelper"
+        )
+
+        process_dead_code(g)
+
+        node = g.get_node(node_id)
+        assert node is not None
+        assert node.is_dead is False
