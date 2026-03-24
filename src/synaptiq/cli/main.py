@@ -126,7 +126,26 @@ def analyze(
         db_path = data_dir / "kuzu"
 
         storage = KuzuBackend()
-        storage.initialize(db_path)
+        try:
+            storage.initialize(db_path)
+        except RuntimeError as exc:
+            msg = str(exc).lower()
+            if "primary key" in msg or "corrupt" in msg:
+                _stderr_console.print(
+                    "[yellow]Corrupted index detected, rebuilding...[/yellow]"
+                )
+                storage.close()
+                if db_path.is_dir():
+                    shutil.rmtree(db_path, ignore_errors=True)
+                else:
+                    db_path.unlink(missing_ok=True)
+                    for suffix in (".wal", ".shadow"):
+                        db_path.with_suffix(suffix).unlink(missing_ok=True)
+                (data_dir / "meta.json").unlink(missing_ok=True)
+                storage = KuzuBackend()
+                storage.initialize(db_path)
+            else:
+                raise
 
         result: PipelineResult | None = None
         with Progress(
@@ -449,7 +468,12 @@ def _init_storage_with_index(repo_path: Path, data_dir: Path, *, output=console)
                 file=sys.stderr,
             )
             storage.close()
-            shutil.rmtree(kuzu_path, ignore_errors=True)
+            if kuzu_path.is_dir():
+                shutil.rmtree(kuzu_path, ignore_errors=True)
+            else:
+                kuzu_path.unlink(missing_ok=True)
+                for suffix in (".wal", ".shadow"):
+                    kuzu_path.with_suffix(suffix).unlink(missing_ok=True)
             meta_path = data_dir / "meta.json"
             meta_path.unlink(missing_ok=True)
             storage = KuzuBackend()
