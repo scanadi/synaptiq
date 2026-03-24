@@ -436,8 +436,26 @@ def _init_storage_with_index(repo_path: Path, data_dir: Path, *, output=console)
     from synaptiq.core.ingestion.pipeline import run_pipeline
     from synaptiq.core.storage.kuzu_backend import KuzuBackend
 
+    kuzu_path = data_dir / "kuzu"
     storage = KuzuBackend()
-    storage.initialize(data_dir / "kuzu")
+
+    try:
+        storage.initialize(kuzu_path)
+    except RuntimeError as exc:
+        msg = str(exc).lower()
+        if "primary key" in msg or "corrupt" in msg:
+            print(
+                "Corrupted index detected, rebuilding...",
+                file=sys.stderr,
+            )
+            storage.close()
+            shutil.rmtree(kuzu_path, ignore_errors=True)
+            meta_path = data_dir / "meta.json"
+            meta_path.unlink(missing_ok=True)
+            storage = KuzuBackend()
+            storage.initialize(kuzu_path)
+        else:
+            raise
 
     if not (data_dir / "meta.json").exists():
         output.print("[bold]Running initial index...[/bold]")
@@ -544,8 +562,15 @@ def _serve_primary(repo_path: Path, data_dir: Path, lock_mgr) -> None:
     )
 
     async def _run() -> None:
+        import signal
+
         from mcp.server.stdio import stdio_server
         stop = asyncio.Event()
+
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, stop.set)
+
         await socket_server.start()
         try:
             async with stdio_server() as (read, write):

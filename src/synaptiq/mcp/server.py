@@ -99,14 +99,37 @@ def _get_storage() -> KuzuBackend:
     If it exists, the backend is initialised from that path.  Otherwise a
     bare (uninitialised) backend is returned so that tools can still be
     called without crashing.
+
+    If the database is corrupted (e.g. duplicate primary key from a
+    mid-write kill), the kuzu directory and meta.json are deleted so
+    the next ``serve --watch`` or ``analyze`` invocation rebuilds cleanly.
     """
+    import shutil
+
     global _storage  # noqa: PLW0603
     if _storage is None:
         _storage = KuzuBackend()
         db_path = Path.cwd() / ".synaptiq" / "kuzu"
         if db_path.exists():
-            _storage.initialize(db_path, read_only=True)
-            logger.info("Initialised storage (read-only) from %s", db_path)
+            try:
+                _storage.initialize(db_path, read_only=True)
+                logger.info("Initialised storage (read-only) from %s", db_path)
+            except RuntimeError as exc:
+                msg = str(exc).lower()
+                if "primary key" in msg or "corrupt" in msg:
+                    logger.warning("Corrupted index detected, removing %s", db_path)
+                    _storage.close()
+                    if db_path.is_dir():
+                        shutil.rmtree(db_path, ignore_errors=True)
+                    else:
+                        db_path.unlink(missing_ok=True)
+                        # Clean up WAL/shadow files left alongside a file-based DB.
+                        for suffix in (".wal", ".shadow"):
+                            db_path.with_suffix(suffix).unlink(missing_ok=True)
+                    (Path.cwd() / ".synaptiq" / "meta.json").unlink(missing_ok=True)
+                    _storage = KuzuBackend()
+                else:
+                    raise
         else:
             logger.warning("No .synaptiq/kuzu directory found in %s", Path.cwd())
     return _storage

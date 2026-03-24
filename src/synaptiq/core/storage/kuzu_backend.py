@@ -864,6 +864,19 @@ class KuzuBackend:
             if table:
                 by_table.setdefault(table, []).append(node)
 
+        # Deduplicate by node.id within each table, keeping the last occurrence.
+        for table, nodes in by_table.items():
+            seen: dict[str, int] = {}
+            for i, node in enumerate(nodes):
+                seen[node.id] = i
+            if len(seen) < len(nodes):
+                logger.debug(
+                    "Deduplicated %d duplicate node(s) in table %s",
+                    len(nodes) - len(seen),
+                    table,
+                )
+                by_table[table] = [nodes[i] for i in sorted(seen.values())]
+
         try:
             for table, nodes in by_table.items():
                 self._csv_copy(table, [
@@ -889,6 +902,20 @@ class KuzuBackend:
             dst_table = _table_for_id(rel.target)
             if src_table and dst_table:
                 by_pair.setdefault((src_table, dst_table), []).append(rel)
+
+        # Deduplicate by (source, target, rel_type), keeping the last occurrence.
+        for pair_key, rels in by_pair.items():
+            seen: dict[tuple[str, str, str], int] = {}
+            for i, rel in enumerate(rels):
+                seen[(rel.source, rel.target, rel.type.value)] = i
+            if len(seen) < len(rels):
+                logger.debug(
+                    "Deduplicated %d duplicate rel(s) in %s->%s",
+                    len(rels) - len(seen),
+                    pair_key[0],
+                    pair_key[1],
+                )
+                by_pair[pair_key] = [rels[i] for i in sorted(seen.values())]
 
         try:
             for (src_table, dst_table), rels in by_pair.items():

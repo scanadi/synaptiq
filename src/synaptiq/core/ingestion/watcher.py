@@ -159,6 +159,10 @@ async def watch_repo(
             dirty = True
             logger.info("Reindexed %d file(s)", len(entries))
 
+        # Check stop event between batches.
+        if stop_event is not None and stop_event.is_set():
+            break
+
         now = time.monotonic()
         if dirty and (now - last_global) >= GLOBAL_PHASE_INTERVAL:
             logger.info("Running global analysis phases...")
@@ -167,6 +171,11 @@ async def watch_repo(
             full_graph, _ = await asyncio.to_thread(
                 run_pipeline, repo_path, None, True
             )
+
+            # Check stop event before the dangerous bulk_load write.
+            if stop_event is not None and stop_event.is_set():
+                logger.info("Shutdown requested, skipping bulk_load")
+                break
 
             # Apply to storage UNDER write lock (only the bulk_load step).
             await _run_under_write_lock(rwlock, storage.bulk_load, full_graph)
