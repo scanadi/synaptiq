@@ -482,8 +482,32 @@ def _init_storage_with_index(repo_path: Path, data_dir: Path, *, output=console)
             raise
 
     if not (data_dir / "meta.json").exists():
-        output.print("[bold]Running initial index...[/bold]")
-        _, result = run_pipeline(repo_path, storage, full=True)
+        import time as _time
+
+        output.print(f"[bold]Indexing[/bold] {repo_path}")
+
+        _last_phase = [None]
+        _phase_start = [_time.monotonic()]
+
+        def _on_progress(phase: str, pct: float) -> None:
+            now = _time.monotonic()
+            if phase != _last_phase[0]:
+                if _last_phase[0] is not None:
+                    elapsed = now - _phase_start[0]
+                    output.print(f"  {_last_phase[0]} [dim]({elapsed:.1f}s)[/dim]")
+                _last_phase[0] = phase
+                _phase_start[0] = now
+
+        _, result = run_pipeline(repo_path, storage, full=True, progress_callback=_on_progress)
+
+        if _last_phase[0] is not None:
+            elapsed = _time.monotonic() - _phase_start[0]
+            output.print(f"  {_last_phase[0]} [dim]({elapsed:.1f}s)[/dim]")
+
+        output.print(
+            f"[bold green]Done[/bold green] — {result.files} files, "
+            f"{result.symbols} symbols in {result.duration_seconds:.1f}s"
+        )
         _write_meta(data_dir, repo_path, result)
 
     return storage
