@@ -231,3 +231,56 @@ class TestObjectLiteralClassName:
         assert len(methods) == 1
         assert methods[0].name == "acquire"
         assert methods[0].class_name == "Pool"
+
+
+# ---------------------------------------------------------------------------
+# Variable type inference (VarTypeInfo)
+# ---------------------------------------------------------------------------
+
+
+class TestVariableTypeInference:
+    """Variable-to-type mappings are extracted from new_expression and type annotations."""
+
+    def test_new_expression_produces_var_type_info(self) -> None:
+        parser = TypeScriptParser(dialect="typescript")
+        result = parser.parse(
+            "const pool = new Pool();",
+            "db.ts",
+        )
+
+        assert len(result.variable_types) == 1
+        vt = result.variable_types[0]
+        assert vt.var_name == "pool"
+        assert vt.type_name == "Pool"
+
+    def test_type_annotation_produces_var_type_info(self) -> None:
+        parser = TypeScriptParser(dialect="typescript")
+        result = parser.parse(
+            "const config: AppConfig = loadConfig();",
+            "config.ts",
+        )
+
+        matching = [vt for vt in result.variable_types if vt.var_name == "config"]
+        assert len(matching) == 1
+        assert matching[0].type_name == "AppConfig"
+
+    def test_builtin_type_annotation_not_recorded(self) -> None:
+        parser = TypeScriptParser(dialect="typescript")
+        result = parser.parse(
+            "const count: number = 42;",
+            "counter.ts",
+        )
+
+        # number is a builtin type — should not produce VarTypeInfo
+        assert len(result.variable_types) == 0
+
+    def test_new_and_annotation_both_recorded(self) -> None:
+        parser = TypeScriptParser(dialect="typescript")
+        result = parser.parse(
+            "const pool: Pool = new Pool();\nconst cfg: Config = {};",
+            "setup.ts",
+        )
+
+        names = {vt.var_name for vt in result.variable_types}
+        assert "pool" in names
+        assert "cfg" in names

@@ -138,6 +138,8 @@ _FRAMEWORK_MODEL_BASES: frozenset[str] = frozenset({
     "Base", "DeclarativeBase",
     # TypeORM
     "BaseEntity",
+    # unittest
+    "TestCase",
 })
 
 _VITE_PLUGIN_HOOKS: frozenset[str] = frozenset({
@@ -360,7 +362,7 @@ def _clear_protocol_stub_false_positives(graph: KnowledgeGraph) -> int:
     return cleared
 
 def _clear_alive_class_method_false_positives(graph: KnowledgeGraph) -> int:
-    """Un-flag methods on classes that are alive (not dead).
+    """Un-flag methods on classes or object-literal variables that are alive.
 
     In TypeScript/JavaScript, class methods are typically called via instance
     references (``obj.method()``, ``this.method()``).  Without type-flow
@@ -370,6 +372,11 @@ def _clear_alive_class_method_false_positives(graph: KnowledgeGraph) -> int:
     This pass un-flags non-private methods on alive classes, since they are
     very likely called via instances.  Methods starting with ``_`` (private
     by convention) are left flagged.
+
+    Also covers the ESLint/Babel visitor pattern where methods are defined
+    inside an object literal assigned to a variable (``const Service = { ... }``).
+    If the owning variable name matches an alive function or is referenced
+    by alive code in the same file, the methods are un-flagged.
 
     Returns the number of methods un-flagged.
     """
@@ -381,18 +388,89 @@ def _clear_alive_class_method_false_positives(graph: KnowledgeGraph) -> int:
         else:
             alive_class_names.add(cls_node.name)
 
+    # Also consider alive functions whose name matches a class_name — these
+    # cover the pattern where a const variable holds an object literal:
+    #   const Service = { sendOTP() {} }
+    # and an alive function elsewhere references Service.
+    alive_function_names: set[str] = set()
+    for func_node in graph.get_nodes_by_label(NodeLabel.FUNCTION):
+        if not func_node.is_dead:
+            alive_function_names.add(func_node.name)
+
+    # Build a set of object-literal "class" names that are referenced by alive
+    # code in the same file.  A method's class_name is the variable name
+    # (e.g., "Service" for `const Service = { sendOTP() {} }`).
+    # Check if any alive symbol in the same file references that name in its content.
+    alive_obj_literal_names: set[str] = _find_alive_object_literal_names(graph)
+
     cleared = 0
     for method in graph.get_nodes_by_label(NodeLabel.METHOD):
         if not method.is_dead or not method.class_name:
             continue
-        if method.class_name in alive_class_names and not method.name.startswith("_"):
+        if method.name.startswith("_"):
+            continue
+        if method.class_name in alive_class_names:
             method.is_dead = False
             cleared += 1
             logger.debug(
                 "Un-flagged alive-class method: %s.%s", method.class_name, method.name
             )
+        elif (
+            method.class_name not in dead_class_names
+            and method.class_name in (alive_function_names | alive_obj_literal_names)
+        ):
+            method.is_dead = False
+            cleared += 1
+            logger.debug(
+                "Un-flagged alive-object-literal method: %s.%s",
+                method.class_name,
+                method.name,
+            )
 
     return cleared
+
+
+def _find_alive_object_literal_names(graph: KnowledgeGraph) -> set[str]:
+    """Find object-literal variable names referenced by alive code.
+
+    For each dead Method whose class_name is not a known class, check if
+    any alive symbol (Function/Method) in the same file mentions the
+    class_name in its content.  This covers patterns like:
+
+        function createVisitor() {
+            const visitors = { enter() {}, exit() {} };
+            return visitors;
+        }
+
+    where ``visitors`` is alive because ``createVisitor`` returns it.
+    """
+    # Collect all class_names from dead methods that are NOT real classes.
+    class_names_set: set[str] = set()
+    for cls_node in graph.get_nodes_by_label(NodeLabel.CLASS):
+        class_names_set.add(cls_node.name)
+
+    # Map: (file_path, obj_name) pairs to check
+    candidates: dict[str, set[str]] = {}  # file_path -> set of obj names
+    for method in graph.get_nodes_by_label(NodeLabel.METHOD):
+        if method.is_dead and method.class_name and method.class_name not in class_names_set:
+            candidates.setdefault(method.file_path, set()).add(method.class_name)
+
+    if not candidates:
+        return set()
+
+    alive_names: set[str] = set()
+    for label in (NodeLabel.FUNCTION, NodeLabel.METHOD):
+        for node in graph.get_nodes_by_label(label):
+            if node.is_dead or not node.content:
+                continue
+            obj_names = candidates.get(node.file_path)
+            if not obj_names:
+                continue
+            for obj_name in obj_names:
+                if obj_name in node.content:
+                    alive_names.add(obj_name)
+
+    return alive_names
 
 
 def _clear_inner_function_false_positives(graph: KnowledgeGraph) -> int:

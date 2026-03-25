@@ -18,7 +18,7 @@ from synaptiq.core.ingestion.calls import (
 )
 from synaptiq.core.ingestion.parser_phase import FileParseData
 from synaptiq.core.ingestion.symbol_lookup import build_name_index
-from synaptiq.core.parsers.base import CallInfo, ParseResult
+from synaptiq.core.parsers.base import CallInfo, ParseResult, VarTypeInfo
 
 _CALLABLE_LABELS = (NodeLabel.FUNCTION, NodeLabel.METHOD, NodeLabel.CLASS)
 
@@ -531,3 +531,72 @@ class TestOrphanCallsFallbackToFile:
         file_id = generate_id(NodeLabel.FILE, "src/app.ts")
         pairs = {(r.source, r.target) for r in calls_rels}
         assert (file_id, target_id) in pairs
+
+
+# ---------------------------------------------------------------------------
+# Type-inferred receiver method resolution
+# ---------------------------------------------------------------------------
+
+
+class TestTypeInferredReceiverResolution:
+    """Variable type inference enables receiver method resolution."""
+
+    def test_new_expression_type_inference_resolves_method(self) -> None:
+        """pool.acquire() resolves to Pool.acquire via type inference from new Pool()."""
+        g = KnowledgeGraph()
+
+        _add_file_node(g, "src/db.ts")
+        _add_symbol_node(g, NodeLabel.CLASS, "src/db.ts", "Pool", 1, 20)
+        caller_id = _add_symbol_node(
+            g, NodeLabel.FUNCTION, "src/db.ts", "connect", 22, 30
+        )
+        method_id = _add_symbol_node(
+            g, NodeLabel.METHOD, "src/db.ts", "acquire", 5, 10, class_name="Pool"
+        )
+
+        parse = [
+            FileParseData(
+                file_path="src/db.ts",
+                language="typescript",
+                parse_result=ParseResult(
+                    calls=[CallInfo(name="acquire", line=25, receiver="pool")],
+                    variable_types=[VarTypeInfo(var_name="pool", type_name="Pool", line=23)],
+                ),
+            ),
+        ]
+
+        process_calls(parse, g)
+
+        calls_rels = g.get_relationships_by_type(RelType.CALLS)
+        pairs = {(r.source, r.target) for r in calls_rels}
+        assert (caller_id, method_id) in pairs
+
+    def test_type_annotation_inference_resolves_method(self) -> None:
+        """svc.run() resolves to Service.run via type annotation const svc: Service."""
+        g = KnowledgeGraph()
+
+        _add_file_node(g, "src/app.ts")
+        _add_symbol_node(g, NodeLabel.CLASS, "src/app.ts", "Service", 1, 20)
+        caller_id = _add_symbol_node(
+            g, NodeLabel.FUNCTION, "src/app.ts", "main", 22, 30
+        )
+        method_id = _add_symbol_node(
+            g, NodeLabel.METHOD, "src/app.ts", "run", 5, 10, class_name="Service"
+        )
+
+        parse = [
+            FileParseData(
+                file_path="src/app.ts",
+                language="typescript",
+                parse_result=ParseResult(
+                    calls=[CallInfo(name="run", line=25, receiver="svc")],
+                    variable_types=[VarTypeInfo(var_name="svc", type_name="Service", line=23)],
+                ),
+            ),
+        ]
+
+        process_calls(parse, g)
+
+        calls_rels = g.get_relationships_by_type(RelType.CALLS)
+        pairs = {(r.source, r.target) for r in calls_rels}
+        assert (caller_id, method_id) in pairs

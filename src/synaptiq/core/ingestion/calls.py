@@ -331,6 +331,22 @@ def _resolve_receiver_method(
         _add_calls_edge(source_id, target, 0.8, graph, seen)
 
 
+def _build_var_type_map(parse_data: list[FileParseData]) -> dict[str, dict[str, str]]:
+    """Build a per-file {var_name → type_name} map from variable type info.
+
+    Used to resolve receiver method calls like ``pool.acquire()`` where
+    ``pool`` was declared as ``const pool = new Pool()``.
+    """
+    result: dict[str, dict[str, str]] = {}
+    for fpd in parse_data:
+        if fpd.parse_result.variable_types:
+            file_map: dict[str, str] = {}
+            for vt in fpd.parse_result.variable_types:
+                file_map.setdefault(vt.var_name, vt.type_name)
+            result[fpd.file_path] = file_map
+    return result
+
+
 def process_calls(
     parse_data: list[FileParseData],
     graph: KnowledgeGraph,
@@ -357,6 +373,7 @@ def process_calls(
     """
     call_index = build_name_index(graph, _CALLABLE_LABELS)
     file_sym_index = build_file_symbol_index(graph, _CALLABLE_LABELS)
+    var_type_map = _build_var_type_map(parse_data)
     seen: set[str] = set()
 
     for fpd in parse_data:
@@ -415,8 +432,13 @@ def process_calls(
                 if recv_id is not None:
                     _add_calls_edge(source_id, recv_id, recv_conf, graph, seen)
 
+                # Use type-inferred name when available (e.g., pool → Pool).
+                resolved_receiver = (
+                    var_type_map.get(fpd.file_path, {}).get(receiver, receiver)
+                )
+
                 _resolve_receiver_method(
-                    receiver, call.name, source_id, fpd.file_path,
+                    resolved_receiver, call.name, source_id, fpd.file_path,
                     call_index, graph, seen,
                 )
 

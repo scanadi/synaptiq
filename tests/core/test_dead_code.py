@@ -814,3 +814,88 @@ class TestSkipsFrameworkModelClasses:
         node = g.get_node(node_id)
         assert node is not None
         assert node.is_dead is True
+
+    @pytest.mark.parametrize(
+        "base_name",
+        ["TestCase"],
+    )
+    def test_additional_framework_bases_not_dead(self, base_name: str) -> None:
+        """Classes extending unittest.TestCase and similar bases are not flagged dead."""
+        g = KnowledgeGraph()
+        _add_file_node(g, "src/tests.py")
+        node_id = _add_symbol_node(
+            g, NodeLabel.CLASS, "src/tests.py", "MyTestCase"
+        )
+        node = g.get_node(node_id)
+        assert node is not None
+        node.properties["bases"] = [base_name]
+
+        process_dead_code(g)
+
+        assert node.is_dead is False
+
+
+# ---------------------------------------------------------------------------
+# Object-literal method alive pass tests
+# ---------------------------------------------------------------------------
+
+
+class TestSkipsAliveObjectLiteralMethods:
+    """Methods on object literals referenced by alive code are not flagged dead."""
+
+    def test_object_literal_method_referenced_by_alive_function(self) -> None:
+        """const visitors = { enter() {} } — if alive code references 'visitors', un-flag."""
+        g = KnowledgeGraph()
+        _add_file_node(g, "src/plugin.ts")
+        _add_file_node(g, "src/main.ts")
+
+        # An alive function that references "visitors" in its content
+        alive_id = _add_symbol_node(
+            g, NodeLabel.FUNCTION, "src/plugin.ts", "createPlugin",
+            is_exported=True,
+        )
+        alive_node = g.get_node(alive_id)
+        assert alive_node is not None
+        alive_node.start_line = 1
+        alive_node.end_line = 20
+        alive_node.content = (
+            "function createPlugin() {\n"
+            "  const visitors = { enter() {}, exit() {} };\n"
+            "  return visitors;\n"
+            "}"
+        )
+
+        # Methods on the object literal "visitors"
+        enter_id = _add_symbol_node(
+            g, NodeLabel.METHOD, "src/plugin.ts", "enter",
+            class_name="visitors",
+        )
+        exit_id = _add_symbol_node(
+            g, NodeLabel.METHOD, "src/plugin.ts", "exit",
+            class_name="visitors",
+        )
+
+        process_dead_code(g)
+
+        enter_node = g.get_node(enter_id)
+        exit_node = g.get_node(exit_id)
+        assert enter_node is not None
+        assert exit_node is not None
+        assert enter_node.is_dead is False
+        assert exit_node.is_dead is False
+
+    def test_object_literal_method_no_reference_still_dead(self) -> None:
+        """Methods on unreferenced object literals remain dead."""
+        g = KnowledgeGraph()
+        _add_file_node(g, "src/unused.ts")
+
+        method_id = _add_symbol_node(
+            g, NodeLabel.METHOD, "src/unused.ts", "doStuff",
+            class_name="orphanObj",
+        )
+
+        process_dead_code(g)
+
+        method_node = g.get_node(method_id)
+        assert method_node is not None
+        assert method_node.is_dead is True

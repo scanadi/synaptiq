@@ -19,6 +19,7 @@ from synaptiq.core.parsers.base import (
     ParseResult,
     SymbolInfo,
     TypeRef,
+    VarTypeInfo,
 )
 
 TS_LANGUAGE = Language(tstypescript.language_typescript())
@@ -273,7 +274,7 @@ class TypeScriptParser(LanguageParser):
     def _extract_variable_declaration(
         self, node: Node, source: str, result: ParseResult
     ) -> None:
-        """Handle arrow functions, function expressions, and require() calls."""
+        """Handle arrow functions, function expressions, require() calls, and type inference."""
         for child in node.children:
             if child.type != "variable_declarator":
                 continue
@@ -289,6 +290,17 @@ class TypeScriptParser(LanguageParser):
                 self._extract_assigned_function(child, var_name, value_node, result)
             elif value_node.type == "call_expression":
                 self._maybe_extract_require(child, var_name, value_node, result)
+            elif value_node.type == "new_expression":
+                # const pool = new Pool() → infer pool: Pool
+                constructor_node = value_node.child_by_field_name("constructor")
+                if constructor_node is not None and constructor_node.type == "identifier":
+                    result.variable_types.append(
+                        VarTypeInfo(
+                            var_name=var_name,
+                            type_name=constructor_node.text.decode(),
+                            line=node.start_point[0] + 1,
+                        )
+                    )
 
             self._extract_variable_type_annotation(child, result)
 
@@ -724,6 +736,7 @@ class TypeScriptParser(LanguageParser):
         self, declarator_node: Node, result: ParseResult
     ) -> None:
         """Extract type from ``const x: Config = ...``."""
+        name_node = declarator_node.child_by_field_name("name")
         for child in declarator_node.children:
             if child.type == "type_annotation":
                 type_name = self._type_annotation_name(child)
@@ -735,6 +748,15 @@ class TypeScriptParser(LanguageParser):
                             line=child.start_point[0] + 1,
                         )
                     )
+                    # Also record as variable-to-type mapping for receiver resolution
+                    if name_node is not None:
+                        result.variable_types.append(
+                            VarTypeInfo(
+                                var_name=name_node.text.decode(),
+                                type_name=type_name,
+                                line=child.start_point[0] + 1,
+                            )
+                        )
 
     @staticmethod
     def _type_annotation_name(annotation_node: Node) -> str:
