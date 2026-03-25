@@ -609,11 +609,14 @@ class TypeScriptParser(LanguageParser):
     def _extract_jsx_expression_references(
         self, node: Node, source: str, result: ParseResult
     ) -> None:
-        """Extract identifier references from JSX expressions like ``{handleClick}``."""
+        """Extract identifier references from JSX expressions like ``{handleClick}``.
+
+        Also handles ternary expressions ``{cond ? handlerA : handlerB}``
+        one level deep.
+        """
         for child in node.children:
             if child.type == "identifier":
                 name = child.text.decode()
-                # Skip common non-function values (booleans, common variables)
                 if not name[0].isupper() and not name.startswith("_"):
                     line = node.start_point[0] + 1
                     result.calls.append(CallInfo(name=name, line=line))
@@ -627,6 +630,15 @@ class TypeScriptParser(LanguageParser):
                         line=line,
                         receiver=obj.text.decode(),
                     ))
+            elif child.type == "ternary_expression":
+                # {condition ? handlerA : handlerB}
+                consequence = child.child_by_field_name("consequence")
+                alternative = child.child_by_field_name("alternative")
+                for branch in (consequence, alternative):
+                    if branch is not None and branch.type == "identifier":
+                        name = branch.text.decode()
+                        line = branch.start_point[0] + 1
+                        result.calls.append(CallInfo(name=name, line=line))
 
     def _extract_object_property_callback(
         self, node: Node, source: str, result: ParseResult
@@ -774,12 +786,24 @@ class TypeScriptParser(LanguageParser):
 
     @staticmethod
     def _find_parent_class_name(node: Node) -> str:
-        """Walk up the tree to find the enclosing class name."""
+        """Walk up the tree to find the enclosing class or object-literal name.
+
+        Handles both ``class Foo { method() {} }`` and the common TS/JS
+        pattern ``const Foo = { method() {} }`` where an object literal
+        acts as a class-like namespace.
+        """
         current = node.parent
         while current is not None:
             if current.type == "class_declaration":
                 name_node = current.child_by_field_name("name")
                 if name_node is not None:
                     return name_node.text.decode()
+            elif current.type == "variable_declarator":
+                # const Foo = { method() {} } — the object literal is the value
+                value_node = current.child_by_field_name("value")
+                if value_node is not None and value_node.type == "object":
+                    name_node = current.child_by_field_name("name")
+                    if name_node is not None:
+                        return name_node.text.decode()
             current = current.parent
         return ""

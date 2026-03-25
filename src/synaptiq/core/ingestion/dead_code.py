@@ -129,6 +129,31 @@ _ENUM_BASES: frozenset[str] = frozenset({
     "Enum", "IntEnum", "StrEnum", "Flag", "IntFlag",
 })
 
+_FRAMEWORK_MODEL_BASES: frozenset[str] = frozenset({
+    # Pydantic
+    "BaseModel", "BaseSettings",
+    # Django ORM
+    "Model", "Manager",
+    # SQLAlchemy
+    "Base", "DeclarativeBase",
+    # TypeORM
+    "BaseEntity",
+})
+
+_VITE_PLUGIN_HOOKS: frozenset[str] = frozenset({
+    "resolveId", "load", "transform", "buildStart", "buildEnd",
+    "closeBundle", "configResolved", "configureServer", "handleHotUpdate",
+    "renderChunk", "generateBundle", "writeBundle", "options",
+    "manualChunks", "renderStart", "renderError", "footer", "banner",
+    "intro", "outro", "moduleParsed",
+})
+
+_CONFIG_CALLBACK_PATTERNS: frozenset[str] = frozenset({
+    "configure", "getLoadContext", "beforeAll", "onError",
+    "onShellError", "onShellReady", "onAllReady",
+    "esbuildOptions", "onSuccess", "viteFinal", "onwarn",
+})
+
 def _is_enum_class(node: GraphNode, label: NodeLabel) -> bool:
     """Return ``True`` if *node* is an enum class (members accessed via dot, not called)."""
     if label != NodeLabel.CLASS:
@@ -136,9 +161,43 @@ def _is_enum_class(node: GraphNode, label: NodeLabel) -> bool:
     bases: list[str] = node.properties.get("bases", [])
     return bool(_ENUM_BASES & set(bases))
 
+def _is_framework_model_class(node: GraphNode, label: NodeLabel) -> bool:
+    """Return ``True`` if *node* extends a framework model base class.
+
+    Framework models (Pydantic BaseModel, Django Model, etc.) are
+    instantiated and used by the framework's metaclass machinery.
+    They appear uncalled in the graph because the framework does the
+    calling, not user code.
+    """
+    if label != NodeLabel.CLASS:
+        return False
+    bases: list[str] = node.properties.get("bases", [])
+    return bool(_FRAMEWORK_MODEL_BASES & set(bases))
+
 def _is_python_public_api(name: str, file_path: str) -> bool:
     """Return ``True`` if *name* is a public symbol in an ``__init__.py`` file."""
     return file_path.endswith("__init__.py") and not name.startswith("_")
+
+def _is_config_file_hook(name: str, file_path: str) -> bool:
+    """Return ``True`` if *name* is a known framework config hook in a config file."""
+    if name in _CONFIG_CALLBACK_PATTERNS:
+        return True
+    if name in _VITE_PLUGIN_HOOKS and (
+        "vite.config" in file_path
+        or "vitest.config" in file_path
+        or "tsup.config" in file_path
+        or "rollup.config" in file_path
+    ):
+        return True
+    return False
+
+def _is_framework_entry_file(file_path: str) -> bool:
+    """Return ``True`` if the file is a framework entry point where all symbols are used."""
+    basename = PurePosixPath(file_path).name
+    return basename in (
+        "entry.server.tsx", "entry.server.ts", "entry.server.js",
+        "entry.client.tsx", "entry.client.ts", "entry.client.js",
+    )
 
 def _is_exempt(
     name: str, is_entry_point: bool, is_exported: bool, file_path: str = ""
@@ -165,6 +224,8 @@ def _is_exempt(
         or _is_test_file(file_path)
         or _is_dunder(name)
         or _is_python_public_api(name, file_path)
+        or _is_config_file_hook(name, file_path)
+        or _is_framework_entry_file(file_path)
     )
 
 def _clear_override_false_positives(graph: KnowledgeGraph) -> int:
@@ -298,6 +359,76 @@ def _clear_protocol_stub_false_positives(graph: KnowledgeGraph) -> int:
 
     return cleared
 
+def _clear_alive_class_method_false_positives(graph: KnowledgeGraph) -> int:
+    """Un-flag methods on classes that are alive (not dead).
+
+    In TypeScript/JavaScript, class methods are typically called via instance
+    references (``obj.method()``, ``this.method()``).  Without type-flow
+    analysis the call resolver cannot link these calls to their targets,
+    so methods appear to have zero incoming CALLS edges.
+
+    This pass un-flags non-private methods on alive classes, since they are
+    very likely called via instances.  Methods starting with ``_`` (private
+    by convention) are left flagged.
+
+    Returns the number of methods un-flagged.
+    """
+    dead_class_names: set[str] = set()
+    alive_class_names: set[str] = set()
+    for cls_node in graph.get_nodes_by_label(NodeLabel.CLASS):
+        if cls_node.is_dead:
+            dead_class_names.add(cls_node.name)
+        else:
+            alive_class_names.add(cls_node.name)
+
+    cleared = 0
+    for method in graph.get_nodes_by_label(NodeLabel.METHOD):
+        if not method.is_dead or not method.class_name:
+            continue
+        if method.class_name in alive_class_names and not method.name.startswith("_"):
+            method.is_dead = False
+            cleared += 1
+            logger.debug(
+                "Un-flagged alive-class method: %s.%s", method.class_name, method.name
+            )
+
+    return cleared
+
+
+def _clear_inner_function_false_positives(graph: KnowledgeGraph) -> int:
+    """Un-flag inner functions whose containing function is alive.
+
+    In TypeScript/React, handler functions are often defined as arrow
+    functions inside a component.  These appear as separate Function nodes
+    but are only referenced within their parent's JSX output.  If the
+    parent function is alive, the inner function is likely used.
+
+    Returns the number of functions un-flagged.
+    """
+    alive_ranges: dict[str, list[tuple[int, int]]] = {}
+    for node in graph.get_nodes_by_label(NodeLabel.FUNCTION):
+        if not node.is_dead and node.start_line and node.end_line:
+            alive_ranges.setdefault(node.file_path, []).append(
+                (node.start_line, node.end_line)
+            )
+
+    cleared = 0
+    for node in graph.get_nodes_by_label(NodeLabel.FUNCTION):
+        if not node.is_dead or not node.start_line or not node.end_line:
+            continue
+        ranges = alive_ranges.get(node.file_path)
+        if not ranges:
+            continue
+        for parent_start, parent_end in ranges:
+            if parent_start < node.start_line and node.end_line < parent_end:
+                node.is_dead = False
+                cleared += 1
+                logger.debug("Un-flagged inner function: %s in %s", node.name, node.file_path)
+                break
+
+    return cleared
+
+
 def process_dead_code(graph: KnowledgeGraph) -> int:
     """Detect dead (unreachable) symbols and flag them in the graph.
 
@@ -317,7 +448,7 @@ def process_dead_code(graph: KnowledgeGraph) -> int:
     12. It is not an ``@overload`` or ``@abstractmethod`` stub.
     13. It is not an enum class (extends ``Enum``, ``IntEnum``, etc.).
 
-    After the initial pass, three additional passes reduce false positives:
+    After the initial pass, five additional passes reduce false positives:
 
     - **Override pass**: un-flags method overrides whose base class method
       is called (resolves dynamic dispatch false positives).
@@ -325,6 +456,10 @@ def process_dead_code(graph: KnowledgeGraph) -> int:
       structurally conform to a Protocol interface.
     - **Protocol stub pass**: un-flags methods on Protocol classes
       themselves (stubs are never called directly).
+    - **Alive class method pass**: un-flags non-private methods on classes
+      that are alive (instance call resolution gap).
+    - **Inner function pass**: un-flags inner functions defined inside
+      alive parent functions (React handler pattern).
 
     For each dead symbol the function sets ``node.is_dead = True``.
 
@@ -352,6 +487,8 @@ def process_dead_code(graph: KnowledgeGraph) -> int:
                 continue
             if _is_enum_class(node, label):
                 continue
+            if _is_framework_model_class(node, label):
+                continue
 
             node.is_dead = True
             dead_count += 1
@@ -368,5 +505,13 @@ def process_dead_code(graph: KnowledgeGraph) -> int:
     # Fourth pass: un-flag Protocol class stubs (interface contracts, never called directly).
     stub_cleared = _clear_protocol_stub_false_positives(graph)
     dead_count -= stub_cleared
+
+    # Fifth pass: un-flag non-private methods on alive classes (instance call resolution gap).
+    alive_class_cleared = _clear_alive_class_method_false_positives(graph)
+    dead_count -= alive_class_cleared
+
+    # Sixth pass: un-flag inner functions defined inside alive parent functions.
+    inner_cleared = _clear_inner_function_false_positives(graph)
+    dead_count -= inner_cleared
 
     return dead_count

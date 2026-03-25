@@ -491,3 +491,43 @@ class TestResolveCallImportResolved:
         )
         assert target_id == expected_id
         assert confidence == 1.0
+
+
+# ---------------------------------------------------------------------------
+# process_calls — orphan (module-level) calls fall back to File node
+# ---------------------------------------------------------------------------
+
+
+class TestOrphanCallsFallbackToFile:
+    """Module-level calls outside any function should still create CALLS edges."""
+
+    def test_module_level_call_creates_edge(self) -> None:
+        """A call at the top level (not inside any function) uses the File node as source."""
+        g = KnowledgeGraph()
+
+        _add_file_node(g, "src/app.ts")
+        _add_file_node(g, "src/init.ts")
+
+        # Target function exists in another file.
+        target_id = _add_symbol_node(
+            g, NodeLabel.FUNCTION, "src/init.ts", "bootstrap", 1, 10
+        )
+
+        # No symbols in app.ts — the call at line 3 is at module level.
+        parse = [
+            FileParseData(
+                file_path="src/app.ts",
+                language="typescript",
+                parse_result=ParseResult(
+                    calls=[CallInfo(name="bootstrap", line=3)],
+                ),
+            ),
+        ]
+
+        process_calls(parse, g)
+
+        calls_rels = g.get_relationships_by_type(RelType.CALLS)
+        # The edge should exist with the File node as source.
+        file_id = generate_id(NodeLabel.FILE, "src/app.ts")
+        pairs = {(r.source, r.target) for r in calls_rels}
+        assert (file_id, target_id) in pairs

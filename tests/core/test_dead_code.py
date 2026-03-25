@@ -596,3 +596,221 @@ class TestSkipsMockAndFixtureDirectories:
         node = g.get_node(node_id)
         assert node is not None
         assert node.is_dead is False
+
+
+# ---------------------------------------------------------------------------
+# Alive class method tests
+# ---------------------------------------------------------------------------
+
+
+class TestSkipsAliveClassMethods:
+    """Non-private methods on alive classes are not flagged dead."""
+
+    def test_method_on_alive_class_not_dead(self) -> None:
+        g = KnowledgeGraph()
+        _add_file_node(g, "src/pool.ts")
+        _add_file_node(g, "src/main.ts")
+
+        class_id = _add_symbol_node(g, NodeLabel.CLASS, "src/pool.ts", "Pool")
+        caller_id = _add_symbol_node(
+            g, NodeLabel.FUNCTION, "src/main.ts", "main", is_entry_point=True
+        )
+        _add_calls_relationship(g, caller_id, class_id)
+
+        method_id = _add_symbol_node(
+            g, NodeLabel.METHOD, "src/pool.ts", "acquire", class_name="Pool"
+        )
+
+        process_dead_code(g)
+
+        node = g.get_node(method_id)
+        assert node is not None
+        assert node.is_dead is False
+
+    def test_method_on_dead_class_still_dead(self) -> None:
+        g = KnowledgeGraph()
+        _add_file_node(g, "src/unused.ts")
+
+        _add_symbol_node(g, NodeLabel.CLASS, "src/unused.ts", "Unused")
+        method_id = _add_symbol_node(
+            g, NodeLabel.METHOD, "src/unused.ts", "doStuff", class_name="Unused"
+        )
+
+        process_dead_code(g)
+
+        node = g.get_node(method_id)
+        assert node is not None
+        assert node.is_dead is True
+
+    def test_private_method_on_alive_class_still_dead(self) -> None:
+        g = KnowledgeGraph()
+        _add_file_node(g, "src/pool.ts")
+        _add_file_node(g, "src/main.ts")
+
+        class_id = _add_symbol_node(g, NodeLabel.CLASS, "src/pool.ts", "Pool")
+        caller_id = _add_symbol_node(
+            g, NodeLabel.FUNCTION, "src/main.ts", "main", is_entry_point=True
+        )
+        _add_calls_relationship(g, caller_id, class_id)
+
+        method_id = _add_symbol_node(
+            g, NodeLabel.METHOD, "src/pool.ts", "_internalHelper", class_name="Pool"
+        )
+
+        process_dead_code(g)
+
+        node = g.get_node(method_id)
+        assert node is not None
+        assert node.is_dead is True
+
+
+# ---------------------------------------------------------------------------
+# Inner function tests
+# ---------------------------------------------------------------------------
+
+
+class TestSkipsInnerFunctions:
+    """Inner functions inside alive parent functions are not flagged dead."""
+
+    def test_inner_function_in_alive_parent_not_dead(self) -> None:
+        g = KnowledgeGraph()
+        _add_file_node(g, "src/component.tsx")
+        _add_file_node(g, "src/app.tsx")
+
+        parent_id = _add_symbol_node(
+            g, NodeLabel.FUNCTION, "src/component.tsx", "MyComponent"
+        )
+        parent_node = g.get_node(parent_id)
+        assert parent_node is not None
+        parent_node.start_line = 1
+        parent_node.end_line = 50
+
+        caller_id = _add_symbol_node(
+            g, NodeLabel.FUNCTION, "src/app.tsx", "App", is_entry_point=True
+        )
+        _add_calls_relationship(g, caller_id, parent_id)
+
+        inner_id = _add_symbol_node(
+            g, NodeLabel.FUNCTION, "src/component.tsx", "handleClick"
+        )
+        inner_node = g.get_node(inner_id)
+        assert inner_node is not None
+        inner_node.start_line = 10
+        inner_node.end_line = 15
+
+        process_dead_code(g)
+
+        node = g.get_node(inner_id)
+        assert node is not None
+        assert node.is_dead is False
+
+    def test_top_level_function_still_dead(self) -> None:
+        g = KnowledgeGraph()
+        _add_file_node(g, "src/utils.ts")
+
+        node_id = _add_symbol_node(
+            g, NodeLabel.FUNCTION, "src/utils.ts", "unusedUtil"
+        )
+        node = g.get_node(node_id)
+        assert node is not None
+        node.start_line = 1
+        node.end_line = 10
+
+        process_dead_code(g)
+
+        node = g.get_node(node_id)
+        assert node is not None
+        assert node.is_dead is True
+
+
+# ---------------------------------------------------------------------------
+# Config file hook tests
+# ---------------------------------------------------------------------------
+
+
+class TestSkipsConfigFileHooks:
+    """Vite/config plugin hooks are not flagged dead."""
+
+    @pytest.mark.parametrize(
+        "name,file_path",
+        [
+            ("resolveId", "apps/web/vite.config.ts"),
+            ("closeBundle", "apps/server/vite.config.ts"),
+            ("manualChunks", "apps/web/vite.config.ts"),
+            ("configure", "apps/web/server/index.ts"),
+            ("onShellError", "apps/web/pages/entry.server.tsx"),
+        ],
+    )
+    def test_config_hooks_not_dead(self, name: str, file_path: str) -> None:
+        g = KnowledgeGraph()
+        _add_file_node(g, file_path)
+        node_id = _add_symbol_node(g, NodeLabel.FUNCTION, file_path, name)
+
+        process_dead_code(g)
+
+        node = g.get_node(node_id)
+        assert node is not None
+        assert node.is_dead is False
+
+
+# ---------------------------------------------------------------------------
+# Framework entry file tests
+# ---------------------------------------------------------------------------
+
+
+class TestSkipsFrameworkEntryFiles:
+    """All symbols in entry.server.tsx / entry.client.tsx are exempt."""
+
+    def test_entry_server_symbols_not_dead(self) -> None:
+        g = KnowledgeGraph()
+        _add_file_node(g, "apps/web/pages/entry.server.tsx")
+        node_id = _add_symbol_node(
+            g, NodeLabel.METHOD, "apps/web/pages/entry.server.tsx", "[readyOption]"
+        )
+
+        process_dead_code(g)
+
+        node = g.get_node(node_id)
+        assert node is not None
+        assert node.is_dead is False
+
+
+# ---------------------------------------------------------------------------
+# Framework model base class tests
+# ---------------------------------------------------------------------------
+
+
+class TestSkipsFrameworkModelClasses:
+    """Classes extending framework model bases (BaseModel, Model, etc.) are exempt."""
+
+    @pytest.mark.parametrize(
+        "base_name",
+        ["BaseModel", "BaseSettings", "Model", "Manager", "Base", "DeclarativeBase",
+         "BaseEntity"],
+    )
+    def test_framework_model_class_not_dead(self, base_name: str) -> None:
+        g = KnowledgeGraph()
+        _add_file_node(g, "src/models.py")
+        node_id = _add_symbol_node(
+            g, NodeLabel.CLASS, "src/models.py", "MyModel"
+        )
+        node = g.get_node(node_id)
+        assert node is not None
+        node.properties["bases"] = [base_name]
+
+        process_dead_code(g)
+
+        assert node.is_dead is False
+
+    def test_class_without_framework_base_still_dead(self) -> None:
+        g = KnowledgeGraph()
+        _add_file_node(g, "src/models.py")
+        node_id = _add_symbol_node(
+            g, NodeLabel.CLASS, "src/models.py", "OrphanClass"
+        )
+
+        process_dead_code(g)
+
+        node = g.get_node(node_id)
+        assert node is not None
+        assert node.is_dead is True

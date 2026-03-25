@@ -198,3 +198,36 @@ class TestDynamicImport:
         matching = [i for i in result.imports if i.module == "./Component"]
         assert len(matching) == 1
         assert matching[0].is_relative is True
+
+
+# ---------------------------------------------------------------------------
+# Object literal class_name resolution
+# ---------------------------------------------------------------------------
+
+
+class TestObjectLiteralClassName:
+    """Methods in object literals should get the variable name as class_name."""
+
+    def test_object_literal_method_has_class_name(self) -> None:
+        parser = TypeScriptParser(dialect="typescript")
+        result = parser.parse(
+            "const EmailService = {\n  sendOTP() { return true; }\n};",
+            "service.ts",
+        )
+
+        methods = [s for s in result.symbols if s.kind == "method"]
+        assert len(methods) == 1
+        assert methods[0].name == "sendOTP"
+        assert methods[0].class_name == "EmailService"
+
+    def test_class_method_still_works(self) -> None:
+        parser = TypeScriptParser(dialect="typescript")
+        result = parser.parse(
+            "class Pool {\n  acquire() { return null; }\n}",
+            "pool.ts",
+        )
+
+        methods = [s for s in result.symbols if s.kind == "method"]
+        assert len(methods) == 1
+        assert methods[0].name == "acquire"
+        assert methods[0].class_name == "Pool"

@@ -371,13 +371,10 @@ def process_calls(
                 call.line, fpd.file_path, file_sym_index
             )
             if source_id is None:
-                logger.debug(
-                    "No containing symbol for call %s at line %d in %s",
-                    call.name,
-                    call.line,
-                    fpd.file_path,
-                )
-                continue
+                # Module-level call outside any function/class body.
+                # Attribute to the File node so the target still gets a
+                # CALLS edge (prevents false-positive dead-code flags).
+                source_id = generate_id(NodeLabel.FILE, fpd.file_path)
 
             # Determine caller class for self/this resolution.
             caller_class_name: str | None = None
