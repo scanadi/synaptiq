@@ -36,6 +36,7 @@ from synaptiq.core.ingestion.heritage import process_heritage
 from synaptiq.core.ingestion.imports import process_imports
 from synaptiq.core.ingestion.parser_phase import process_parsing
 from synaptiq.core.ingestion.processes import process_processes
+from synaptiq.core.ingestion.rest_linking import process_rest_linking
 from synaptiq.core.ingestion.structure import process_structure
 from synaptiq.core.ingestion.types import process_types
 from synaptiq.core.ingestion.walker import FileEntry, walk_repo
@@ -53,6 +54,7 @@ class PipelineResult:
     processes: int = 0
     dead_code: int = 0
     coupled_pairs: int = 0
+    rest_links: int = 0
     embeddings: int = 0
     duration_seconds: float = 0.0
     incremental: bool = False
@@ -132,6 +134,10 @@ def run_pipeline(
     report("Tracing calls", 0.0)
     process_calls(parse_data, graph)
     report("Tracing calls", 1.0)
+
+    report("Linking REST endpoints", 0.0)
+    result.rest_links = process_rest_linking(parse_data, graph)
+    report("Linking REST endpoints", 1.0)
 
     report("Extracting heritage", 0.0)
     process_heritage(parse_data, graph)

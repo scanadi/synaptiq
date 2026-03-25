@@ -1,6 +1,6 @@
 """MCP server for Synaptiq — exposes code intelligence tools over stdio transport.
 
-Registers fifteen tools and three resources that give AI agents and MCP clients
+Registers twenty tools and three resources that give AI agents and MCP clients
 access to the Synaptiq knowledge graph.  The server lazily initialises a
 :class:`KuzuBackend` from the ``.synaptiq/kuzu`` directory in the current
 working directory.
@@ -38,6 +38,8 @@ from synaptiq.mcp.resources import get_dead_code_list, get_overview, get_schema
 if TYPE_CHECKING:
     from synaptiq.core.daemon.socket_client import SocketClient
 
+from synaptiq.mcp.secret_scanner import redact as _redact_secrets
+from synaptiq.mcp.token_budget import truncate_response, wrap_with_metadata
 from synaptiq.mcp.tools import (
     handle_call_path,
     handle_communities,
@@ -48,11 +50,16 @@ from synaptiq.mcp.tools import (
     handle_dead_code,
     handle_detect_changes,
     handle_explain,
+    handle_export,
     handle_file_context,
+    handle_forget,
     handle_impact,
     handle_list_repos,
     handle_query,
+    handle_recall,
+    handle_remember,
     handle_review_risk,
+    handle_suggest,
     handle_test_impact,
 )
 
@@ -161,6 +168,18 @@ TOOLS: list[Tool] = [
                     "description": "Maximum number of results (default 20).",
                     "default": 20,
                 },
+                "focus_files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Bias results toward symbols in these files using "
+                        "Personalized PageRank."
+                    ),
+                },
+                "max_tokens": {
+                    "type": "integer",
+                    "description": "Maximum response size in tokens.",
+                },
             },
             "required": ["query"],
         },
@@ -177,6 +196,18 @@ TOOLS: list[Tool] = [
                 "symbol": {
                     "type": "string",
                     "description": "Name of the symbol to look up.",
+                },
+                "focus_files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Bias results toward symbols near these files using "
+                        "Personalized PageRank."
+                    ),
+                },
+                "max_tokens": {
+                    "type": "integer",
+                    "description": "Maximum response size in tokens.",
                 },
             },
             "required": ["symbol"],
@@ -394,6 +425,113 @@ TOOLS: list[Tool] = [
             },
         },
     ),
+    Tool(
+        name="synaptiq_remember",
+        description=(
+            "Persist a fact about the codebase for recall in future sessions. "
+            "Useful for storing architectural insights discovered during analysis."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "key": {
+                    "type": "string",
+                    "description": "Unique key identifying the fact.",
+                },
+                "value": {
+                    "type": "string",
+                    "description": "The fact or insight to remember.",
+                },
+                "category": {
+                    "type": "string",
+                    "description": (
+                        "Optional category (e.g. 'architecture', 'pattern')."
+                    ),
+                },
+            },
+            "required": ["key", "value"],
+        },
+    ),
+    Tool(
+        name="synaptiq_recall",
+        description=(
+            "Retrieve previously stored facts about the codebase. "
+            "Searches by key (exact) or fuzzy word overlap across all facts."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Key or search query to look up.",
+                },
+            },
+            "required": ["query"],
+        },
+    ),
+    Tool(
+        name="synaptiq_forget",
+        description="Remove a previously stored fact by key.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "key": {
+                    "type": "string",
+                    "description": "Key of the fact to remove.",
+                },
+            },
+            "required": ["key"],
+        },
+    ),
+    Tool(
+        name="synaptiq_suggest",
+        description=(
+            "Get suggested tool calls for a natural language question. "
+            "Returns an ordered sequence of recommended Synaptiq tools and arguments."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "Natural language question about the codebase.",
+                },
+            },
+            "required": ["question"],
+        },
+    ),
+    Tool(
+        name="synaptiq_export",
+        description=(
+            "Graph-aware context packing: traverse from a symbol and return all "
+            "structurally relevant code in a single response. Replaces multiple "
+            "round-trip tool calls with one comprehensive result."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "symbol": {
+                    "type": "string",
+                    "description": "Name of the starting symbol.",
+                },
+                "depth": {
+                    "type": "integer",
+                    "description": "Traversal depth (default 2, max 4).",
+                    "default": 2,
+                },
+                "include_source": {
+                    "type": "boolean",
+                    "description": "Include full source code of each symbol (default true).",
+                    "default": True,
+                },
+                "max_tokens": {
+                    "type": "integer",
+                    "description": "Maximum response size in tokens.",
+                },
+            },
+            "required": ["symbol"],
+        },
+    ),
 ]
 
 @server.list_tools()
@@ -401,53 +539,97 @@ async def list_tools() -> list[Tool]:
     """Return the list of available Synaptiq tools."""
     return TOOLS
 
+def _apply_response_pipeline(result: str, max_tokens: int | None = None) -> str:
+    """Apply secret scanning, token budgeting, and metadata to a tool response."""
+    result, redacted_count = _redact_secrets(result)
+    if redacted_count > 0:
+        result += f"\n\nWARNING: {redacted_count} potential secret(s) redacted from response."
+    if max_tokens and max_tokens > 0:
+        result = truncate_response(result, max_tokens)
+    return wrap_with_metadata(result)
+
+
 def dispatch_tool(name: str, arguments: dict, storage: KuzuBackend) -> str:
     """Synchronous tool dispatch — called directly or via ``asyncio.to_thread``."""
+    max_tokens = arguments.get("max_tokens")
+
     if name == "synaptiq_list_repos":
-        return handle_list_repos()
+        result = handle_list_repos()
     elif name == "synaptiq_query":
-        return handle_query(storage, arguments.get("query", ""), limit=arguments.get("limit", 20))
+        result = handle_query(
+            storage,
+            arguments.get("query", ""),
+            limit=arguments.get("limit", 20),
+            focus_files=arguments.get("focus_files"),
+        )
     elif name == "synaptiq_context":
-        return handle_context(storage, arguments.get("symbol", ""))
+        result = handle_context(
+            storage,
+            arguments.get("symbol", ""),
+            focus_files=arguments.get("focus_files"),
+        )
     elif name == "synaptiq_impact":
-        return handle_impact(storage, arguments.get("symbol", ""), depth=arguments.get("depth", 3))
+        result = handle_impact(
+            storage, arguments.get("symbol", ""), depth=arguments.get("depth", 3)
+        )
     elif name == "synaptiq_dead_code":
-        return handle_dead_code(storage)
+        result = handle_dead_code(storage)
     elif name == "synaptiq_detect_changes":
-        return handle_detect_changes(storage, arguments.get("diff", ""))
+        result = handle_detect_changes(storage, arguments.get("diff", ""))
     elif name == "synaptiq_cypher":
-        return handle_cypher(storage, arguments.get("query", ""))
+        result = handle_cypher(storage, arguments.get("query", ""))
     elif name == "synaptiq_coupling":
-        return handle_coupling(
+        result = handle_coupling(
             storage,
             arguments.get("file_path", ""),
             min_strength=arguments.get("min_strength", 0.3),
         )
     elif name == "synaptiq_call_path":
-        return handle_call_path(
+        result = handle_call_path(
             storage,
             arguments.get("from_symbol", ""),
             arguments.get("to_symbol", ""),
             max_depth=arguments.get("max_depth", 10),
         )
     elif name == "synaptiq_communities":
-        return handle_communities(storage, community=arguments.get("community"))
+        result = handle_communities(storage, community=arguments.get("community"))
     elif name == "synaptiq_explain":
-        return handle_explain(storage, arguments.get("symbol", ""))
+        result = handle_explain(storage, arguments.get("symbol", ""))
     elif name == "synaptiq_review_risk":
-        return handle_review_risk(storage, arguments.get("diff", ""))
+        result = handle_review_risk(storage, arguments.get("diff", ""))
     elif name == "synaptiq_file_context":
-        return handle_file_context(storage, arguments.get("file_path", ""))
+        result = handle_file_context(storage, arguments.get("file_path", ""))
     elif name == "synaptiq_cycles":
-        return handle_cycles(storage, min_size=arguments.get("min_size", 2))
+        result = handle_cycles(storage, min_size=arguments.get("min_size", 2))
     elif name == "synaptiq_test_impact":
-        return handle_test_impact(
+        result = handle_test_impact(
             storage,
             diff=arguments.get("diff", ""),
             symbols=arguments.get("symbols"),
         )
+    elif name == "synaptiq_remember":
+        result = handle_remember(
+            arguments.get("key", ""),
+            arguments.get("value", ""),
+            category=arguments.get("category", ""),
+        )
+    elif name == "synaptiq_recall":
+        result = handle_recall(arguments.get("query", ""))
+    elif name == "synaptiq_forget":
+        result = handle_forget(arguments.get("key", ""))
+    elif name == "synaptiq_suggest":
+        result = handle_suggest(storage, arguments.get("question", ""))
+    elif name == "synaptiq_export":
+        result = handle_export(
+            storage,
+            arguments.get("symbol", ""),
+            depth=arguments.get("depth", 2),
+            include_source=arguments.get("include_source", True),
+        )
     else:
-        return f"Unknown tool: {name}"
+        result = f"Unknown tool: {name}"
+
+    return _apply_response_pipeline(result, max_tokens)
 
 
 @server.call_tool()
@@ -488,12 +670,17 @@ async def list_resources() -> list[Resource]:
 def dispatch_resource(uri_str: str, storage: KuzuBackend) -> str:
     """Synchronous resource dispatch."""
     if uri_str == "synaptiq://overview":
-        return get_overview(storage)
-    if uri_str == "synaptiq://dead-code":
-        return get_dead_code_list(storage)
-    if uri_str == "synaptiq://schema":
-        return get_schema()
-    return f"Unknown resource: {uri_str}"
+        result = get_overview(storage)
+    elif uri_str == "synaptiq://dead-code":
+        result = get_dead_code_list(storage)
+    elif uri_str == "synaptiq://schema":
+        result = get_schema()
+    else:
+        result = f"Unknown resource: {uri_str}"
+    result, count = _redact_secrets(result)
+    if count > 0:
+        result += f"\n\nWARNING: {count} potential secret(s) redacted from response."
+    return wrap_with_metadata(result)
 
 
 @server.read_resource()

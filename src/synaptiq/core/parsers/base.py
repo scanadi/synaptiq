@@ -64,6 +64,26 @@ class VarTypeInfo:
     line: int
 
 @dataclass
+class EndpointInfo:
+    """A detected REST API endpoint definition."""
+
+    url_pattern: str  # e.g., "/users/{id}"
+    http_method: str  # e.g., "get", "post", "put", "delete", "patch"
+    function_name: str  # the handler function/method name
+    line: int
+
+
+@dataclass
+class HttpCallInfo:
+    """A detected HTTP client call site."""
+
+    url: str  # the URL or URL pattern being called
+    http_method: str  # e.g., "get", "post"
+    line: int
+    receiver: str = ""  # e.g., "requests", "axios", "fetch"
+
+
+@dataclass
 class ParseResult:
     """Complete parse result for a single file."""
 
@@ -76,6 +96,8 @@ class ParseResult:
     )  # (class_name, kind, parent_name) where kind is "extends" or "implements"
     exports: list[str] = field(default_factory=list)  # names from __all__ or export statements
     variable_types: list[VarTypeInfo] = field(default_factory=list)
+    endpoints: list[EndpointInfo] = field(default_factory=list)
+    http_calls: list[HttpCallInfo] = field(default_factory=list)
 
 class LanguageParser(ABC):
     """Base interface for language-specific parsers."""

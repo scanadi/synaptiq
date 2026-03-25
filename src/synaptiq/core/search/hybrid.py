@@ -25,6 +25,7 @@ def hybrid_search(
     fts_weight: float = 1.0,
     vector_weight: float = 1.0,
     rrf_k: int = 60,
+    ppr_scores: dict[str, float] | None = None,
 ) -> list[SearchResult]:
     """Run hybrid search combining FTS and vector search with RRF.
 
@@ -37,6 +38,9 @@ def hybrid_search(
         fts_weight: Weight multiplier for FTS results in RRF scoring.
         vector_weight: Weight multiplier for vector results in RRF scoring.
         rrf_k: RRF smoothing constant (standard value is 60).
+        ppr_scores: Optional Personalized PageRank scores keyed by node ID.
+            When provided, each result's RRF score is multiplied by
+            ``(1 + ppr_score)`` to bias results toward graph-proximate nodes.
 
     Returns:
         Merged list of :class:`SearchResult` sorted by combined RRF score,
@@ -63,6 +67,12 @@ def hybrid_search(
 
     _accumulate_ranks(fts_results, fts_weight, rrf_k, rrf_scores, metadata)
     _accumulate_ranks(vector_results, vector_weight, rrf_k, rrf_scores, metadata)
+
+    # Apply Personalized PageRank bias if provided.
+    if ppr_scores:
+        for node_id in rrf_scores:
+            ppr = ppr_scores.get(node_id, 0.0)
+            rrf_scores[node_id] *= 1.0 + ppr
 
     merged: list[SearchResult] = []
     for node_id, score in rrf_scores.items():

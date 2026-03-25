@@ -16,6 +16,7 @@ from typing import Any
 
 from synaptiq.core.cypher_guard import WRITE_KEYWORDS, sanitize_cypher
 from synaptiq.core.ingestion.dead_code import _is_test_file
+from synaptiq.core.memory import MemoryStore
 from synaptiq.core.search.hybrid import hybrid_search
 from synaptiq.core.storage.base import StorageBackend
 from synaptiq.core.storage.kuzu_backend import escape_cypher as _escape_cypher
@@ -177,13 +178,20 @@ def _format_query_results(results: list, groups: dict[str, list]) -> str:
     return "\n".join(lines)
 
 
-def handle_query(storage: StorageBackend, query: str, limit: int = 20) -> str:
+def handle_query(
+    storage: StorageBackend,
+    query: str,
+    limit: int = 20,
+    focus_files: list[str] | None = None,
+) -> str:
     """Execute hybrid search and format results, grouped by execution process.
 
     Args:
         storage: The storage backend to search against.
         query: Text search query.
         limit: Maximum number of results (default 20, capped at 100).
+        focus_files: Optional list of file paths to bias results toward
+            via Personalized PageRank.
 
     Returns:
         Formatted search results grouped by process, with file, name, label,
@@ -191,8 +199,16 @@ def handle_query(storage: StorageBackend, query: str, limit: int = 20) -> str:
     """
     limit = max(1, min(limit, 100))
 
+    ppr_scores: dict[str, float] | None = None
+    if focus_files:
+        from synaptiq.core.search.pagerank import personalized_pagerank
+
+        ppr_scores = personalized_pagerank(storage, focus_files)
+
     query_embedding = _get_query_embedding(query)
-    results = hybrid_search(query, storage, query_embedding=query_embedding, limit=limit)
+    results = hybrid_search(
+        query, storage, query_embedding=query_embedding, limit=limit, ppr_scores=ppr_scores
+    )
     if not results:
         return f"No results found for '{query}'."
 
@@ -200,7 +216,11 @@ def handle_query(storage: StorageBackend, query: str, limit: int = 20) -> str:
     return _format_query_results(results, groups)
 
 
-def handle_context(storage: StorageBackend, symbol: str) -> str:
+def handle_context(
+    storage: StorageBackend,
+    symbol: str,
+    focus_files: list[str] | None = None,
+) -> str:
     """Provide a 360-degree view of a symbol.
 
     Looks up the symbol by name via full-text search, then retrieves its
@@ -210,12 +230,21 @@ def handle_context(storage: StorageBackend, symbol: str) -> str:
     Args:
         storage: The storage backend.
         symbol: The symbol name to look up.
+        focus_files: Optional list of file paths to bias result ordering
+            via Personalized PageRank.
 
     Returns:
         Formatted view including callers, callees, type refs, and guidance.
     """
     if not symbol or not symbol.strip():
         return "Error: 'symbol' parameter is required and cannot be empty."
+
+    # Compute PPR scores if focus_files provided.
+    ppr_scores: dict[str, float] | None = None
+    if focus_files:
+        from synaptiq.core.search.pagerank import personalized_pagerank
+
+        ppr_scores = personalized_pagerank(storage, focus_files)
 
     results = _resolve_symbol(storage, symbol)
     if not results:
@@ -240,6 +269,12 @@ def handle_context(storage: StorageBackend, symbol: str) -> str:
     except (AttributeError, TypeError):
         callers_raw = [(c, 1.0) for c in storage.get_callers(node.id)]
 
+    # Sort callers by PPR proximity if focus_files provided.
+    if ppr_scores and callers_raw:
+        callers_raw.sort(
+            key=lambda pair: ppr_scores.get(pair[0].id, 0.0), reverse=True
+        )
+
     if callers_raw:
         lines.append(f"\nCallers ({len(callers_raw)}):")
         for c, conf in callers_raw:
@@ -250,6 +285,12 @@ def handle_context(storage: StorageBackend, symbol: str) -> str:
         callees_raw = storage.get_callees_with_confidence(node.id)
     except (AttributeError, TypeError):
         callees_raw = [(c, 1.0) for c in storage.get_callees(node.id)]
+
+    # Sort callees by PPR proximity if focus_files provided.
+    if ppr_scores and callees_raw:
+        callees_raw.sort(
+            key=lambda pair: ppr_scores.get(pair[0].id, 0.0), reverse=True
+        )
 
     if callees_raw:
         lines.append(f"\nCallees ({len(callees_raw)}):")
@@ -1221,3 +1262,218 @@ def handle_test_impact(
                     lines.append(f"    - {test_name} (transitive via: {source_sym})")
 
     return "\n".join(lines)
+
+
+# ------------------------------------------------------------------
+# Memory tools
+# ------------------------------------------------------------------
+
+_memory_store: MemoryStore | None = None
+
+
+def _get_memory() -> MemoryStore:
+    global _memory_store  # noqa: PLW0603
+    if _memory_store is None:
+        _memory_store = MemoryStore()
+    return _memory_store
+
+
+def handle_remember(key: str, value: str, category: str = "") -> str:
+    """Store a fact for future recall."""
+    if not key or not key.strip():
+        return "Error: 'key' parameter is required and cannot be empty."
+    if not value or not value.strip():
+        return "Error: 'value' parameter is required and cannot be empty."
+
+    fact = _get_memory().remember(key.strip(), value.strip(), category.strip())
+    cat_info = f" [{fact.category}]" if fact.category else ""
+    return f"Remembered: {fact.key}{cat_info}\n  {fact.value}"
+
+
+def handle_recall(query: str) -> str:
+    """Retrieve stored facts matching a query."""
+    if not query or not query.strip():
+        return "Error: 'query' parameter is required and cannot be empty."
+
+    facts = _get_memory().recall(query.strip())
+    if not facts:
+        return f"No stored facts match '{query}'."
+
+    lines = [f"Recalled facts ({len(facts)}):"]
+    lines.append("")
+    for i, fact in enumerate(facts, 1):
+        cat_info = f" [{fact.category}]" if fact.category else ""
+        lines.append(f"  {i}. {fact.key}{cat_info}")
+        lines.append(f"     {fact.value}")
+    return "\n".join(lines)
+
+
+def handle_forget(key: str) -> str:
+    """Remove a stored fact by key."""
+    if not key or not key.strip():
+        return "Error: 'key' parameter is required and cannot be empty."
+
+    removed = _get_memory().forget(key.strip())
+    if removed:
+        return f"Forgotten: '{key}'"
+    return f"No fact found with key '{key}'."
+
+
+# ------------------------------------------------------------------
+# Suggest tool
+# ------------------------------------------------------------------
+
+
+def handle_suggest(storage: StorageBackend, question: str) -> str:
+    """Return tool call suggestions for a natural language question."""
+    if not question or not question.strip():
+        return "Error: 'question' parameter is required and cannot be empty."
+
+    from synaptiq.mcp.suggest import suggest_tools
+
+    suggestions = suggest_tools(question.strip(), storage)
+    if not suggestions:
+        return "Could not determine appropriate tools for this question."
+
+    lines = ["Suggested tool calls:"]
+    lines.append("")
+    for i, s in enumerate(suggestions, 1):
+        args_str = json.dumps(s.arguments) if s.arguments else "{}"
+        lines.append(f"  {i}. {s.tool_name}({args_str})")
+        lines.append(f"     Reason: {s.reason}")
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------------
+# Export tool
+# ------------------------------------------------------------------
+
+
+def handle_export(
+    storage: StorageBackend,
+    symbol: str,
+    depth: int = 2,
+    include_source: bool = True,
+) -> str:
+    """Graph-aware context packing from a starting symbol.
+
+    Performs multi-hop BFS traversal and returns a single structurally-ordered
+    context blob with callers, callees, type references, and community members.
+    """
+    if not symbol or not symbol.strip():
+        return "Error: 'symbol' parameter is required and cannot be empty."
+
+    depth = max(1, min(depth, 4))
+
+    results = _resolve_symbol(storage, symbol)
+    if not results:
+        return f"Symbol '{symbol}' not found."
+
+    root_node = storage.get_node(results[0].node_id)
+    if not root_node:
+        return f"Symbol '{symbol}' not found."
+
+    # Collect related nodes via BFS at each hop level.
+    sections: list[str] = []
+
+    # Root symbol.
+    label_display = root_node.label.value.title() if root_node.label else "Unknown"
+    root_lines = [f"=== Symbol: {root_node.name} ({label_display}) ==="]
+    root_lines.append(f"File: {root_node.file_path}:{root_node.start_line}-{root_node.end_line}")
+    if root_node.signature:
+        root_lines.append(f"Signature: {root_node.signature}")
+    if include_source and root_node.content:
+        root_lines.append("")
+        root_lines.append(root_node.content)
+    sections.append("\n".join(root_lines))
+
+    # Direct callees.
+    try:
+        callees_raw = storage.get_callees_with_confidence(root_node.id)
+    except (AttributeError, TypeError):
+        callees_raw = [(c, 1.0) for c in storage.get_callees(root_node.id)]
+
+    if callees_raw:
+        callee_lines = [f"\n=== Direct Callees ({len(callees_raw)}) ==="]
+        for i, (node, conf) in enumerate(callees_raw, 1):
+            label = node.label.value.title() if node.label else "Unknown"
+            tag = _confidence_tag(conf)
+            loc = f"{node.file_path}:{node.start_line}"
+            callee_lines.append(f"  {i}. {node.name} ({label}) — {loc}{tag}")
+            if node.signature:
+                callee_lines.append(f"     Signature: {node.signature}")
+            if include_source and node.content:
+                callee_lines.append(f"     Source:\n{node.content}")
+        sections.append("\n".join(callee_lines))
+
+    # Direct callers.
+    try:
+        callers_raw = storage.get_callers_with_confidence(root_node.id)
+    except (AttributeError, TypeError):
+        callers_raw = [(c, 1.0) for c in storage.get_callers(root_node.id)]
+
+    if callers_raw:
+        caller_lines = [f"\n=== Direct Callers ({len(callers_raw)}) ==="]
+        for i, (node, conf) in enumerate(callers_raw, 1):
+            label = node.label.value.title() if node.label else "Unknown"
+            tag = _confidence_tag(conf)
+            loc = f"{node.file_path}:{node.start_line}"
+            caller_lines.append(f"  {i}. {node.name} ({label}) — {loc}{tag}")
+            if node.signature:
+                caller_lines.append(f"     Signature: {node.signature}")
+            if include_source and node.content:
+                caller_lines.append(f"     Source:\n{node.content}")
+        sections.append("\n".join(caller_lines))
+
+    # Type references.
+    type_refs = storage.get_type_refs(root_node.id)
+    if type_refs:
+        type_lines = [f"\n=== Type References ({len(type_refs)}) ==="]
+        for i, t in enumerate(type_refs, 1):
+            type_lines.append(f"  {i}. {t.name} — {t.file_path}")
+        sections.append("\n".join(type_lines))
+
+    # Heritage.
+    escaped_id = _escape_cypher(root_node.id)
+    heritage_rows = (
+        storage.execute_raw(
+            f"MATCH (n)-[r:CodeRelation]->(parent) "
+            f"WHERE n.id = '{escaped_id}' "
+            f"AND r.rel_type IN ['extends', 'implements'] "
+            f"RETURN parent.name, parent.file_path, r.rel_type"
+        )
+        or []
+    )
+    if heritage_rows:
+        her_lines = [f"\n=== Heritage ({len(heritage_rows)}) ==="]
+        for row in heritage_rows:
+            her_lines.append(f"  - {row[2]}: {row[0]}  {row[1]}")
+        sections.append("\n".join(her_lines))
+
+    # Community membership.
+    comm_rows = (
+        storage.execute_raw(
+            f"MATCH (n)-[:MEMBER_OF]->(c:Community) WHERE n.id = '{escaped_id}' RETURN c.name"
+        )
+        or []
+    )
+    if comm_rows:
+        comm_name = comm_rows[0][0] or "?"
+        sections.append(f"\n=== Community: {comm_name} ===")
+
+    # Deeper hops if depth > 1.
+    if depth >= 2:
+        deeper_nodes = storage.traverse_with_depth(root_node.id, depth, direction="callers")
+        deeper = [(n, d) for n, d in deeper_nodes if d >= 2]
+        if deeper:
+            deep_lines = [f"\n=== Transitive Callers (depth 2-{depth}, {len(deeper)} symbols) ==="]
+            for i, (node, d) in enumerate(deeper[:20], 1):
+                label = node.label.value.title() if node.label else "Unknown"
+                deep_lines.append(
+                    f"  {i}. {node.name} ({label}) — {node.file_path}:{node.start_line} [depth {d}]"
+                )
+            if len(deeper) > 20:
+                deep_lines.append(f"  ... and {len(deeper) - 20} more")
+            sections.append("\n".join(deep_lines))
+
+    return "\n".join(sections)

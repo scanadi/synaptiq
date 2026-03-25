@@ -42,6 +42,7 @@ class FileParseData:
     file_path: str
     language: str
     parse_result: ParseResult
+    content: str = ""
 
 _PARSER_CACHE: dict[str, LanguageParser] = {}
 
@@ -115,7 +116,9 @@ def parse_file(file_path: str, content: str, language: str) -> FileParseData:
         logger.warning("Failed to parse %s (%s), skipping", file_path, language, exc_info=True)
         result = ParseResult()
 
-    return FileParseData(file_path=file_path, language=language, parse_result=result)
+    return FileParseData(
+        file_path=file_path, language=language, parse_result=result, content=content
+    )
 
 def process_parsing(
     files: list[FileEntry],

@@ -1,0 +1,1 @@
+"""Synaptiq benchmark suite."""
