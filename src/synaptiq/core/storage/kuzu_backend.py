@@ -18,6 +18,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import logging
+import shutil
 import tempfile
 import threading
 from contextlib import contextmanager
@@ -107,6 +108,7 @@ class KuzuBackend:
     def __init__(self) -> None:
         self._db: kuzu.Database | None = None
         self._conn: kuzu.Connection | None = None
+        self._db_path: Path | None = None
         # Thread-safe pool of read connections.
         self._read_pool: list[kuzu.Connection] = []
         self._pool_lock = threading.Lock()
@@ -121,6 +123,7 @@ class KuzuBackend:
                 instances) without lock conflicts.  Schema creation is
                 skipped since the database must already exist.
         """
+        self._db_path = path
         self._db = kuzu.Database(str(path), read_only=read_only)
         self._conn = kuzu.Connection(self._db)
         if not read_only:
@@ -792,18 +795,33 @@ class KuzuBackend:
                 logger.debug("get_indexed_files failed", exc_info=True)
         return mapping
 
+    def _reset_database(self) -> None:
+        """Close, delete, and reinitialize the database from scratch.
+
+        This avoids ``MATCH (n) DETACH DELETE n`` which triggers a segfault
+        in Kuzu's native layer on large datasets (2000+ files).
+        """
+        assert self._db_path is not None
+        db_path = self._db_path
+        self.close()
+        if db_path.exists():
+            if db_path.is_dir():
+                shutil.rmtree(db_path)
+            else:
+                db_path.unlink()
+        self.initialize(db_path)
+
     def bulk_load(self, graph: KnowledgeGraph) -> None:
         """Replace the entire store with the contents of *graph*.
 
         Uses CSV-based COPY FROM for bulk loading nodes and relationships,
         falling back to individual inserts if COPY FROM fails.
+
+        Recreates the database from scratch to avoid a Kuzu native segfault
+        on large ``DETACH DELETE`` operations.
         """
+        self._reset_database()
         assert self._conn is not None
-        for table in _NODE_TABLE_NAMES:
-            try:
-                self._conn.execute(f"MATCH (n:{table}) DETACH DELETE n")
-            except Exception:
-                pass
 
         if not self._bulk_load_nodes_csv(graph):
             self.add_nodes(list(graph.iter_nodes()))
@@ -942,9 +960,12 @@ class KuzuBackend:
         assert self._conn is not None
         try:
             try:
-                self._conn.execute("MATCH (e:Embedding) DELETE e")
+                self._conn.execute("DROP TABLE Embedding")
             except Exception:
                 pass
+            self._conn.execute(
+                f"CREATE NODE TABLE IF NOT EXISTS Embedding({_EMBEDDING_PROPERTIES})"
+            )
 
             self._csv_copy("Embedding", [
                 [emb.node_id,
