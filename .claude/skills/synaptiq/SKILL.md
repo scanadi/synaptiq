@@ -253,9 +253,9 @@ Three read-only resources are available for quick reference without querying:
 
 ### Node Labels
 
-`File` | `Folder` | `Function` | `Class` | `Method` | `Interface` | `TypeAlias` | `Community` | `Process`
+`File` | `Folder` | `Function` | `Class` | `Method` | `Module` | `Interface` | `TypeAlias` | `Community` | `Process`
 
-Note: `Enum` and `Embedding` tables exist in the schema but are typically empty in TypeScript codebases.
+Note: `Enum` and `Embedding` tables exist in the schema but are typically empty in TypeScript codebases. `Module` nodes represent Ruby modules (namespaces / mixin sources) and are typically empty in non-Ruby codebases.
 
 ### Node Properties
 
@@ -281,6 +281,7 @@ All relationships are stored in a **single `CodeRelation` table** with a `rel_ty
 | `imports` | File → File | `symbols` (list) |
 | `extends` | Class → Class | — |
 | `implements` | Class → Interface | — |
+| `mixes_in` | Class/Module → Module (Ruby `include`/`extend`/`prepend`) | — |
 | `uses_type` | Symbol → Type | `role` (param/return/variable) |
 | `member_of` | Symbol → Community | — |
 | `step_in_process` | Symbol → Process | `step_number` |

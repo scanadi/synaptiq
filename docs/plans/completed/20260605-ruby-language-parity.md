@@ -321,10 +321,10 @@ parser and the phases recognize Ruby via `language == "ruby"` / `.rb` suffix.
 - [x] manual smoke: ran `synaptiq analyze` on a copy of `tests/fixtures/ruby_project/` (5 files, 12 symbols, 39 relationships, 1 flow, 4 dead) then `synaptiq status` + `cypher` label/rel-type counts — confirmed Module node + MIXES_IN/EXTENDS edges materialize
 
 ### Task 14: [Final] Documentation
-- [ ] update `CLAUDE.md` (Parsers section, supported languages, new `MODULE`/`MIXES_IN` graph vocabulary)
-- [ ] update `README.md` language support list
-- [ ] update the `synaptiq` skill `SKILL.md` schema section to document `Module` node + `MIXES_IN` edge
-- [ ] move this plan to `docs/plans/completed/`
+- [x] update `CLAUDE.md` (Parsers section, supported languages, new `MODULE`/`MIXES_IN` graph vocabulary)
+- [x] update `README.md` language support list
+- [x] update the `synaptiq` skill `SKILL.md` schema section to document `Module` node + `MIXES_IN` edge
+- [x] move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 *Items requiring manual intervention or external systems — informational only*

@@ -116,6 +116,7 @@ Uses the [Leiden algorithm](https://www.nature.com/articles/s41598-019-41695-z) 
 Detects entry points using framework-aware patterns:
 - **Python**: `@app.route`, `@router.get`, `@click.command`, `test_*` functions, `__main__` blocks
 - **JavaScript/TypeScript**: Express handlers, exported functions, `handler`/`middleware` patterns
+- **Ruby**: Rails controller/job/mailer actions, Sinatra/Rails route blocks, RSpec `*_spec.rb` / `*_test.rb`, `Rakefile`/`config.ru`
 
 Then traces BFS execution flows from each entry point through the call graph, classifying flows as intra-community or cross-community.
 
@@ -172,6 +173,7 @@ Symbols removed (1):
 | Python | `.py` | tree-sitter-python |
 | TypeScript | `.ts`, `.tsx` | tree-sitter-typescript |
 | JavaScript | `.js`, `.jsx`, `.mjs`, `.cjs` | tree-sitter-javascript |
+| Ruby | `.rb`, `.rake`, `.gemspec`, `.ru`, `.rbi` (+ `Rakefile`, `Gemfile`, `Guardfile`, `Capfile`, `Vagrantfile`, `Brewfile`, `Podfile`) | tree-sitter-ruby |
 
 ---
 
@@ -503,6 +505,7 @@ Unix domain socket paths are limited to 104 bytes on macOS. When the `.synaptiq/
 | `Function` | Top-level function |
 | `Class` | Class definition |
 | `Method` | Method within a class |
+| `Module` | Ruby module (namespace / mixin) |
 | `Interface` | Interface / Protocol definition |
 | `TypeAlias` | Type alias |
 | `Enum` | Enumeration |
@@ -519,6 +522,7 @@ Unix domain socket paths are limited to 104 bytes on macOS. When the `.synaptiq/
 | `IMPORTS` | File -> File it imports from | `symbols` (names list) |
 | `EXTENDS` | Class -> Class it extends | — |
 | `IMPLEMENTS` | Class -> Interface it implements | — |
+| `MIXES_IN` | Class/Module -> Ruby module it mixes in (`include`/`extend`/`prepend`) | — |
 | `USES_TYPE` | Symbol -> Type it references | `role` (param/return/variable) |
 | `EXPORTS` | File -> Symbol it exports | — |
 | `MEMBER_OF` | Symbol -> Community it belongs to | — |
@@ -543,7 +547,7 @@ Examples:
 
 ```mermaid
 flowchart TB
-    SRC(["📁 Source Code<br/>.py · .ts · .js · .tsx · .jsx"])
+    SRC(["📁 Source Code<br/>.py · .ts · .js · .tsx · .jsx · .rb"])
 
     PIPELINE["⚙️ Ingestion Pipeline — 11 Phases<br/>walk → structure → parse → imports → calls<br/>heritage → types → communities<br/>processes → dead_code → coupling"]
 
