@@ -263,12 +263,12 @@ parser and the phases recognize Ruby via `language == "ruby"` / `.rb` suffix.
 - Modify: `src/synaptiq/core/ingestion/processes.py`
 - Modify: `tests/core/test_processes.py`
 
-- [ ] write tests: Rails controller actions (methods in `*_controller.rb` classes ending `Controller`), Sinatra route blocks, rake tasks, RSpec `describe`/`it` blocks flagged as entry points
-- [ ] add `_RUBY_ENTRY_*` constants (controller/job/mailer suffixes, `app/controllers` paths) and Ruby branch in `_matches_framework_pattern`
-- [ ] **condition for the Ruby branch: `language == "ruby" or node.file_path.endswith(".rb")` — do NOT include the `""` empty-language fallback the Python/TS branches use, or it will double-match those files**
-- [ ] add Ruby entry filenames/conventions to entry-file heuristics: `*_spec.rb`, `*_test.rb`, plus `Rakefile`, `config.ru`, `*.rake` (these now route to Ruby per Task 1's special-files decision, so the heuristics are live)
-- [ ] write edge tests: a plain private method with incoming calls is NOT an entry point
-- [ ] run tests + ruff — must pass before next task
+- [x] write tests: Rails controller actions (methods in `*_controller.rb` classes ending `Controller`), Sinatra route blocks, rake tasks, RSpec `describe`/`it` blocks flagged as entry points — covered via `*_spec.rb` heuristic + controller/job/mailer class & filename patterns
+- [x] add `_RUBY_ENTRY_*` constants (controller/job/mailer suffixes, `app/controllers` paths) and Ruby branch in `_matches_framework_pattern` — `_RUBY_ENTRY_CLASS_SUFFIXES`, `_RUBY_ENTRY_FILE_SUFFIXES`, `_RUBY_ENTRY_FILE_HEURISTICS`, `_RUBY_ROUTE_RE`
+- [x] **condition for the Ruby branch: `language == "ruby" or node.file_path.endswith(".rb")` — do NOT include the `""` empty-language fallback the Python/TS branches use, or it will double-match those files**
+- [x] add Ruby entry filenames/conventions to entry-file heuristics: `*_spec.rb`, `*_test.rb`, plus `Rakefile`, `config.ru`, `*.rake` (these now route to Ruby per Task 1's special-files decision, so the heuristics are live) — via `_is_ruby_entry_file` in `_is_entry_point`
+- [x] write edge tests: a plain private method with incoming calls is NOT an entry point — plus non-route-DSL not misdetected, and plain `.rb` function without callers not flagged via heuristic
+- [x] run tests + ruff — 27 process tests + 683 core tests pass; ruff clean
 
 ### Task 10: Dead-code phase — Ruby exemptions (metaprogramming, Rails, tests)
 
