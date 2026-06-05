@@ -20,12 +20,16 @@ import tree_sitter_ruby as tsruby
 from tree_sitter import Language, Node, Parser
 
 from synaptiq.core.parsers.base import (
+    ImportInfo,
     LanguageParser,
     ParseResult,
     SymbolInfo,
 )
 
 RUBY_LANGUAGE = Language(tsruby.language())
+
+# ``require``-family methods that bring another file/feature into scope.
+_IMPORT_METHODS = frozenset({"require", "require_relative", "autoload", "load"})
 
 
 class RubyParser(LanguageParser):
@@ -80,6 +84,11 @@ class RubyParser(LanguageParser):
                     self._extract_module(child, content, result, class_name)
                 case "assignment":
                     self._extract_constant(child, content, result, class_name)
+                case "call":
+                    # A ``call`` may be a ``require``-family import; either way we
+                    # still descend so definitions nested in a block are found.
+                    self._extract_import(child, result)
+                    self._walk(child, content, result, class_name)
                 case _:
                     self._walk(child, content, result, class_name)
 
@@ -230,6 +239,66 @@ class RubyParser(LanguageParser):
                 class_name=class_name,
             )
         )
+
+    # ------------------------------------------------------------------
+    # Imports
+    # ------------------------------------------------------------------
+
+    def _extract_import(self, node: Node, result: ParseResult) -> None:
+        """Extract a ``require``/``require_relative``/``autoload``/``load`` call.
+
+        Only string-literal arguments are honoured; dynamic requires (an
+        identifier, a method call, or an interpolated string) are ignored so we
+        never record a bogus module path.
+        """
+        method_node = node.child_by_field_name("method")
+        if method_node is None or method_node.type != "identifier":
+            return
+        method = method_node.text.decode("utf8")
+        if method not in _IMPORT_METHODS:
+            return
+
+        args_node = node.child_by_field_name("arguments")
+        if args_node is None:
+            return
+        args = [c for c in args_node.children if c.is_named]
+        if not args:
+            return
+
+        if method == "autoload":
+            # ``autoload :Const, "path"`` — first arg is the constant symbol,
+            # second is the feature path.
+            if len(args) < 2:
+                return
+            module = self._string_literal(args[1])
+            if module is None:
+                return
+            const = args[0]
+            names = [const.text.decode("utf8").lstrip(":")] if const.type == "simple_symbol" else []
+            result.imports.append(ImportInfo(module=module, names=names))
+            return
+
+        module = self._string_literal(args[0])
+        if module is None:
+            return
+        result.imports.append(ImportInfo(module=module, is_relative=method == "require_relative"))
+
+    @staticmethod
+    def _string_literal(node: Node) -> str | None:
+        """Return the text of a plain string literal, or ``None``.
+
+        ``None`` is returned for any non-string node or for an interpolated
+        string (``"a/#{x}"``), both of which represent dynamic values.
+        """
+        if node.type != "string":
+            return None
+        parts: list[str] = []
+        for child in node.children:
+            if child.type == "string_content":
+                parts.append(child.text.decode("utf8"))
+            elif child.type == "interpolation":
+                return None
+        return "".join(parts)
 
     # ------------------------------------------------------------------
     # Helpers

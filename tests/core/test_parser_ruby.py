@@ -238,6 +238,81 @@ class TestParseConstants:
 
 
 # ---------------------------------------------------------------------------
+# Imports (require / require_relative / autoload / load)
+# ---------------------------------------------------------------------------
+
+
+class TestParseImports:
+    """``require``-family calls become :class:`ImportInfo` entries."""
+
+    def test_require_is_absolute(self, parser: RubyParser) -> None:
+        imports = parser.parse('require "json"\n', "test.rb").imports
+        assert len(imports) == 1
+        assert imports[0].module == "json"
+        assert imports[0].is_relative is False
+
+    def test_require_relative_is_relative(self, parser: RubyParser) -> None:
+        imports = parser.parse('require_relative "../lib/foo"\n', "test.rb").imports
+        assert len(imports) == 1
+        assert imports[0].module == "../lib/foo"
+        assert imports[0].is_relative is True
+
+    def test_autoload_records_constant_name_and_path(self, parser: RubyParser) -> None:
+        imports = parser.parse('autoload :Bar, "bar"\n', "test.rb").imports
+        assert len(imports) == 1
+        assert imports[0].module == "bar"
+        assert imports[0].names == ["Bar"]
+        assert imports[0].is_relative is False
+
+    def test_load_is_an_import(self, parser: RubyParser) -> None:
+        imports = parser.parse('load "x.rb"\n', "test.rb").imports
+        assert len(imports) == 1
+        assert imports[0].module == "x.rb"
+
+    def test_multiple_requires(self, parser: RubyParser) -> None:
+        code = 'require "json"\nrequire "set"\nrequire_relative "./util"\n'
+        imports = parser.parse(code, "test.rb").imports
+        assert [(i.module, i.is_relative) for i in imports] == [
+            ("json", False),
+            ("set", False),
+            ("./util", True),
+        ]
+
+    def test_require_inside_class_is_captured(self, parser: RubyParser) -> None:
+        code = 'class C\n  require "json"\n  def m\n  end\nend\n'
+        imports = parser.parse(code, "test.rb").imports
+        assert [i.module for i in imports] == ["json"]
+
+    def test_single_quoted_require(self, parser: RubyParser) -> None:
+        imports = parser.parse("require 'yaml'\n", "test.rb").imports
+        assert [i.module for i in imports] == ["yaml"]
+
+
+class TestParseImportsEdgeCases:
+    """Non-literal / dynamic requires are ignored without error."""
+
+    def test_dynamic_require_identifier_ignored(self, parser: RubyParser) -> None:
+        imports = parser.parse("require name\n", "test.rb").imports
+        assert imports == []
+
+    def test_dynamic_require_method_call_ignored(self, parser: RubyParser) -> None:
+        imports = parser.parse('require File.expand_path("y")\n', "test.rb").imports
+        assert imports == []
+
+    def test_interpolated_require_ignored(self, parser: RubyParser) -> None:
+        imports = parser.parse('require "a/#{x}"\n', "test.rb").imports
+        assert imports == []
+
+    def test_non_import_call_is_not_an_import(self, parser: RubyParser) -> None:
+        imports = parser.parse('puts "hi"\n', "test.rb").imports
+        assert imports == []
+
+    def test_autoload_without_path_ignored(self, parser: RubyParser) -> None:
+        imports = parser.parse("autoload :Bar\n", "test.rb").imports
+        assert imports == []
+
+
+# ---------------------------------------------------------------------------
 # Error / edge cases
 # ---------------------------------------------------------------------------
 

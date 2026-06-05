@@ -200,11 +200,11 @@ parser and the phases recognize Ruby via `language == "ruby"` / `.rb` suffix.
 - Modify: `src/synaptiq/core/parsers/ruby_lang.py`
 - Modify: `tests/core/test_parser_ruby.py`
 
-- [ ] write tests: `require "json"`, `require_relative "../lib/foo"`, `autoload :Bar, "bar"`; assert `ImportInfo.module`, `is_relative`, names
-- [ ] implement import extraction from `call` nodes whose method is `require`/`require_relative`/`autoload`/`load`
-- [ ] set `is_relative=True` for `require_relative`
-- [ ] write edge tests: dynamic require (non-literal arg) ignored safely
-- [ ] run tests + ruff — must pass before next task
+- [x] write tests: `require "json"`, `require_relative "../lib/foo"`, `autoload :Bar, "bar"`; assert `ImportInfo.module`, `is_relative`, names
+- [x] implement import extraction from `call` nodes whose method is `require`/`require_relative`/`autoload`/`load`
+- [x] set `is_relative=True` for `require_relative`
+- [x] write edge tests: dynamic require (non-literal arg) ignored safely
+- [x] run tests + ruff — must pass before next task
 
 ### Task 5: Ruby parser — call extraction (receivers, `self`, blocks)
 
