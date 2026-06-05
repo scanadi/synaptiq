@@ -59,20 +59,21 @@ Guards: must be on `main`, clean working tree, synced with remote, tag must not 
 
 ### Ingestion Pipeline
 
-The core of Synaptiq is `src/synaptiq/core/ingestion/pipeline.py` which orchestrates 11 analysis phases plus an optional embedding phase:
+The core of Synaptiq is `src/synaptiq/core/ingestion/pipeline.py` which orchestrates 12 analysis phases plus an optional embedding phase:
 
 1. `walker.py` — file discovery respecting `.gitignore`
 2. `structure.py` — folder/file hierarchy (CONTAINS edges)
 3. `parser_phase.py` — tree-sitter AST extraction → Function/Class/Method/Module/Interface/Enum/TypeAlias nodes
 4. `imports.py` — import resolution to actual files (IMPORTS edges)
 5. `calls.py` — call tracing with confidence scores (CALLS edges, 1.0=exact, 0.5=fuzzy)
-6. `heritage.py` — class inheritance (EXTENDS), interface implementation (IMPLEMENTS), and Ruby module mixins (MIXES_IN, from `include`/`extend`/`prepend`)
-7. `types.py` — type references from params/returns/variables (USES_TYPE edges)
-8. `community.py` — Leiden algorithm clustering (MEMBER_OF edges)
-9. `processes.py` — framework-aware entry point detection + BFS flow tracing
-10. `dead_code.py` — multi-pass dead code analysis with exemptions for decorators, protocols, overrides
-11. `coupling.py` — git history co-change analysis (COUPLED_WITH edges)
-12. Embeddings (optional) — fastembed BAAI/bge-small-en-v1.5 384-dim vectors for semantic search. Skippable via `--no-embeddings` flag on `analyze`.
+6. `rest_linking.py` — links REST endpoints to HTTP client calls across services (Python FastAPI/Flask, TS Express/axios, Ruby Sinatra/Rails routes + HTTParty/Faraday/RestClient/Typhoeus/Net::HTTP). Per-language regex extractors live in `extract_rest_info_from_source`.
+7. `heritage.py` — class inheritance (EXTENDS), interface implementation (IMPLEMENTS), and Ruby module mixins (MIXES_IN, from `include`/`extend`/`prepend`)
+8. `types.py` — type references from params/returns/variables (USES_TYPE edges)
+9. `community.py` — Leiden algorithm clustering (MEMBER_OF edges)
+10. `processes.py` — framework-aware entry point detection + BFS flow tracing
+11. `dead_code.py` — multi-pass dead code analysis with exemptions for decorators, protocols, overrides; Ruby adds `initialize` constructors, metaprogramming hooks (`method_missing`, `inherited`, ...), `attr_*`/Rails-callback macro methods, and Rails framework base classes
+12. `coupling.py` — git history co-change analysis (COUPLED_WITH edges)
+13. Embeddings (optional) — fastembed BAAI/bge-small-en-v1.5 384-dim vectors for semantic search. Skippable via `--no-embeddings` flag on `analyze`.
 
 ### Storage Layer
 

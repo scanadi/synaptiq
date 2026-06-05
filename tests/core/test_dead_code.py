@@ -1092,3 +1092,18 @@ class TestRubyUnusedPrivateMethodStillDead:
         node = g.get_node(method_id)
         assert node is not None
         assert node.is_dead is True
+
+
+def test_ruby_macro_prefixes_stay_in_sync_with_parser():
+    """The dead-code exemption list must match the parser's recorded macros.
+
+    ``dead_code._RUBY_MACRO_PREFIXES`` is intentionally duplicated from
+    ``ruby_lang._SYMBOL_RECORDING_METHODS`` (to avoid importing the tree-sitter
+    parser into every dead-code run).  If the parser starts recording a new
+    macro and this list is not updated, those methods would be wrongly flagged
+    dead.  This test fails loudly on that drift.
+    """
+    from synaptiq.core.ingestion.dead_code import _RUBY_MACRO_PREFIXES
+    from synaptiq.core.parsers.ruby_lang import _SYMBOL_RECORDING_METHODS
+
+    assert set(_RUBY_MACRO_PREFIXES) == set(_SYMBOL_RECORDING_METHODS)

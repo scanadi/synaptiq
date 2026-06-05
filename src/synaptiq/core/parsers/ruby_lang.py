@@ -418,7 +418,9 @@ class RubyParser(LanguageParser):
                     self._extract_calls(body, result, self._parameter_names(child))
             elif ctype in ("block", "do_block"):
                 self._extract_calls(child, result, locals_ | self._block_parameter_names(child))
-            elif ctype == "assignment":
+            elif ctype in ("assignment", "operator_assignment"):
+                # Both ``x = foo`` and ``x ||= foo`` (the idiomatic memoization
+                # form) take a bare identifier on the RHS as a paren-less call.
                 right = child.child_by_field_name("right")
                 if right is not None and right.type == "identifier":
                     name = right.text.decode("utf8")

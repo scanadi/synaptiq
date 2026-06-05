@@ -61,7 +61,7 @@ _TS_AXIOS = re.compile(
 # bare method calls like ``render "tpl"`` or ``has_many :x`` are not misread as
 # routes.
 _RB_ENDPOINT = re.compile(
-    r"^\s*(get|post|put|delete|patch)\s+[\"']([^\"']+)[\"']",
+    r"^\s*(get|post|put|delete|patch|head|options)\s+[\"']([^\"']+)[\"']",
 )
 
 # Ruby HTTP client calls: HTTParty.get("url"), Faraday.get("url"),

@@ -427,6 +427,20 @@ class TestParseCallsEdgeCases:
         assert "fetch_data" in by_name
         assert "result" not in by_name
 
+    def test_memoization_operator_assignment_rhs_call(self, parser: RubyParser) -> None:
+        # The ``@x ||= build`` memoization idiom must record ``build`` as a call.
+        code = "def cache\n  @cache ||= build_cache\nend\n"
+        by_name = _calls_by_name(parser.parse(code, "test.rb"))
+        assert "build_cache" in by_name
+
+    def test_operator_assignment_local_lhs_not_a_call(self, parser: RubyParser) -> None:
+        # After ``count += step`` the LHS ``count`` is a local, not a call; the
+        # RHS bare identifier ``step`` is a paren-less call.
+        code = "def m\n  step = 1\n  count += step\n  count\nend\n"
+        by_name = _calls_by_name(parser.parse(code, "test.rb"))
+        assert "count" not in by_name
+        assert "step" not in by_name  # step is a local bound on the prior line
+
     def test_no_calls_for_definitions_only(self, parser: RubyParser) -> None:
         code = "class C\n  def m\n  end\nend\n"
         assert parser.parse(code, "test.rb").calls == []
