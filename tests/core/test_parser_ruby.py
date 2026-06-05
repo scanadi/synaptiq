@@ -523,6 +523,21 @@ class TestParseAttrAccessors:
         cls = self._class_symbol(parser, "class A\n  def m\n  end\nend\n")
         assert cls.decorators == []
 
+    def test_rails_callback_recorded(self, parser: RubyParser) -> None:
+        cls = self._class_symbol(
+            parser,
+            "class UsersController\n  before_action :authenticate\nend\n",
+        )
+        assert "before_action:authenticate" in cls.decorators
+
+    def test_multiple_callback_symbols_recorded(self, parser: RubyParser) -> None:
+        cls = self._class_symbol(
+            parser,
+            "class User\n  after_save :notify, :reindex\nend\n",
+        )
+        assert "after_save:notify" in cls.decorators
+        assert "after_save:reindex" in cls.decorators
+
 
 # ---------------------------------------------------------------------------
 # Error / edge cases

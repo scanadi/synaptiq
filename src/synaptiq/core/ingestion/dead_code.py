@@ -24,6 +24,43 @@ _SYMBOL_LABELS: tuple[NodeLabel, ...] = (
 
 _CONSTRUCTOR_NAMES: frozenset[str] = frozenset({"__init__", "__new__", "constructor"})
 
+
+def _is_constructor(name: str, file_path: str) -> bool:
+    """Return ``True`` if *name* is a constructor for its language.
+
+    ``__init__``/``__new__``/``constructor`` are language-agnostic; Ruby's
+    constructor ``initialize`` is only treated as such in ``.rb`` files (it is
+    an ordinary, dead-able method name in other languages).
+    """
+    if name in _CONSTRUCTOR_NAMES:
+        return True
+    return name == "initialize" and file_path.endswith(".rb")
+
+# Ruby metaprogramming hooks the interpreter/framework calls indirectly.  They
+# never have a direct CALLS edge but are not dead.
+_RUBY_METAPROGRAMMING_NAMES: frozenset[str] = frozenset({
+    "method_missing", "respond_to_missing?", "const_missing",
+    "method_added", "singleton_method_added", "inherited",
+    "included", "extended", "prepended", "coerce",
+})
+
+# Macro prefixes whose ``"{macro}:{name}"`` decorator entries (recorded by the
+# Ruby parser) name methods Ruby/Rails invokes indirectly: ``attr_*`` accessors
+# and Rails lifecycle callbacks.  A method whose owning type carries a matching
+# decorator is exempt from dead-code flagging.
+_RUBY_MACRO_PREFIXES: tuple[str, ...] = (
+    "attr_accessor", "attr_reader", "attr_writer",
+    "before_action", "after_action", "around_action",
+    "before_filter", "after_filter", "around_filter",
+    "before_save", "after_save", "around_save",
+    "before_create", "after_create", "around_create",
+    "before_update", "after_update", "around_update",
+    "before_destroy", "after_destroy", "around_destroy",
+    "before_validation", "after_validation",
+    "after_commit", "after_rollback", "after_initialize",
+    "after_find", "after_touch",
+)
+
 def _is_test_class(name: str) -> bool:
     """Return ``True`` if *name* follows pytest class convention (``Test*``).
 
@@ -57,11 +94,13 @@ def _is_test_file(file_path: str) -> bool:
     return (
         "tests" in parts
         or "test" in parts
+        or "spec" in parts
         or "__tests__" in parts
         or "__mocks__" in parts
         or "__fixtures__" in parts
         or any(p.startswith("test_") for p in parts)
         or file_path.endswith("conftest.py")
+        or filename.endswith(("_spec.rb", "_test.rb"))
         or _has_test_suffix(filename)
     )
 
@@ -140,6 +179,10 @@ _FRAMEWORK_MODEL_BASES: frozenset[str] = frozenset({
     "BaseEntity",
     # unittest
     "TestCase",
+    # Rails (heritage stores the last namespace segment, so e.g.
+    # ``ActiveRecord::Base`` is captured as ``Base``, already listed above).
+    "ApplicationRecord", "ApplicationController", "ApplicationJob",
+    "ApplicationMailer", "ActiveRecord", "ActionController",
 })
 
 _VITE_PLUGIN_HOOKS: frozenset[str] = frozenset({
@@ -215,16 +258,18 @@ def _is_exempt(
     - It is a test class (name starts with ``Test``).
     - It lives in a test file (fixtures, helpers are not dead code).
     - It is a dunder method (``__str__``, ``__repr__``, etc.).
+    - It is a Ruby metaprogramming hook (``method_missing``, etc.).
     - It is a public symbol in a Python ``__init__.py`` file.
     """
     return (
         is_entry_point
         or is_exported
-        or name in _CONSTRUCTOR_NAMES
+        or _is_constructor(name, file_path)
         or name.startswith("test_")
         or _is_test_class(name)
         or _is_test_file(file_path)
         or _is_dunder(name)
+        or name in _RUBY_METAPROGRAMMING_NAMES
         or _is_python_public_api(name, file_path)
         or _is_config_file_hook(name, file_path)
         or _is_framework_entry_file(file_path)
@@ -507,6 +552,45 @@ def _clear_inner_function_false_positives(graph: KnowledgeGraph) -> int:
     return cleared
 
 
+def _clear_ruby_macro_method_false_positives(graph: KnowledgeGraph) -> int:
+    """Un-flag methods named by an ``attr_*`` accessor or Rails callback macro.
+
+    The Ruby parser records macro arguments on the owning type's ``decorators``
+    as ``"{macro}:{name}"`` (e.g. ``attr_reader:name``, ``before_action:auth``).
+    Such methods are invoked by Ruby/Rails indirectly and have no direct CALLS
+    edge, so a hand-written ``def name`` / ``def auth`` would otherwise be
+    flagged dead.  This pass un-flags those methods.
+
+    Returns the number of methods un-flagged.
+    """
+    # Map (file_path, owning_type_name) -> set of macro-named methods.
+    macro_methods: dict[tuple[str, str], set[str]] = {}
+    for label in (NodeLabel.CLASS, NodeLabel.MODULE):
+        for node in graph.get_nodes_by_label(label):
+            decorators: list[str] = node.properties.get("decorators", [])
+            for dec in decorators:
+                prefix, sep, target = dec.partition(":")
+                if sep and prefix in _RUBY_MACRO_PREFIXES and target:
+                    macro_methods.setdefault((node.file_path, node.name), set()).add(target)
+
+    if not macro_methods:
+        return 0
+
+    cleared = 0
+    for method in graph.get_nodes_by_label(NodeLabel.METHOD):
+        if not method.is_dead or not method.class_name:
+            continue
+        names = macro_methods.get((method.file_path, method.class_name))
+        if names and method.name in names:
+            method.is_dead = False
+            cleared += 1
+            logger.debug(
+                "Un-flagged Ruby macro method: %s.%s", method.class_name, method.name
+            )
+
+    return cleared
+
+
 def process_dead_code(graph: KnowledgeGraph) -> int:
     """Detect dead (unreachable) symbols and flag them in the graph.
 
@@ -591,5 +675,9 @@ def process_dead_code(graph: KnowledgeGraph) -> int:
     # Sixth pass: un-flag inner functions defined inside alive parent functions.
     inner_cleared = _clear_inner_function_false_positives(graph)
     dead_count -= inner_cleared
+
+    # Seventh pass: un-flag Ruby methods named by attr_*/Rails-callback macros.
+    ruby_macro_cleared = _clear_ruby_macro_method_false_positives(graph)
+    dead_count -= ruby_macro_cleared
 
     return dead_count

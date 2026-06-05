@@ -41,6 +41,25 @@ _MIXIN_METHODS = frozenset({"include", "extend", "prepend"})
 # detection (Task 10) can treat the generated accessors as used.
 _ATTR_METHODS = frozenset({"attr_accessor", "attr_reader", "attr_writer"})
 
+# Rails callback macros.  Their symbol arguments name methods the framework
+# invokes indirectly (never via a direct call edge), so we record them on the
+# owning type for the same dead-code exemption path as ``attr_*``.
+_CALLBACK_METHODS = frozenset({
+    "before_action", "after_action", "around_action",
+    "before_filter", "after_filter", "around_filter",
+    "before_save", "after_save", "around_save",
+    "before_create", "after_create", "around_create",
+    "before_update", "after_update", "around_update",
+    "before_destroy", "after_destroy", "around_destroy",
+    "before_validation", "after_validation",
+    "after_commit", "after_rollback", "after_initialize",
+    "after_find", "after_touch",
+})
+
+# Macros whose symbol arguments name framework-invoked methods recorded on the
+# owning type's ``decorators`` (``attr_*`` accessors + Rails callbacks).
+_SYMBOL_RECORDING_METHODS = _ATTR_METHODS | _CALLBACK_METHODS
+
 # Node types whose direct ``identifier`` children sit in statement/value
 # position, where a bare identifier (not a known local) is a method call.
 _STMT_CONTAINERS = frozenset({"program", "body_statement", "block_body", "then", "else", "ensure"})
@@ -340,10 +359,11 @@ class RubyParser(LanguageParser):
 
         ``include``/``extend``/``prepend M`` inside a class/module emit a
         ``(class_name, "mixin", "M")`` heritage tuple; ``attr_accessor``/
-        ``attr_reader``/``attr_writer`` symbol arguments are recorded on the
-        owning type's ``decorators`` so Task 10 can exempt the generated
-        accessors from dead-code analysis.  Both only apply within a type, and
-        only to bare calls (no receiver).
+        ``attr_reader``/``attr_writer`` accessor symbols and Rails callback
+        symbols (``before_action``/``after_save``/...) are recorded on the
+        owning type's ``decorators`` (as ``"{macro}:{name}"``) so Task 10 can
+        exempt the framework-invoked methods from dead-code analysis.  All only
+        apply within a type, and only to bare calls (no receiver).
         """
         if not class_name or owner is None:
             return
@@ -362,7 +382,7 @@ class RubyParser(LanguageParser):
             for arg in args_node.children:
                 if arg.type in ("constant", "scope_resolution"):
                     result.heritage.append((class_name, "mixin", self._constant_last_segment(arg)))
-        elif method in _ATTR_METHODS:
+        elif method in _SYMBOL_RECORDING_METHODS:
             for arg in args_node.children:
                 if arg.type == "simple_symbol":
                     sym = arg.text.decode("utf8").lstrip(":")

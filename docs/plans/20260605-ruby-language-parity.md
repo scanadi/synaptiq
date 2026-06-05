@@ -276,12 +276,13 @@ parser and the phases recognize Ruby via `language == "ruby"` / `.rb` suffix.
 - Modify: `src/synaptiq/core/ingestion/dead_code.py`
 - Modify: `tests/core/test_dead_code.py`
 
-- [ ] write tests: `initialize` exempt (constructor); `method_missing`/`respond_to_missing?` exempt; attr-generated accessors exempt; Rails callbacks (`before_action`, `after_save`, etc.) targets exempt; `*_spec.rb`/`*_test.rb` files treated as test files
-- [ ] add `"initialize"` to `_CONSTRUCTOR_NAMES`
-- [ ] add Ruby test-file detection to `_is_test_file` (`*_spec.rb`, `*_test.rb`, `spec/`, dirs)
-- [ ] add Ruby metaprogramming/framework exemptions (method_missing, attr accessors recorded in Task 6, Rails model bases like `ApplicationRecord`)
-- [ ] write edge tests: a genuinely unused private Ruby method IS flagged dead
-- [ ] run tests + ruff — must pass before next task
+- [x] write tests: `initialize` exempt (constructor); `method_missing`/`respond_to_missing?` exempt; attr-generated accessors exempt; Rails callbacks (`before_action`, `after_save`, etc.) targets exempt; `*_spec.rb`/`*_test.rb` files treated as test files
+- [x] add `"initialize"` to `_CONSTRUCTOR_NAMES` — implemented as a Ruby-scoped `_is_constructor(name, file_path)` helper instead of a flat set member: adding `initialize` globally regressed a Python test (`.py` method named `initialize` is legitimately dead-able), so `initialize` is a constructor only in `.rb` files
+- [x] add Ruby test-file detection to `_is_test_file` (`*_spec.rb`, `*_test.rb`, `spec/`, dirs)
+- [x] add Ruby metaprogramming/framework exemptions (method_missing, attr accessors recorded in Task 6, Rails model bases like `ApplicationRecord`) — metaprogramming hooks via `_RUBY_METAPROGRAMMING_NAMES` in `_is_exempt`; attr_*/Rails-callback macro methods via new `_clear_ruby_macro_method_false_positives` pass (7th pass) reading `"{macro}:{name}"` decorators; Rails bases added to `_FRAMEWORK_MODEL_BASES`
+- [x] write edge tests: a genuinely unused private Ruby method IS flagged dead
+- [x] run tests + ruff — must pass before next task
+- ➕ Scope note: extended the Task-6 parser macro recording (`ruby_lang.py` `_extract_class_macro`) to also record Rails callback symbol targets (`before_action :auth` → `before_action:auth`) on the owning type's `decorators`, mirroring `attr_*`. This is what makes the dead-code callback exemption fire end-to-end; added matching parser tests in `tests/core/test_parser_ruby.py`.
 
 ### Task 11: REST linking phase — Ruby endpoints & HTTP calls
 
