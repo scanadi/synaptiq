@@ -433,6 +433,98 @@ class TestParseCallsEdgeCases:
 
 
 # ---------------------------------------------------------------------------
+# Heritage & mixins (<, include/extend/prepend, attr_*)
+# ---------------------------------------------------------------------------
+
+
+class TestParseHeritage:
+    """Superclass and mixin relationships become heritage tuples."""
+
+    def test_superclass_extends(self, parser: RubyParser) -> None:
+        heritage = parser.parse("class A < B\nend\n", "test.rb").heritage
+        assert ("A", "extends", "B") in heritage
+
+    def test_no_superclass_no_extends(self, parser: RubyParser) -> None:
+        heritage = parser.parse("class A\nend\n", "test.rb").heritage
+        assert all(kind != "extends" for _, kind, _ in heritage)
+
+    def test_namespaced_superclass_uses_last_segment(self, parser: RubyParser) -> None:
+        heritage = parser.parse("class A < Foo::Bar\nend\n", "test.rb").heritage
+        assert ("A", "extends", "Bar") in heritage
+
+    def test_include_is_mixin(self, parser: RubyParser) -> None:
+        code = "class A\n  include M\nend\n"
+        heritage = parser.parse(code, "test.rb").heritage
+        assert ("A", "mixin", "M") in heritage
+
+    def test_extend_is_mixin(self, parser: RubyParser) -> None:
+        code = "class A\n  extend M\nend\n"
+        heritage = parser.parse(code, "test.rb").heritage
+        assert ("A", "mixin", "M") in heritage
+
+    def test_prepend_is_mixin(self, parser: RubyParser) -> None:
+        code = "class A\n  prepend M\nend\n"
+        heritage = parser.parse(code, "test.rb").heritage
+        assert ("A", "mixin", "M") in heritage
+
+    def test_mixin_inside_module(self, parser: RubyParser) -> None:
+        code = "module A\n  include K\nend\n"
+        heritage = parser.parse(code, "test.rb").heritage
+        assert ("A", "mixin", "K") in heritage
+
+    def test_multiple_includes(self, parser: RubyParser) -> None:
+        code = "class A\n  include M1, M2\nend\n"
+        heritage = parser.parse(code, "test.rb").heritage
+        assert ("A", "mixin", "M1") in heritage
+        assert ("A", "mixin", "M2") in heritage
+
+    def test_namespaced_mixin_uses_last_segment(self, parser: RubyParser) -> None:
+        code = "class A\n  include Foo::Bar\nend\n"
+        heritage = parser.parse(code, "test.rb").heritage
+        assert ("A", "mixin", "Bar") in heritage
+
+    def test_extends_and_mixin_combined(self, parser: RubyParser) -> None:
+        code = "class A < Base\n  include M\nend\n"
+        heritage = parser.parse(code, "test.rb").heritage
+        assert ("A", "extends", "Base") in heritage
+        assert ("A", "mixin", "M") in heritage
+
+    def test_top_level_include_is_not_a_mixin(self, parser: RubyParser) -> None:
+        # ``include M`` outside any class/module has no owning type.
+        heritage = parser.parse("include M\n", "test.rb").heritage
+        assert heritage == []
+
+
+class TestParseAttrAccessors:
+    """attr_accessor/reader/writer names are recorded on the owning type."""
+
+    def _class_symbol(self, parser: RubyParser, code: str) -> object:
+        syms = parser.parse(code, "test.rb").symbols
+        return next(s for s in syms if s.kind in ("class", "module"))
+
+    def test_attr_accessor_recorded(self, parser: RubyParser) -> None:
+        cls = self._class_symbol(parser, "class A\n  attr_accessor :x, :y\nend\n")
+        assert "attr_accessor:x" in cls.decorators
+        assert "attr_accessor:y" in cls.decorators
+
+    def test_attr_reader_recorded(self, parser: RubyParser) -> None:
+        cls = self._class_symbol(parser, "class A\n  attr_reader :z\nend\n")
+        assert "attr_reader:z" in cls.decorators
+
+    def test_attr_writer_recorded(self, parser: RubyParser) -> None:
+        cls = self._class_symbol(parser, "class A\n  attr_writer :w\nend\n")
+        assert "attr_writer:w" in cls.decorators
+
+    def test_attr_on_module(self, parser: RubyParser) -> None:
+        cls = self._class_symbol(parser, "module M\n  attr_reader :a\nend\n")
+        assert "attr_reader:a" in cls.decorators
+
+    def test_no_attrs_means_empty_decorators(self, parser: RubyParser) -> None:
+        cls = self._class_symbol(parser, "class A\n  def m\n  end\nend\n")
+        assert cls.decorators == []
+
+
+# ---------------------------------------------------------------------------
 # Error / edge cases
 # ---------------------------------------------------------------------------
 

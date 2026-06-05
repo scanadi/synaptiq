@@ -224,12 +224,12 @@ parser and the phases recognize Ruby via `language == "ruby"` / `.rb` suffix.
 - Modify: `src/synaptiq/core/parsers/ruby_lang.py`
 - Modify: `tests/core/test_parser_ruby.py`
 
-- [ ] write tests: `class A < B` → `("A","extends","B")`; `include M`/`extend M`/`prepend M` inside a class/module → `("A","mixin","M")`
-- [ ] implement superclass extraction from `class` node superclass field
-- [ ] implement mixin extraction from `include`/`extend`/`prepend` call nodes, attributing to the enclosing class/module
-- [ ] capture `attr_accessor`/`attr_reader`/`attr_writer` symbol names into a node property (for dead-code exemption in Task 10)
-- [ ] write edge tests: multiple includes, namespaced parents (`A < Foo::Bar`)
-- [ ] run tests + ruff — must pass before next task
+- [x] write tests: `class A < B` → `("A","extends","B")`; `include M`/`extend M`/`prepend M` inside a class/module → `("A","mixin","M")`
+- [x] implement superclass extraction from `class` node superclass field
+- [x] implement mixin extraction from `include`/`extend`/`prepend` call nodes, attributing to the enclosing class/module
+- [x] capture `attr_accessor`/`attr_reader`/`attr_writer` symbol names into a node property (for dead-code exemption in Task 10) — recorded on the owning type's `decorators` as `"{macro}:{name}"` (e.g. `attr_reader:name`), which flows to `props["decorators"]` via `parser_phase`
+- [x] write edge tests: multiple includes, namespaced parents (`A < Foo::Bar`)
+- [x] run tests + ruff — must pass before next task
 
 ### Task 7: Heritage phase — wire `mixin` kind → `MIXES_IN`
 

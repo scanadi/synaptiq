@@ -8,7 +8,7 @@ This module is built incrementally across the Ruby-parity tasks:
 * Task 3 — symbol extraction (methods, classes, modules, constants).
 * Task 4 — imports (``require`` / ``require_relative`` / ``autoload``).
 * Task 5 — calls (receivers, ``self``, blocks, paren-less, bare calls).
-* Task 6 — heritage & mixins.
+* Task 6 — heritage (``<``), mixins (include/extend/prepend), ``attr_*`` capture.
 
 Each ``parse`` failure degrades gracefully to an empty :class:`ParseResult`,
 matching the behaviour of the existing parsers.
@@ -31,6 +31,15 @@ RUBY_LANGUAGE = Language(tsruby.language())
 
 # ``require``-family methods that bring another file/feature into scope.
 _IMPORT_METHODS = frozenset({"require", "require_relative", "autoload", "load"})
+
+# Mixin macros: ``include``/``extend``/``prepend`` pull a module into the
+# enclosing class/module, modelled as a ``"mixin"`` heritage tuple.
+_MIXIN_METHODS = frozenset({"include", "extend", "prepend"})
+
+# Accessor-generating macros.  Their symbol arguments name methods that Ruby
+# synthesises at load time; we record them on the owning type so dead-code
+# detection (Task 10) can treat the generated accessors as used.
+_ATTR_METHODS = frozenset({"attr_accessor", "attr_reader", "attr_writer"})
 
 # Node types whose direct ``identifier`` children sit in statement/value
 # position, where a bare identifier (not a known local) is a method call.
@@ -70,12 +79,15 @@ class RubyParser(LanguageParser):
         content: str,
         result: ParseResult,
         class_name: str,
+        owner: SymbolInfo | None = None,
     ) -> None:
         """Recursively walk the AST collecting definitions.
 
         ``class_name`` is the name of the lexically enclosing class/module, used
-        to attribute methods and constants.  Definition nodes are dispatched to
-        their dedicated extractors; everything else is descended into so that a
+        to attribute methods and constants.  ``owner`` is that type's
+        :class:`SymbolInfo`, used to record accessor macros (``attr_*``) directly
+        on the node properties.  Definition nodes are dispatched to their
+        dedicated extractors; everything else is descended into so that a
         definition nested inside e.g. an ``if`` block is still discovered.
         """
         for child in node.children:
@@ -91,12 +103,14 @@ class RubyParser(LanguageParser):
                 case "assignment":
                     self._extract_constant(child, content, result, class_name)
                 case "call":
-                    # A ``call`` may be a ``require``-family import; either way we
-                    # still descend so definitions nested in a block are found.
+                    # A ``call`` may be a ``require``-family import or a class
+                    # macro (mixin / attr_*); either way we still descend so
+                    # definitions nested in a block are found.
                     self._extract_import(child, result)
-                    self._walk(child, content, result, class_name)
+                    self._extract_class_macro(child, result, class_name, owner)
+                    self._walk(child, content, result, class_name, owner)
                 case _:
-                    self._walk(child, content, result, class_name)
+                    self._walk(child, content, result, class_name, owner)
 
     def _extract_method(
         self,
@@ -178,19 +192,25 @@ class RubyParser(LanguageParser):
         if not name:
             return
 
-        result.symbols.append(
-            SymbolInfo(
-                name=name,
-                kind="class",
-                start_line=node.start_point[0] + 1,
-                end_line=node.end_point[0] + 1,
-                content=content[node.start_byte : node.end_byte],
-            )
+        symbol = SymbolInfo(
+            name=name,
+            kind="class",
+            start_line=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
+            content=content[node.start_byte : node.end_byte],
         )
+        result.symbols.append(symbol)
+
+        # ``class A < B`` — the superclass field holds ``< Parent``.
+        superclass = node.child_by_field_name("superclass")
+        if superclass is not None:
+            parent = self._superclass_name(superclass)
+            if parent:
+                result.heritage.append((name, "extends", parent))
 
         body = node.child_by_field_name("body")
         if body is not None:
-            self._walk(body, content, result, class_name=name)
+            self._walk(body, content, result, class_name=name, owner=symbol)
 
     def _extract_module(
         self,
@@ -204,19 +224,18 @@ class RubyParser(LanguageParser):
         if not name:
             return
 
-        result.symbols.append(
-            SymbolInfo(
-                name=name,
-                kind="module",
-                start_line=node.start_point[0] + 1,
-                end_line=node.end_point[0] + 1,
-                content=content[node.start_byte : node.end_byte],
-            )
+        symbol = SymbolInfo(
+            name=name,
+            kind="module",
+            start_line=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
+            content=content[node.start_byte : node.end_byte],
         )
+        result.symbols.append(symbol)
 
         body = node.child_by_field_name("body")
         if body is not None:
-            self._walk(body, content, result, class_name=name)
+            self._walk(body, content, result, class_name=name, owner=symbol)
 
     def _extract_constant(
         self,
@@ -305,6 +324,49 @@ class RubyParser(LanguageParser):
             elif child.type == "interpolation":
                 return None
         return "".join(parts)
+
+    # ------------------------------------------------------------------
+    # Class macros (mixins & accessors)
+    # ------------------------------------------------------------------
+
+    def _extract_class_macro(
+        self,
+        node: Node,
+        result: ParseResult,
+        class_name: str,
+        owner: SymbolInfo | None,
+    ) -> None:
+        """Extract mixin and accessor macros from a bare ``call`` node.
+
+        ``include``/``extend``/``prepend M`` inside a class/module emit a
+        ``(class_name, "mixin", "M")`` heritage tuple; ``attr_accessor``/
+        ``attr_reader``/``attr_writer`` symbol arguments are recorded on the
+        owning type's ``decorators`` so Task 10 can exempt the generated
+        accessors from dead-code analysis.  Both only apply within a type, and
+        only to bare calls (no receiver).
+        """
+        if not class_name or owner is None:
+            return
+        if node.child_by_field_name("receiver") is not None:
+            return
+        method_node = node.child_by_field_name("method")
+        if method_node is None or method_node.type != "identifier":
+            return
+        method = method_node.text.decode("utf8")
+
+        args_node = node.child_by_field_name("arguments")
+        if args_node is None:
+            return
+
+        if method in _MIXIN_METHODS:
+            for arg in args_node.children:
+                if arg.type in ("constant", "scope_resolution"):
+                    result.heritage.append((class_name, "mixin", self._constant_last_segment(arg)))
+        elif method in _ATTR_METHODS:
+            for arg in args_node.children:
+                if arg.type == "simple_symbol":
+                    sym = arg.text.decode("utf8").lstrip(":")
+                    owner.decorators.append(f"{method}:{sym}")
 
     # ------------------------------------------------------------------
     # Calls
@@ -443,6 +505,26 @@ class RubyParser(LanguageParser):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _superclass_name(node: Node) -> str:
+        """Return the parent name from a ``superclass`` node (``< Parent``).
+
+        The trailing constant segment is used so namespaced parents
+        (``< Foo::Bar``) match the way classes/modules are named.
+        """
+        for child in node.children:
+            if child.type in ("constant", "scope_resolution"):
+                return RubyParser._constant_last_segment(child)
+        return ""
+
+    @staticmethod
+    def _constant_last_segment(node: Node) -> str:
+        """Return the final segment of a ``constant``/``scope_resolution`` node.
+
+        ``Foo::Bar`` → ``Bar``; a bare ``Foo`` is returned unchanged.
+        """
+        return node.text.decode("utf8").rsplit("::", 1)[-1]
 
     @staticmethod
     def _definition_name(node: Node) -> str:
