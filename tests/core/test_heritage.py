@@ -11,7 +11,7 @@ from synaptiq.core.ingestion.parser_phase import FileParseData
 from synaptiq.core.ingestion.symbol_lookup import build_name_index
 from synaptiq.core.parsers.base import ParseResult
 
-_HERITAGE_LABELS = (NodeLabel.CLASS, NodeLabel.INTERFACE)
+_HERITAGE_LABELS = (NodeLabel.CLASS, NodeLabel.INTERFACE, NodeLabel.MODULE)
 
 
 # ---------------------------------------------------------------------------
@@ -110,9 +110,7 @@ class TestBuildSymbolIndex:
                 assert node is not None
                 assert node.name == name
 
-    def test_index_excludes_non_heritage_labels(
-        self, graph: KnowledgeGraph
-    ) -> None:
+    def test_index_excludes_non_heritage_labels(self, graph: KnowledgeGraph) -> None:
         # Add a function node -- it should NOT appear in the index.
         graph.add_node(
             GraphNode(
@@ -150,9 +148,7 @@ class TestProcessHeritageExtends:
         assert rel.source == generate_id(NodeLabel.CLASS, "src/models.py", "Dog")
         assert rel.target == generate_id(NodeLabel.CLASS, "src/models.py", "Animal")
 
-    def test_extends_relationship_id_format(
-        self, graph: KnowledgeGraph
-    ) -> None:
+    def test_extends_relationship_id_format(self, graph: KnowledgeGraph) -> None:
         parse_data = [
             _make_parse_data(
                 "src/models.py",
@@ -189,13 +185,9 @@ class TestProcessHeritageImplements:
 
         rel = impl_rels[0]
         assert rel.source == generate_id(NodeLabel.CLASS, "src/models.ts", "User")
-        assert rel.target == generate_id(
-            NodeLabel.INTERFACE, "src/types.ts", "Serializable"
-        )
+        assert rel.target == generate_id(NodeLabel.INTERFACE, "src/types.ts", "Serializable")
 
-    def test_implements_relationship_type(
-        self, graph: KnowledgeGraph
-    ) -> None:
+    def test_implements_relationship_type(self, graph: KnowledgeGraph) -> None:
         parse_data = [
             _make_parse_data(
                 "src/models.ts",
@@ -216,9 +208,7 @@ class TestProcessHeritageImplements:
 class TestProcessHeritageUnresolvedParent:
     """Heritage referencing an unknown parent is silently skipped."""
 
-    def test_process_heritage_unresolved_parent(
-        self, graph: KnowledgeGraph
-    ) -> None:
+    def test_process_heritage_unresolved_parent(self, graph: KnowledgeGraph) -> None:
         parse_data = [
             _make_parse_data(
                 "src/models.py",
@@ -231,9 +221,7 @@ class TestProcessHeritageUnresolvedParent:
         extends_rels = graph.get_relationships_by_type(RelType.EXTENDS)
         assert len(extends_rels) == 0
 
-    def test_unresolved_child_also_skipped(
-        self, graph: KnowledgeGraph
-    ) -> None:
+    def test_unresolved_child_also_skipped(self, graph: KnowledgeGraph) -> None:
         parse_data = [
             _make_parse_data(
                 "src/models.py",
@@ -288,9 +276,7 @@ class TestProcessHeritageMultiple:
         total = len(extends_rels) + len(impl_rels)
         assert total == 3
 
-    def test_multiple_heritage_sources_are_correct(
-        self, graph: KnowledgeGraph
-    ) -> None:
+    def test_multiple_heritage_sources_are_correct(self, graph: KnowledgeGraph) -> None:
         graph.add_node(
             GraphNode(
                 id=generate_id(NodeLabel.INTERFACE, "src/types.ts", "Printable"),
@@ -383,3 +369,172 @@ class TestProtocolAnnotation:
 
         extends_rels = graph.get_relationships_by_type(RelType.EXTENDS)
         assert len(extends_rels) == 0
+
+
+# ---------------------------------------------------------------------------
+# process_heritage — Ruby mixins (MIXES_IN)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def ruby_graph() -> KnowledgeGraph:
+    """Return a KnowledgeGraph with Ruby Class and Module nodes.
+
+    Layout:
+    - Module:app/concerns/trackable.rb:Trackable
+    - Class:app/models/user.rb:User
+    - Class:app/models/base.rb:Base
+    - Module:app/models/user.rb:LocalMixin  (same-file as User)
+    - Module:app/concerns/other.rb:LocalMixin  (cross-file duplicate name)
+    """
+    g = KnowledgeGraph()
+
+    g.add_node(
+        GraphNode(
+            id=generate_id(NodeLabel.MODULE, "app/concerns/trackable.rb", "Trackable"),
+            label=NodeLabel.MODULE,
+            name="Trackable",
+            file_path="app/concerns/trackable.rb",
+        )
+    )
+    g.add_node(
+        GraphNode(
+            id=generate_id(NodeLabel.CLASS, "app/models/user.rb", "User"),
+            label=NodeLabel.CLASS,
+            name="User",
+            file_path="app/models/user.rb",
+        )
+    )
+    g.add_node(
+        GraphNode(
+            id=generate_id(NodeLabel.CLASS, "app/models/base.rb", "Base"),
+            label=NodeLabel.CLASS,
+            name="Base",
+            file_path="app/models/base.rb",
+        )
+    )
+    # Same-name module in two files to exercise same-file preference.
+    g.add_node(
+        GraphNode(
+            id=generate_id(NodeLabel.MODULE, "app/concerns/other.rb", "LocalMixin"),
+            label=NodeLabel.MODULE,
+            name="LocalMixin",
+            file_path="app/concerns/other.rb",
+        )
+    )
+    g.add_node(
+        GraphNode(
+            id=generate_id(NodeLabel.MODULE, "app/models/user.rb", "LocalMixin"),
+            label=NodeLabel.MODULE,
+            name="LocalMixin",
+            file_path="app/models/user.rb",
+        )
+    )
+
+    return g
+
+
+def _make_ruby_parse_data(
+    file_path: str,
+    heritage: list[tuple[str, str, str]],
+) -> FileParseData:
+    """Create a Ruby FileParseData with only heritage tuples populated."""
+    return FileParseData(
+        file_path=file_path,
+        language="ruby",
+        parse_result=ParseResult(heritage=heritage),
+    )
+
+
+class TestProcessHeritageMixin:
+    """Ruby include/extend/prepend produce MIXES_IN relationships."""
+
+    def test_include_creates_mixes_in(self, ruby_graph: KnowledgeGraph) -> None:
+        parse_data = [
+            _make_ruby_parse_data(
+                "app/models/user.rb",
+                [("User", "mixin", "Trackable")],
+            ),
+        ]
+        process_heritage(parse_data, ruby_graph)
+
+        mixin_rels = ruby_graph.get_relationships_by_type(RelType.MIXES_IN)
+        assert len(mixin_rels) == 1
+
+        rel = mixin_rels[0]
+        assert rel.type == RelType.MIXES_IN
+        assert rel.source == generate_id(NodeLabel.CLASS, "app/models/user.rb", "User")
+        assert rel.target == generate_id(NodeLabel.MODULE, "app/concerns/trackable.rb", "Trackable")
+
+    def test_mixin_relationship_id_format(self, ruby_graph: KnowledgeGraph) -> None:
+        parse_data = [
+            _make_ruby_parse_data(
+                "app/models/user.rb",
+                [("User", "mixin", "Trackable")],
+            ),
+        ]
+        process_heritage(parse_data, ruby_graph)
+
+        rel = ruby_graph.get_relationships_by_type(RelType.MIXES_IN)[0]
+        assert rel.id.startswith("mixin:")
+        assert "->" in rel.id
+
+    def test_class_inheritance_still_extends(self, ruby_graph: KnowledgeGraph) -> None:
+        """``class User < Base`` must still produce an EXTENDS edge, not MIXES_IN."""
+        parse_data = [
+            _make_ruby_parse_data(
+                "app/models/user.rb",
+                [("User", "extends", "Base")],
+            ),
+        ]
+        process_heritage(parse_data, ruby_graph)
+
+        extends_rels = ruby_graph.get_relationships_by_type(RelType.EXTENDS)
+        mixin_rels = ruby_graph.get_relationships_by_type(RelType.MIXES_IN)
+
+        assert len(extends_rels) == 1
+        assert len(mixin_rels) == 0
+        assert extends_rels[0].target == generate_id(NodeLabel.CLASS, "app/models/base.rb", "Base")
+
+    def test_mixin_prefers_same_file_module_target(self, ruby_graph: KnowledgeGraph) -> None:
+        """A mixin target defined in the importing file wins over a cross-file dup."""
+        parse_data = [
+            _make_ruby_parse_data(
+                "app/models/user.rb",
+                [("User", "mixin", "LocalMixin")],
+            ),
+        ]
+        process_heritage(parse_data, ruby_graph)
+
+        rel = ruby_graph.get_relationships_by_type(RelType.MIXES_IN)[0]
+        assert rel.target == generate_id(NodeLabel.MODULE, "app/models/user.rb", "LocalMixin")
+
+    def test_unresolved_external_mixin_skipped(self, ruby_graph: KnowledgeGraph) -> None:
+        """An include of an external/unknown module is skipped without error."""
+        parse_data = [
+            _make_ruby_parse_data(
+                "app/models/user.rb",
+                [("User", "mixin", "Comparable")],
+            ),
+        ]
+        # Should not raise.
+        process_heritage(parse_data, ruby_graph)
+
+        mixin_rels = ruby_graph.get_relationships_by_type(RelType.MIXES_IN)
+        assert len(mixin_rels) == 0
+
+    def test_module_can_be_mixin_source(self, ruby_graph: KnowledgeGraph) -> None:
+        """A module including another module produces MIXES_IN (module as source)."""
+        parse_data = [
+            _make_ruby_parse_data(
+                "app/concerns/trackable.rb",
+                [("Trackable", "mixin", "LocalMixin")],
+            ),
+        ]
+        process_heritage(parse_data, ruby_graph)
+
+        mixin_rels = ruby_graph.get_relationships_by_type(RelType.MIXES_IN)
+        assert len(mixin_rels) == 1
+        assert mixin_rels[0].source == generate_id(
+            NodeLabel.MODULE, "app/concerns/trackable.rb", "Trackable"
+        )

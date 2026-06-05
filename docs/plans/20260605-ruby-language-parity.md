@@ -237,12 +237,12 @@ parser and the phases recognize Ruby via `language == "ruby"` / `.rb` suffix.
 - Modify: `src/synaptiq/core/ingestion/heritage.py`
 - Modify: `tests/core/test_heritage.py`
 
-- [ ] write tests: Ruby class with `include M` produces a `MIXES_IN` edge from class/module to module node; `class A < B` produces `EXTENDS`
-- [ ] add `"mixin": RelType.MIXES_IN` to `_KIND_TO_REL`
-- [ ] add `NodeLabel.MODULE` to `_HERITAGE_LABELS` so mixin/parent modules resolve
-- [ ] verify same-file-preference resolution still works for module targets
-- [ ] write edge test: unresolved external module mixin is skipped without error
-- [ ] run tests + ruff — must pass before next task
+- [x] write tests: Ruby class with `include M` produces a `MIXES_IN` edge from class/module to module node; `class A < B` produces `EXTENDS`
+- [x] add `"mixin": RelType.MIXES_IN` to `_KIND_TO_REL`
+- [x] add `NodeLabel.MODULE` to `_HERITAGE_LABELS` so mixin/parent modules resolve
+- [x] verify same-file-preference resolution still works for module targets
+- [x] write edge test: unresolved external module mixin is skipped without error
+- [x] run tests + ruff — must pass before next task
 
 ### Task 8: Imports phase — `_resolve_ruby` (require_relative + Rails autoload)
 
