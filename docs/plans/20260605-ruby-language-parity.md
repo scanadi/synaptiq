@@ -167,12 +167,12 @@ parser and the phases recognize Ruby via `language == "ruby"` / `.rb` suffix.
 - Modify: `tests/core/test_graph.py` and/or storage test for schema creation
 - Modify: `tests/mcp/` schema resource test (if present)
 
-- [ ] write test (in `tests/core/test_graph_model.py`): `NodeLabel.MODULE.value == "module"`, `RelType.MIXES_IN.value == "mixes_in"`
-- [ ] write test: adding a `MODULE` node + a `MIXES_IN` rel round-trips through the Kuzu backend (verifies auto-derived `Module` table + REL TABLE GROUP accept the new types)
-- [ ] write test: `resources.get_schema()` mentions `Module` and `MIXES_IN`
-- [ ] add `MODULE = "module"` to `NodeLabel` and `MIXES_IN = "mixes_in"` to `RelType`
-- [ ] update `resources.get_schema()` — add `Module` to the node-labels block (confirm that block exists to edit) and `MIXES_IN` to the relationship-types block
-- [ ] run full storage + model + mcp tests — must pass before next task
+- [x] write test (in `tests/core/test_graph_model.py`): `NodeLabel.MODULE.value == "module"`, `RelType.MIXES_IN.value == "mixes_in"`
+- [x] write test: adding a `MODULE` node + a `MIXES_IN` rel round-trips through the Kuzu backend (verifies auto-derived `Module` table + REL TABLE GROUP accept the new types)
+- [x] write test: `resources.get_schema()` mentions `Module` and `MIXES_IN`
+- [x] add `MODULE = "module"` to `NodeLabel` and `MIXES_IN = "mixes_in"` to `RelType`
+- [x] update `resources.get_schema()` — add `Module` to the node-labels block (confirm that block exists to edit) and `MIXES_IN` to the relationship-types block
+- [x] run full storage + model + mcp tests — must pass before next task
 
 ### Task 3: Ruby parser — symbol extraction (methods, classes, modules, constants)
 

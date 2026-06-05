@@ -23,6 +23,7 @@ class NodeLabel(Enum):
     INTERFACE = "interface"
     TYPE_ALIAS = "type_alias"
     ENUM = "enum"
+    MODULE = "module"
     COMMUNITY = "community"
     PROCESS = "process"
 
@@ -35,6 +36,7 @@ class RelType(Enum):
     IMPORTS = "imports"
     EXTENDS = "extends"
     IMPLEMENTS = "implements"
+    MIXES_IN = "mixes_in"
     MEMBER_OF = "member_of"
     STEP_IN_PROCESS = "step_in_process"
     USES_TYPE = "uses_type"

@@ -121,6 +121,7 @@ Node Labels:
   - Interface  : Interface / protocol definition
   - TypeAlias  : Type alias definition
   - Enum       : Enumeration definition
+  - Module     : Module / namespace definition (e.g. Ruby module)
   - Community  : Detected community cluster (via Leiden algorithm)
   - Process    : Business process / workflow
 
@@ -135,6 +136,7 @@ Relationship Types:
   - IMPORTS       : File/symbol imports another
   - EXTENDS       : Class extends another class
   - IMPLEMENTS    : Class implements an interface
+  - MIXES_IN      : Class/module mixes in a module (Ruby include/extend/prepend)
   - MEMBER_OF     : Symbol belongs to a community
   - STEP_IN_PROCESS : Symbol is a step in a process
   - USES_TYPE     : Symbol references a type

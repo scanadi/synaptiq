@@ -397,6 +397,8 @@ class TestResources:
         assert "Relationship Types:" in result
         assert "CALLS" in result
         assert "Function" in result
+        assert "Module" in result
+        assert "MIXES_IN" in result
 
     def test_get_overview(self, mock_storage):
         """Overview resource queries storage for stats."""
