@@ -250,12 +250,12 @@ parser and the phases recognize Ruby via `language == "ruby"` / `.rb` suffix.
 - Modify: `src/synaptiq/core/ingestion/imports.py`
 - Modify: `tests/core/test_imports.py`
 
-- [ ] write tests: `require_relative "../lib/foo"` resolves to `lib/foo.rb` in the file index (assert NON-None); Rails-style implicit `UserService` → `app/services/user_service.rb` (snake_case convention)
-- [ ] add `.rb → "ruby"` mapping in `_detect_language` (imports.py:136)
-- [ ] add the dispatch arm `if language == "ruby": return _resolve_ruby(...)` in `resolve_import_path` (imports.py:85-92) — **separate checkbox: without this arm Ruby imports silently return None with no error**
-- [ ] implement `_resolve_ruby`: relative resolution from importing file dir; `require` against project roots; convention-based (underscore) name→path mapping for autoload-style references
-- [ ] write edge tests: gem requires (`require "rails"`) resolve to None (external); missing file → None
-- [ ] run tests + ruff — must pass before next task
+- [x] write tests: `require_relative "../lib/foo"` resolves to `lib/foo.rb` in the file index (assert NON-None); Rails-style implicit `UserService` → `app/services/user_service.rb` (snake_case convention)
+- [x] add `.rb → "ruby"` mapping in `_detect_language` (imports.py:136) — added all Ruby suffixes (`.rb`, `.rake`, `.ru`, `.gemspec`, `.rbi`) via `_RUBY_EXTENSIONS` for parity with Task 1's extension map
+- [x] add the dispatch arm `if language == "ruby": return _resolve_ruby(...)` in `resolve_import_path` (imports.py:85-92) — **separate checkbox: without this arm Ruby imports silently return None with no error**
+- [x] implement `_resolve_ruby`: relative resolution from importing file dir (`posixpath.normpath`); `require` against project roots; convention-based (`_underscore` ActiveSupport-style) name→path basename mapping for autoload-style references
+- [x] write edge tests: gem requires (`require "rails"`) resolve to None (external); missing file → None
+- [x] run tests + ruff — `ruff check` clean; `ruff format --check` is pre-existing repo-wide dirty (ruff version drift, 56 files), code matches surrounding single-blank-line style
 
 ### Task 9: Processes phase — Ruby framework entry points
 

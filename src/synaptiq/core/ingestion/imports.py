@@ -8,6 +8,8 @@ relationships between the importing file and the target file.
 from __future__ import annotations
 
 import logging
+import posixpath
+import re
 from pathlib import PurePosixPath
 
 from synaptiq.core.graph.graph import KnowledgeGraph
@@ -23,6 +25,7 @@ from synaptiq.core.parsers.base import ImportInfo
 logger = logging.getLogger(__name__)
 
 _JS_TS_EXTENSIONS = (".ts", ".js", ".tsx", ".jsx")
+_RUBY_EXTENSIONS = (".rb", ".rake", ".ru", ".gemspec", ".rbi")
 
 def build_file_index(graph: KnowledgeGraph) -> dict[str, str]:
     """Build an index mapping file paths to their graph node IDs.
@@ -88,6 +91,8 @@ def resolve_import_path(
         return _resolve_python(importing_file, import_info, file_index, source_roots)
     if language in ("typescript", "javascript"):
         return _resolve_js_ts(importing_file, import_info, file_index)
+    if language == "ruby":
+        return _resolve_ruby(importing_file, import_info, file_index)
 
     return None
 
@@ -142,6 +147,8 @@ def _detect_language(file_path: str) -> str:
         return "typescript"
     if suffix in (".js", ".jsx"):
         return "javascript"
+    if suffix in _RUBY_EXTENSIONS:
+        return "ruby"
     return ""
 
 def _resolve_python(
@@ -292,3 +299,92 @@ def _try_js_ts_paths(base_path: str, file_index: dict[str, str]) -> str | None:
             return file_index[candidate]
 
     return None
+
+def _resolve_ruby(
+    importing_file: str,
+    import_info: ImportInfo,
+    file_index: dict[str, str],
+) -> str | None:
+    """Resolve a Ruby ``require``/``require_relative``/``autoload`` to a file node.
+
+    Handles:
+    - ``require_relative`` (``is_relative=True``): resolved against the
+      importing file's directory (e.g. ``../lib/foo`` -> ``lib/foo.rb``).
+    - ``require`` / ``autoload``: tried as a project-root-relative path first
+      (e.g. ``config/settings`` -> ``config/settings.rb``), then via the Rails
+      autoload naming convention — the required feature or the autoloaded
+      constant is snake-cased and matched against file basenames
+      (``UserService`` -> ``app/services/user_service.rb``).
+
+    Returns ``None`` for external gems (``require "rails"``) and missing files.
+    """
+    module = import_info.module
+
+    if import_info.is_relative:
+        base = PurePosixPath(importing_file).parent
+        resolved = posixpath.normpath(str(base / module))
+        return _try_ruby_paths(resolved, file_index)
+
+    # require / autoload — first try the literal feature path against the root.
+    result = _try_ruby_paths(module, file_index)
+    if result:
+        return result
+
+    # Convention-based fallback: match by snake_cased basename. The required
+    # feature itself may already be snake_case ("user_service"); autoload also
+    # carries the CamelCase constant in ``names`` ("UserService").
+    candidates = [module, *import_info.names]
+    for candidate in candidates:
+        result = _resolve_ruby_by_basename(_underscore(candidate), file_index)
+        if result:
+            return result
+
+    return None
+
+def _try_ruby_paths(base_path: str, file_index: dict[str, str]) -> str | None:
+    """Try common Ruby file resolution patterns for *base_path*.
+
+    Checks the path as-is (when it already carries a ``.rb`` suffix) and with
+    ``.rb`` appended.
+    """
+    candidates = [base_path, f"{base_path}.rb"]
+    for candidate in candidates:
+        if candidate in file_index:
+            return file_index[candidate]
+    return None
+
+def _resolve_ruby_by_basename(
+    name: str, file_index: dict[str, str]
+) -> str | None:
+    """Match *name* against file basenames using the Rails autoload convention.
+
+    ``name`` is a (possibly ``/``-namespaced) snake_case path; only the final
+    segment is compared against each indexed file's basename, so
+    ``user_service`` resolves to ``app/services/user_service.rb`` regardless of
+    its directory.  Returns the lexicographically-first match for determinism.
+    """
+    target = PurePosixPath(name).name
+    if not target.endswith(".rb"):
+        target = f"{target}.rb"
+
+    matches = sorted(
+        node_id
+        for path, node_id in file_index.items()
+        if PurePosixPath(path).name == target
+    )
+    return matches[0] if matches else None
+
+def _underscore(name: str) -> str:
+    """Convert a Ruby constant path to its conventional snake_case file path.
+
+    Mirrors ActiveSupport's ``underscore``: ``UserService`` -> ``user_service``,
+    ``HTTPClient`` -> ``http_client``, ``Admin::UserService`` ->
+    ``admin/user_service``.
+    """
+    name = name.replace("::", "/")
+    segments = []
+    for segment in name.split("/"):
+        s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", segment)
+        s = re.sub(r"([a-z\d])([A-Z])", r"\1_\2", s)
+        segments.append(s.lower())
+    return "/".join(segments)
