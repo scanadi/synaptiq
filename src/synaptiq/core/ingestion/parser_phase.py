@@ -85,10 +85,15 @@ def get_parser(language: str) -> LanguageParser:
 
         parser = TypeScriptParser(dialect="javascript")
 
+    elif language == "ruby":
+        from synaptiq.core.parsers.ruby_lang import RubyParser
+
+        parser = RubyParser()
+
     else:
         raise ValueError(
             f"Unsupported language {language!r}. "
-            f"Expected one of: python, typescript, javascript"
+            f"Expected one of: python, typescript, javascript, ruby"
         )
 
     _PARSER_CACHE[language] = parser

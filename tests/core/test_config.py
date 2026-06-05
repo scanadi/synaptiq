@@ -165,6 +165,27 @@ class TestGetLanguage:
     def test_accepts_path_object(self) -> None:
         assert get_language(Path("src/app.py")) == "python"
 
+    def test_ruby_rb(self) -> None:
+        assert get_language("app/models/user.rb") == "ruby"
+
+    def test_ruby_extensions(self) -> None:
+        assert get_language("lib/tasks/foo.rake") == "ruby"
+        assert get_language("synaptiq.gemspec") == "ruby"
+        assert get_language("config.ru") == "ruby"
+        assert get_language("sig/foo.rbi") == "ruby"
+
+    def test_ruby_special_filenames(self) -> None:
+        assert get_language("Rakefile") == "ruby"
+        assert get_language("Gemfile") == "ruby"
+        assert get_language("Guardfile") == "ruby"
+        assert get_language("Capfile") == "ruby"
+        assert get_language("Vagrantfile") == "ruby"
+        assert get_language("Brewfile") == "ruby"
+        assert get_language("Podfile") == "ruby"
+
+    def test_ruby_special_filename_with_dir(self) -> None:
+        assert get_language("project/Rakefile") == "ruby"
+
 
 class TestIsSupported:
     """Tests for is_supported()."""
@@ -183,6 +204,13 @@ class TestIsSupported:
 
     def test_accepts_path_object(self) -> None:
         assert is_supported(Path("src/module.tsx")) is True
+
+    def test_supported_rb(self) -> None:
+        assert is_supported("app/models/user.rb") is True
+
+    def test_supported_special_filename(self) -> None:
+        assert is_supported("Rakefile") is True
+        assert is_supported("Gemfile") is True
 
 
 class TestSupportedExtensions:

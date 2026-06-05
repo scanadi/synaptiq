@@ -147,16 +147,16 @@ parser and the phases recognize Ruby via `language == "ruby"` / `.rb` suffix.
 - Modify: `tests/core/test_config.py` (existing — already covers `get_language`/`is_supported`/`SUPPORTED_EXTENSIONS`)
 - Create: `tests/core/test_parser_ruby.py` (stub asserting `get_parser("ruby")` works)
 
-- [ ] write test (in `tests/core/test_config.py`): `get_language("foo.rb") == "ruby"`, `is_supported("foo.rb")`
-- [ ] **Decision (resolved): route Ruby special files.** `get_language` currently keys on `Path.suffix` only. Extend it to also recognize suffix-less / non-`.rb` Ruby files by basename so they parse as Ruby (and Task 9 entry heuristics on `Rakefile`/`config.ru` become live).
-- [ ] write tests (in `tests/core/test_config.py`): special filenames map to `"ruby"` — `Rakefile`, `Gemfile`, `Guardfile`, `Capfile`, `Vagrantfile`, `Brewfile`, `Podfile`; and special extensions — `.rake`, `.gemspec`, `.ru`, `.rbi`
-- [ ] add a `SPECIAL_FILENAMES: dict[str, str]` map (`{"Rakefile": "ruby", "Gemfile": "ruby", "Guardfile": "ruby", "Capfile": "ruby", "Vagrantfile": "ruby", "Brewfile": "ruby", "Podfile": "ruby"}`) to `config/languages.py`; have `get_language`/`is_supported` consult `Path.name` against it before falling back to suffix lookup
-- [ ] add `".rake": "ruby"`, `".gemspec": "ruby"`, `".ru": "ruby"`, `".rbi": "ruby"` to `SUPPORTED_EXTENSIONS`
-- [ ] write test: `parser_phase.get_parser("ruby")` returns a `LanguageParser` (will fail until parser exists — see Task 3 note)
-- [ ] add `tree-sitter-ruby>=0.23.0` to `pyproject.toml` dependencies; `uv sync --all-extras`
-- [ ] add `".rb": "ruby"` to `SUPPORTED_EXTENSIONS`
-- [ ] add `ruby` branch in `get_parser()` importing `RubyParser` (temporary minimal stub class is fine until Task 3); also extend the `ValueError` message to list `ruby`
-- [ ] run tests + `ruff check` — language/dispatch tests must pass before next task
+- [x] write test (in `tests/core/test_config.py`): `get_language("foo.rb") == "ruby"`, `is_supported("foo.rb")`
+- [x] **Decision (resolved): route Ruby special files.** `get_language` currently keys on `Path.suffix` only. Extend it to also recognize suffix-less / non-`.rb` Ruby files by basename so they parse as Ruby (and Task 9 entry heuristics on `Rakefile`/`config.ru` become live).
+- [x] write tests (in `tests/core/test_config.py`): special filenames map to `"ruby"` — `Rakefile`, `Gemfile`, `Guardfile`, `Capfile`, `Vagrantfile`, `Brewfile`, `Podfile`; and special extensions — `.rake`, `.gemspec`, `.ru`, `.rbi`
+- [x] add a `SPECIAL_FILENAMES: dict[str, str]` map (`{"Rakefile": "ruby", "Gemfile": "ruby", "Guardfile": "ruby", "Capfile": "ruby", "Vagrantfile": "ruby", "Brewfile": "ruby", "Podfile": "ruby"}`) to `config/languages.py`; have `get_language`/`is_supported` consult `Path.name` against it before falling back to suffix lookup
+- [x] add `".rake": "ruby"`, `".gemspec": "ruby"`, `".ru": "ruby"`, `".rbi": "ruby"` to `SUPPORTED_EXTENSIONS`
+- [x] write test: `parser_phase.get_parser("ruby")` returns a `LanguageParser` (will fail until parser exists — see Task 3 note)
+- [x] add `tree-sitter-ruby>=0.23.0` to `pyproject.toml` dependencies; `uv sync --all-extras`
+- [x] add `".rb": "ruby"` to `SUPPORTED_EXTENSIONS`
+- [x] add `ruby` branch in `get_parser()` importing `RubyParser` (temporary minimal stub class is fine until Task 3); also extend the `ValueError` message to list `ruby`
+- [x] run tests + `ruff check` — language/dispatch tests must pass before next task
 
 ### Task 2: Graph model — add `MODULE` label and `MIXES_IN` relationship
 
