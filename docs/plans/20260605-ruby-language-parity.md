@@ -292,12 +292,13 @@ parser and the phases recognize Ruby via `language == "ruby"` / `.rb` suffix.
 - Modify: `tests/core/test_rest_linking.py`
 - Modify: `tests/core/test_parser_ruby.py`
 
-- [ ] write tests: Sinatra `get "/users/:id" do` and Rails `get "/users/:id" => "users#show"` → `EndpointInfo`; `Net::HTTP`/`HTTParty.get`/`Faraday` → `HttpCallInfo`
-- [ ] add `.rb → "ruby"` branch in `rest_linking._detect_language` (rest_linking.py:323) — **separate, load-bearing checkbox: the extraction loop does `if not language: continue`, so a missing arm silently drops ALL Ruby endpoints/HTTP calls, even AST-emitted ones**
-- [ ] add a `language == "ruby"` regex pass in `extract_rest_info_from_source`
-- [ ] add Ruby endpoint/HTTP regex patterns; normalize `:id` path params
-- [ ] write edge tests: non-route DSL methods not misdetected
-- [ ] run tests + ruff — must pass before next task
+- [x] write tests: Sinatra `get "/users/:id" do` and Rails `get "/users/:id" => "users#show"` → `EndpointInfo`; `Net::HTTP`/`HTTParty.get`/`Faraday` → `HttpCallInfo`
+- [x] add `.rb → "ruby"` branch in `rest_linking._detect_language` (rest_linking.py:323) — added all Ruby suffixes (`.rb`, `.rake`, `.ru`, `.gemspec`, `.rbi`) for parity with the imports phase; **load-bearing: the extraction loop does `if not language: continue`, so without it ALL Ruby endpoints/HTTP calls are silently dropped**
+- [x] add a `language == "ruby"` regex pass in `extract_rest_info_from_source`
+- [x] add Ruby endpoint/HTTP regex patterns; normalize `:id` path params (handled by the existing `_PARAM_PATTERNS` Express arm — `:id` → `{param}`, no new normalization code needed)
+- [x] write edge tests: non-route DSL methods not misdetected (also: receiver-prefixed verbs like `File.delete "/x"` not flagged; non-literal HTTP URLs ignored)
+- [x] run tests + ruff — 106 rest-linking + ruby-parser tests pass; ruff check + format clean on touched files
+- ℹ️ Scope note: implemented via the regex pass only (no AST `EndpointInfo`/`HttpCallInfo` emission in `ruby_lang.py`), mirroring the Python/TS parsers which also emit zero endpoints/http_calls from the AST and rely entirely on `extract_rest_info_from_source`. The Ruby endpoint regex anchors the HTTP verb to line start (`^\s*(get|post|...)`) so bare DSL calls with the verb in receiver position (`File.delete`, `render "tpl"`) are not misdetected.
 
 ### Task 12: Call blocklist + full-pipeline integration test
 

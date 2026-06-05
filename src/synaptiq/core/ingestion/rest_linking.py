@@ -56,6 +56,21 @@ _TS_AXIOS = re.compile(
     re.IGNORECASE,
 )
 
+# Ruby route DSL: Sinatra ``get "/x" do`` / Rails ``get "/x" => "c#a"`` /
+# ``get "/x", to: "c#a"``.  The verb must open the (optionally indented) line so
+# bare method calls like ``render "tpl"`` or ``has_many :x`` are not misread as
+# routes.
+_RB_ENDPOINT = re.compile(
+    r"^\s*(get|post|put|delete|patch)\s+[\"']([^\"']+)[\"']",
+)
+
+# Ruby HTTP client calls: HTTParty.get("url"), Faraday.get("url"),
+# RestClient.post("url"), Net::HTTP.get("url") — only string-literal URLs.
+_RB_HTTP_CALL = re.compile(
+    r"\b(HTTParty|Faraday|RestClient|Typhoeus|Net::HTTP)"
+    r"\.(get|post|put|delete|patch|head)\s*\(?\s*[\"']([^\"']+)[\"']",
+)
+
 
 def extract_rest_info_from_source(
     content: str, file_path: str, language: str
@@ -134,6 +149,29 @@ def extract_rest_info_from_source(
                         http_method=m.group(1).lower(),
                         line=i,
                         receiver="axios",
+                    )
+                )
+
+    elif language == "ruby":
+        for i, line in enumerate(lines, 1):
+            # Sinatra/Rails route DSL.
+            for m in _RB_ENDPOINT.finditer(line):
+                endpoints.append(
+                    EndpointInfo(
+                        url_pattern=m.group(2),
+                        http_method=m.group(1).lower(),
+                        function_name="",
+                        line=i,
+                    )
+                )
+            # HTTP client calls.
+            for m in _RB_HTTP_CALL.finditer(line):
+                http_calls.append(
+                    HttpCallInfo(
+                        url=m.group(3),
+                        http_method=m.group(2).lower(),
+                        line=i,
+                        receiver=m.group(1),
                     )
                 )
 
@@ -328,6 +366,8 @@ def _detect_language(file_path: str) -> str | None:
         return "typescript"
     if file_path.endswith((".js", ".jsx")):
         return "javascript"
+    if file_path.endswith((".rb", ".rake", ".ru", ".gemspec", ".rbi")):
+        return "ruby"
     return None
 
 
