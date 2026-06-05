@@ -181,13 +181,18 @@ parser and the phases recognize Ruby via `language == "ruby"` / `.rb` suffix.
 - Modify: `src/synaptiq/core/ingestion/parser_phase.py` (`_KIND_TO_LABEL["module"]`)
 - Modify: `tests/core/test_parser_ruby.py`
 
-- [ ] write tests: top-level `def`, `class` with methods, `module` with methods, nested classes, singleton/`self.` class methods, constants — assert `SymbolInfo` kind/name/class_name/lines/signature
-- [ ] implement `RubyParser(LanguageParser)` using `tree_sitter_ruby`, walking `method`, `singleton_method`, `class`, `module`, `assignment`(constants) nodes
-- [ ] emit `kind="function"|"class"|"method"|"module"`; set `class_name` for methods nested in class/module
-- [ ] add `"module": NodeLabel.MODULE` to `_KIND_TO_LABEL` in `parser_phase.py`
-- [ ] handle parse failures gracefully (return empty `ParseResult`, matching existing parsers)
-- [ ] write error/edge tests: empty file, syntax error, deeply nested modules
-- [ ] run tests + ruff — must pass before next task
+- [x] write tests: top-level `def`, `class` with methods, `module` with methods, nested classes, singleton/`self.` class methods, constants — assert `SymbolInfo` kind/name/class_name/lines/signature
+- [x] implement `RubyParser(LanguageParser)` using `tree_sitter_ruby`, walking `method`, `singleton_method`, `class`, `module`, `assignment`(constants) nodes
+- [x] emit `kind="function"|"class"|"method"|"module"`; set `class_name` for methods nested in class/module
+- [x] add `"module": NodeLabel.MODULE` to `_KIND_TO_LABEL` in `parser_phase.py`
+- [x] handle parse failures gracefully (return empty `ParseResult`, matching existing parsers)
+- [x] write error/edge tests: empty file, syntax error, deeply nested modules
+- [x] run tests + ruff — must pass before next task
+- ℹ️ Scope note: constants emit `SymbolInfo(kind="constant")` for parser-level
+  capture, but there is no `CONSTANT` `NodeLabel` (Task 2 only added `MODULE`).
+  `parser_phase` now has `_UNMAPPED_KINDS = {"constant"}` so constants are skipped
+  from the graph silently (no warning noise). Mirrors the "type extraction
+  skipped" pragmatism — Ruby constants are not materialized as graph nodes for now.
 
 ### Task 4: Ruby parser — import extraction (`require` / `require_relative` / `autoload`)
 

@@ -33,7 +33,13 @@ _KIND_TO_LABEL: dict[str, NodeLabel] = {
     "interface": NodeLabel.INTERFACE,
     "type_alias": NodeLabel.TYPE_ALIAS,
     "enum": NodeLabel.ENUM,
+    "module": NodeLabel.MODULE,
 }
+
+# Symbol kinds that are intentionally parsed but not materialized as graph
+# nodes (no corresponding NodeLabel).  Skipped silently to avoid log noise.
+_UNMAPPED_KINDS: frozenset[str] = frozenset({"constant"})
+
 
 @dataclass
 class FileParseData:
@@ -44,7 +50,9 @@ class FileParseData:
     parse_result: ParseResult
     content: str = ""
 
+
 _PARSER_CACHE: dict[str, LanguageParser] = {}
+
 
 def get_parser(language: str) -> LanguageParser:
     """Return the appropriate tree-sitter parser for *language*.
@@ -99,6 +107,7 @@ def get_parser(language: str) -> LanguageParser:
     _PARSER_CACHE[language] = parser
     return parser
 
+
 def parse_file(file_path: str, content: str, language: str) -> FileParseData:
     """Parse a single file and return structured parse data.
 
@@ -124,6 +133,7 @@ def parse_file(file_path: str, content: str, language: str) -> FileParseData:
     return FileParseData(
         file_path=file_path, language=language, parse_result=result, content=content
     )
+
 
 def process_parsing(
     files: list[FileEntry],
@@ -173,6 +183,8 @@ def process_parsing(
         for symbol in parse_data.parse_result.symbols:
             label = _KIND_TO_LABEL.get(symbol.kind)
             if label is None:
+                if symbol.kind in _UNMAPPED_KINDS:
+                    continue
                 logger.warning(
                     "Unknown symbol kind %r for %s in %s, skipping",
                     symbol.kind,
