@@ -212,11 +212,11 @@ parser and the phases recognize Ruby via `language == "ruby"` / `.rb` suffix.
 - Modify: `src/synaptiq/core/parsers/ruby_lang.py`
 - Modify: `tests/core/test_parser_ruby.py`
 
-- [ ] write tests: `foo()`, `obj.bar(x)`, `self.baz`, bare call `helper`, chained calls, block/proc arg callbacks → `CallInfo(name, receiver, arguments)`
-- [ ] implement call extraction from `call`/`method_call`/`command` nodes (handle paren-less calls)
-- [ ] populate `receiver` (`self`, identifier, or constant) and bare-identifier `arguments`
-- [ ] write edge tests: operator methods, safe-navigation `&.`, no false call for local var reference
-- [ ] run tests + ruff — must pass before next task
+- [x] write tests: `foo()`, `obj.bar(x)`, `self.baz`, bare call `helper`, chained calls, block/proc arg callbacks → `CallInfo(name, receiver, arguments)`
+- [x] implement call extraction from `call`/`method_call`/`command` nodes (handle paren-less calls)
+- [x] populate `receiver` (`self`, identifier, or constant) and bare-identifier `arguments`
+- [x] write edge tests: operator methods, safe-navigation `&.`, no false call for local var reference
+- [x] run tests + ruff — must pass before next task
 
 ### Task 6: Ruby parser — heritage & mixins (`<`, include/extend/prepend)
 

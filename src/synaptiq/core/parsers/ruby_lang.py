@@ -7,7 +7,7 @@ This module is built incrementally across the Ruby-parity tasks:
 
 * Task 3 — symbol extraction (methods, classes, modules, constants).
 * Task 4 — imports (``require`` / ``require_relative`` / ``autoload``).
-* Task 5 — calls.
+* Task 5 — calls (receivers, ``self``, blocks, paren-less, bare calls).
 * Task 6 — heritage & mixins.
 
 Each ``parse`` failure degrades gracefully to an empty :class:`ParseResult`,
@@ -20,6 +20,7 @@ import tree_sitter_ruby as tsruby
 from tree_sitter import Language, Node, Parser
 
 from synaptiq.core.parsers.base import (
+    CallInfo,
     ImportInfo,
     LanguageParser,
     ParseResult,
@@ -30,6 +31,10 @@ RUBY_LANGUAGE = Language(tsruby.language())
 
 # ``require``-family methods that bring another file/feature into scope.
 _IMPORT_METHODS = frozenset({"require", "require_relative", "autoload", "load"})
+
+# Node types whose direct ``identifier`` children sit in statement/value
+# position, where a bare identifier (not a known local) is a method call.
+_STMT_CONTAINERS = frozenset({"program", "body_statement", "block_body", "then", "else", "ensure"})
 
 
 class RubyParser(LanguageParser):
@@ -52,6 +57,7 @@ class RubyParser(LanguageParser):
             return result
 
         self._walk(tree.root_node, content, result, class_name="")
+        self._extract_calls(tree.root_node, result, locals_=set())
         return result
 
     # ------------------------------------------------------------------
@@ -299,6 +305,140 @@ class RubyParser(LanguageParser):
             elif child.type == "interpolation":
                 return None
         return "".join(parts)
+
+    # ------------------------------------------------------------------
+    # Calls
+    # ------------------------------------------------------------------
+
+    def _extract_calls(self, node: Node, result: ParseResult, locals_: set[str]) -> None:
+        """Recursively collect method calls into ``result.calls``.
+
+        ``locals_`` holds the names bound as local variables / parameters in the
+        current scope.  Ruby resolves a bare identifier as a method call only
+        when no local of that name exists, so this set distinguishes a real
+        zero-arg call (``validate``) from a local-variable read (``count``).
+
+        Scope rules mirror Ruby's: a ``def`` opens a *fresh* scope (methods do
+        not capture surrounding locals) seeded with its parameters, while a
+        block inherits the enclosing locals plus its own block parameters.
+        """
+        for child in node.children:
+            ctype = child.type
+            if ctype == "call":
+                self._extract_call_node(child, result)
+                # Descend to find nested calls (arguments, receiver chains,
+                # block bodies).  A ``call`` is not a statement container, so a
+                # receiver identifier here is never mistaken for a bare call.
+                self._extract_calls(child, result, locals_)
+            elif ctype in ("method", "singleton_method"):
+                body = child.child_by_field_name("body")
+                if body is not None:
+                    self._extract_calls(body, result, self._parameter_names(child))
+            elif ctype in ("block", "do_block"):
+                self._extract_calls(child, result, locals_ | self._block_parameter_names(child))
+            elif ctype == "assignment":
+                right = child.child_by_field_name("right")
+                if right is not None and right.type == "identifier":
+                    name = right.text.decode("utf8")
+                    if name not in locals_:
+                        result.calls.append(CallInfo(name=name, line=right.start_point[0] + 1))
+                else:
+                    self._extract_calls(child, result, locals_)
+                left = child.child_by_field_name("left")
+                if left is not None and left.type == "identifier":
+                    locals_.add(left.text.decode("utf8"))
+            elif ctype == "identifier" and node.type in _STMT_CONTAINERS:
+                name = child.text.decode("utf8")
+                if name not in locals_:
+                    result.calls.append(CallInfo(name=name, line=child.start_point[0] + 1))
+            else:
+                self._extract_calls(child, result, locals_)
+
+    def _extract_call_node(self, node: Node, result: ParseResult) -> None:
+        """Extract a single ``call`` node into a :class:`CallInfo`."""
+        method_node = node.child_by_field_name("method")
+        if method_node is None:
+            return
+        name = method_node.text.decode("utf8")
+
+        receiver = ""
+        recv_node = node.child_by_field_name("receiver")
+        if recv_node is not None:
+            receiver = self._receiver_name(recv_node)
+
+        result.calls.append(
+            CallInfo(
+                name=name,
+                line=node.start_point[0] + 1,
+                receiver=receiver,
+                arguments=self._identifier_arguments(node),
+            )
+        )
+
+    def _receiver_name(self, node: Node) -> str:
+        """Return a textual receiver for a call (``self``, identifier, constant)."""
+        if node.type == "self":
+            return "self"
+        if node.type in ("identifier", "constant", "scope_resolution"):
+            return node.text.decode("utf8")
+        # Chained call or other expression — fall back to the leftmost name.
+        return self._root_identifier(node)
+
+    @staticmethod
+    def _root_identifier(node: Node) -> str:
+        """Walk down the leftmost children to the first name-like node."""
+        current: Node | None = node
+        while current is not None:
+            if current.type in ("identifier", "constant", "self"):
+                return current.text.decode("utf8")
+            current = current.children[0] if current.children else None
+        return ""
+
+    @staticmethod
+    def _identifier_arguments(node: Node) -> list[str]:
+        """Return bare-identifier arguments of a call (callback references)."""
+        args_node = node.child_by_field_name("arguments")
+        if args_node is None:
+            return []
+        return [c.text.decode("utf8") for c in args_node.children if c.type == "identifier"]
+
+    @staticmethod
+    def _parameter_names(node: Node) -> set[str]:
+        """Collect local names bound by a method's parameter list."""
+        params_node = node.child_by_field_name("parameters")
+        if params_node is None:
+            return set()
+        return RubyParser._collect_parameter_identifiers(params_node)
+
+    @staticmethod
+    def _block_parameter_names(node: Node) -> set[str]:
+        """Collect local names bound by a block's ``|params|`` list."""
+        for child in node.children:
+            if child.type == "block_parameters":
+                return RubyParser._collect_parameter_identifiers(child)
+        return set()
+
+    @staticmethod
+    def _collect_parameter_identifiers(params_node: Node) -> set[str]:
+        """Pull every plain identifier name out of a parameter list.
+
+        Handles simple, optional (``a=1``), keyword (``a:``), splat (``*a``),
+        and block (``&blk``) parameters — each wraps or contains an identifier.
+        """
+        names: set[str] = set()
+        for child in params_node.children:
+            if child.type == "identifier":
+                names.add(child.text.decode("utf8"))
+            else:
+                inner = child.child_by_field_name("name")
+                if inner is not None and inner.type == "identifier":
+                    names.add(inner.text.decode("utf8"))
+                else:
+                    for grand in child.children:
+                        if grand.type == "identifier":
+                            names.add(grand.text.decode("utf8"))
+                            break
+        return names
 
     # ------------------------------------------------------------------
     # Helpers

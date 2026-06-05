@@ -313,6 +313,126 @@ class TestParseImportsEdgeCases:
 
 
 # ---------------------------------------------------------------------------
+# Calls (receivers, self, blocks, paren-less)
+# ---------------------------------------------------------------------------
+
+
+def _calls_by_name(result: ParseResult) -> dict[str, list]:
+    by_name: dict[str, list] = {}
+    for call in result.calls:
+        by_name.setdefault(call.name, []).append(call)
+    return by_name
+
+
+class TestParseCalls:
+    """``call`` nodes become :class:`CallInfo` entries."""
+
+    def test_function_call_with_parens(self, parser: RubyParser) -> None:
+        calls = parser.parse("foo()\n", "test.rb").calls
+        assert len(calls) == 1
+        assert calls[0].name == "foo"
+        assert calls[0].receiver == ""
+
+    def test_method_call_with_receiver(self, parser: RubyParser) -> None:
+        by_name = _calls_by_name(parser.parse("obj.bar(x)\n", "test.rb"))
+        assert "bar" in by_name
+        call = by_name["bar"][0]
+        assert call.receiver == "obj"
+        assert call.arguments == ["x"]
+
+    def test_self_receiver(self, parser: RubyParser) -> None:
+        by_name = _calls_by_name(parser.parse("self.baz\n", "test.rb"))
+        assert "baz" in by_name
+        assert by_name["baz"][0].receiver == "self"
+
+    def test_constant_receiver(self, parser: RubyParser) -> None:
+        by_name = _calls_by_name(parser.parse("Foo.create(attrs)\n", "test.rb"))
+        assert "create" in by_name
+        assert by_name["create"][0].receiver == "Foo"
+
+    def test_bare_call_in_method_body(self, parser: RubyParser) -> None:
+        code = "def perform\n  validate\n  save\nend\n"
+        by_name = _calls_by_name(parser.parse(code, "test.rb"))
+        assert "validate" in by_name
+        assert "save" in by_name
+        assert by_name["validate"][0].receiver == ""
+
+    def test_parenless_call_with_argument(self, parser: RubyParser) -> None:
+        by_name = _calls_by_name(parser.parse("render arg\n", "test.rb"))
+        assert "render" in by_name
+        assert by_name["render"][0].arguments == ["arg"]
+
+    def test_chained_calls(self, parser: RubyParser) -> None:
+        by_name = _calls_by_name(parser.parse("a.b.c(x)\n", "test.rb"))
+        # both the inner ``.b`` and the outer ``.c`` are method calls.
+        assert "b" in by_name
+        assert "c" in by_name
+        assert by_name["c"][0].receiver == "a"
+        assert by_name["b"][0].receiver == "a"
+
+    def test_block_callback_calls(self, parser: RubyParser) -> None:
+        code = "items.map { |i| transform(i) }\n"
+        by_name = _calls_by_name(parser.parse(code, "test.rb"))
+        assert "map" in by_name
+        assert by_name["map"][0].receiver == "items"
+        # the call inside the block body is also extracted.
+        assert "transform" in by_name
+        assert by_name["transform"][0].receiver == ""
+
+    def test_do_block_body_calls(self, parser: RubyParser) -> None:
+        code = "items.each do |i|\n  process i\nend\n"
+        by_name = _calls_by_name(parser.parse(code, "test.rb"))
+        assert "each" in by_name
+        assert "process" in by_name
+
+    def test_call_lines(self, parser: RubyParser) -> None:
+        code = "foo\n\nbar\n"
+        by_name = _calls_by_name(parser.parse(code, "test.rb"))
+        assert by_name["foo"][0].line == 1
+        assert by_name["bar"][0].line == 3
+
+
+class TestParseCallsEdgeCases:
+    """Operators, safe-navigation, and local-variable references."""
+
+    def test_operator_is_not_a_call(self, parser: RubyParser) -> None:
+        by_name = _calls_by_name(parser.parse("a + b\n", "test.rb"))
+        assert "+" not in by_name
+        assert by_name == {}
+
+    def test_safe_navigation_call(self, parser: RubyParser) -> None:
+        by_name = _calls_by_name(parser.parse("user&.name\n", "test.rb"))
+        assert "name" in by_name
+        assert by_name["name"][0].receiver == "user"
+
+    def test_local_variable_reference_is_not_a_call(self, parser: RubyParser) -> None:
+        code = "def m\n  count = compute\n  count\nend\n"
+        by_name = _calls_by_name(parser.parse(code, "test.rb"))
+        # ``count`` is a local variable, not a method call.
+        assert "count" not in by_name
+
+    def test_method_parameter_is_not_a_call(self, parser: RubyParser) -> None:
+        code = "def m(value)\n  value\nend\n"
+        by_name = _calls_by_name(parser.parse(code, "test.rb"))
+        assert "value" not in by_name
+
+    def test_block_parameter_is_not_a_call(self, parser: RubyParser) -> None:
+        code = "list.each do |row|\n  row\nend\n"
+        by_name = _calls_by_name(parser.parse(code, "test.rb"))
+        assert "row" not in by_name
+
+    def test_assignment_rhs_call(self, parser: RubyParser) -> None:
+        code = "def m\n  result = fetch_data\n  result\nend\n"
+        by_name = _calls_by_name(parser.parse(code, "test.rb"))
+        assert "fetch_data" in by_name
+        assert "result" not in by_name
+
+    def test_no_calls_for_definitions_only(self, parser: RubyParser) -> None:
+        code = "class C\n  def m\n  end\nend\n"
+        assert parser.parse(code, "test.rb").calls == []
+
+
+# ---------------------------------------------------------------------------
 # Error / edge cases
 # ---------------------------------------------------------------------------
 
