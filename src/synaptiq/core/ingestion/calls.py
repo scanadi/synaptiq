@@ -78,6 +78,20 @@ _CALL_BLOCKLIST: frozenset[str] = frozenset({
     "useState", "useEffect", "useRef", "useCallback", "useMemo",
     "useContext", "useReducer", "useLayoutEffect", "useImperativeHandle",
     "useDebugValue", "useId", "useTransition", "useDeferredValue",
+    # Ruby Kernel / builtins and common framework macros whose definitions
+    # do not live in the user's codebase.  ``require``/``freeze``/``map`` etc.
+    # are already covered above; the rest are Ruby-specific.
+    "puts", "p", "pp", "require_relative", "autoload", "load",
+    "attr_accessor", "attr_reader", "attr_writer", "include", "prepend",
+    "raise", "fail", "throw", "catch", "loop", "lambda", "proc", "send",
+    "public_send", "respond_to?", "instance_variable_get",
+    "instance_variable_set", "define_method", "method_missing",
+    "new", "dup", "clone", "to_s", "to_sym", "to_a", "to_h", "to_i", "to_f",
+    "each", "each_with_index", "each_with_object", "select", "reject",
+    "reduce", "inject", "find", "detect", "collect", "flat_map", "sort",
+    "sort_by", "group_by", "count", "first", "last", "push", "concat",
+    "fetch", "merge", "key?", "nil?", "empty?", "blank?", "present?",
+    "freeze!", "tap", "then", "yield_self",
 })
 
 

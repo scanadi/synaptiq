@@ -307,10 +307,10 @@ parser and the phases recognize Ruby via `language == "ruby"` / `.rb` suffix.
 - Create: `tests/fixtures/ruby_project/` (small Rails/Sinatra-flavored sample; `tests/fixtures/` does not yet exist)
 - Create: `tests/e2e/test_ruby_pipeline.py` (model structure/assertions on existing `tests/e2e/test_full_pipeline.py`)
 
-- [ ] write integration test: index `tests/fixtures/ruby_project/` end-to-end; assert Function/Class/Module/Method nodes, CALLS, IMPORTS, EXTENDS, MIXES_IN edges, entry points, and dead-code results (must run only after Task 3+ — the Task 1 stub produces zero symbols)
-- [ ] add Ruby builtins/Kernel methods to `_CALL_BLOCKLIST` (`puts`, `print`, `p`, `require`, `require_relative`, `attr_accessor`, `attr_reader`, `attr_writer`, `include`, `extend`, `prepend`, `raise`, `loop`, `lambda`, `proc`, `send`, `freeze`, `new`, `to_s`, `to_sym`, `each`, `map`, `select`, etc.)
-- [ ] write test asserting blocklisted Ruby builtins produce no CALLS edges
-- [ ] run full test suite — must pass before next task
+- [x] write integration test: index `tests/fixtures/ruby_project/` end-to-end; assert Function/Class/Module/Method nodes, CALLS, IMPORTS, EXTENDS, MIXES_IN edges, entry points, and dead-code results (must run only after Task 3+ — the Task 1 stub produces zero symbols)
+- [x] add Ruby builtins/Kernel methods to `_CALL_BLOCKLIST` (`puts`, `print`, `p`, `require`, `require_relative`, `attr_accessor`, `attr_reader`, `attr_writer`, `include`, `extend`, `prepend`, `raise`, `loop`, `lambda`, `proc`, `send`, `freeze`, `new`, `to_s`, `to_sym`, `each`, `map`, `select`, etc.)
+- [x] write test asserting blocklisted Ruby builtins produce no CALLS edges
+- [x] run full test suite — 864 passed (2 pre-existing warnings); ruff clean on touched files
 
 ### Task 13: Verify acceptance criteria
 - [ ] verify all Overview requirements implemented (symbols, imports, calls, extends, mixins, entry points, REST, dead code)

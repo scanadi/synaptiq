@@ -355,6 +355,57 @@ class TestProcessCallsNoDuplicates:
         assert len(calls_rels) == 1
 
 
+class TestRubyBuiltinBlocklist:
+    """Ruby Kernel/builtin names never produce CALLS edges.
+
+    Even when a same-named symbol happens to be defined in the codebase,
+    calls to blocklisted Ruby builtins (``puts``, ``new``, ``each`` …) must
+    be filtered out before resolution so they don't create spurious edges.
+    """
+
+    def test_blocklisted_ruby_builtins_no_edges(self) -> None:
+        g = KnowledgeGraph()
+        _add_file_node(g, "app/widget.rb")
+
+        # A method that would be the resolution target if not blocklisted.
+        caller_id = _add_symbol_node(
+            g, NodeLabel.METHOD, "app/widget.rb", "render", 1, 10, class_name="Widget"
+        )
+        # Decoy same-named definitions to prove blocklisting wins over a
+        # would-be same-file exact match.
+        for builtin in ("puts", "each", "new"):
+            _add_symbol_node(
+                g, NodeLabel.METHOD, "app/widget.rb", builtin, 20, 22, class_name="Widget"
+            )
+
+        parse_data = [
+            FileParseData(
+                file_path="app/widget.rb",
+                language="ruby",
+                parse_result=ParseResult(
+                    calls=[
+                        CallInfo(name="puts", line=3),
+                        CallInfo(name="each", line=4),
+                        CallInfo(name="new", line=5, receiver="User"),
+                        CallInfo(name="require", line=6),
+                    ],
+                ),
+            ),
+        ]
+
+        process_calls(parse_data, g)
+
+        calls_rels = g.get_relationships_by_type(RelType.CALLS)
+        targets = {r.target for r in calls_rels}
+        for builtin in ("puts", "each", "new"):
+            builtin_id = generate_id(NodeLabel.METHOD, "app/widget.rb", f"Widget.{builtin}")
+            assert builtin_id not in targets
+        # Every call in this fixture is a blocklisted builtin, so no CALLS
+        # edge should originate from the caller at all.
+        assert caller_id not in {r.source for r in calls_rels}
+        assert len(calls_rels) == 0
+
+
 # ---------------------------------------------------------------------------
 # resolve_call — self.method()
 # ---------------------------------------------------------------------------
