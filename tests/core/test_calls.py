@@ -532,6 +532,41 @@ class TestOrphanCallsFallbackToFile:
         pairs = {(r.source, r.target) for r in calls_rels}
         assert (file_id, target_id) in pairs
 
+    def test_blocklisted_call_still_links_callback_arguments(self) -> None:
+        """rows.map(formatRow) links formatRow even though 'map' is blocklisted."""
+        g = KnowledgeGraph()
+
+        _add_file_node(g, "src/core.ts")
+        caller_id = _add_symbol_node(
+            g, NodeLabel.FUNCTION, "src/core.ts", "getSharedCompanies", 1, 20
+        )
+        target_id = _add_symbol_node(
+            g, NodeLabel.FUNCTION, "src/core.ts", "formatRow", 30, 35
+        )
+
+        parse = [
+            FileParseData(
+                file_path="src/core.ts",
+                language="typescript",
+                parse_result=ParseResult(
+                    calls=[
+                        CallInfo(
+                            name="map",
+                            line=10,
+                            receiver="rows",
+                            arguments=["formatRow"],
+                        )
+                    ],
+                ),
+            ),
+        ]
+
+        process_calls(parse, g)
+
+        calls_rels = g.get_relationships_by_type(RelType.CALLS)
+        pairs = {(r.source, r.target) for r in calls_rels}
+        assert (caller_id, target_id) in pairs
+
 
 # ---------------------------------------------------------------------------
 # Type-inferred receiver method resolution

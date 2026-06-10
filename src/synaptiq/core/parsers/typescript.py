@@ -47,6 +47,23 @@ _BUILTIN_TYPES: frozenset[str] = frozenset(
     }
 )
 
+# Wrapper nodes that can occupy the `function` field of a call_expression.
+# When explicit type arguments are present, the grammar resolves the
+# `await fn<T>(x)` vs `await fn < T > (x)` ambiguity by binding the unary
+# operator to the callee: call_expression(function: await_expression(fn),
+# type_arguments, arguments).  Unwrap these to reach the real callee —
+# otherwise generic awaited calls produce no CALLS edge and their targets
+# get false-flagged as dead code.
+_CALLEE_WRAPPERS: frozenset[str] = frozenset(
+    {
+        "await_expression",
+        "parenthesized_expression",
+        "non_null_expression",
+        "as_expression",
+        "satisfies_expression",
+    }
+)
+
 class TypeScriptParser(LanguageParser):
     """Parse TypeScript, TSX, or JavaScript files via tree-sitter.
 
@@ -509,6 +526,11 @@ class TypeScriptParser(LanguageParser):
 
     def _extract_call(self, node: Node, source: str, result: ParseResult) -> None:
         func_node = node.child_by_field_name("function")
+        if func_node is None:
+            return
+
+        while func_node is not None and func_node.type in _CALLEE_WRAPPERS:
+            func_node = func_node.named_child(0)
         if func_node is None:
             return
 

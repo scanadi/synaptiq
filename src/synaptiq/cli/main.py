@@ -452,18 +452,32 @@ def diff(
     branch_range: str = typer.Argument(
         ..., help="Branch range for comparison (e.g. main..feature)."
     ),
+    full: bool = typer.Option(
+        False,
+        "--full",
+        help=(
+            "Build the complete graph for both sides (exhaustive cross-file "
+            "relationships, cost scales with repo size). Default mode parses "
+            "only changed files."
+        ),
+    ),
 ) -> None:
-    """Structural branch comparison."""
+    """Structural branch comparison (parses only changed files by default)."""
     from synaptiq.core.diff import diff_branches, format_diff
 
     repo_path = Path.cwd().resolve()
     try:
-        result = diff_branches(repo_path, branch_range)
+        result = diff_branches(repo_path, branch_range, full=full)
     except (ValueError, RuntimeError) as exc:
         console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
     console.print(format_diff(result))
+    if not full:
+        console.print(
+            "[dim]Scoped diff: relationships limited to changed files. "
+            "Use --full for exhaustive cross-file comparison.[/dim]"
+        )
 
 
 @app.command()
@@ -540,7 +554,7 @@ def serve(
         if existing is None:
             print("Error: cannot read lock info from primary", file=sys.stderr)
             raise typer.Exit(code=1)
-        _serve_proxy(existing.socket)
+        _serve_proxy(existing.socket, repo_path, data_dir)
 
 
 def _init_storage_with_index(repo_path: Path, data_dir: Path, *, output=console):
@@ -658,6 +672,139 @@ def _serve_http_standalone(host: str, port: int) -> None:
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
 
+def _report_watch_death(task) -> None:
+    """A dead watcher silently serves an ever-staler index — say so."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        import logging
+
+        logging.getLogger(__name__).error("File watcher crashed", exc_info=exc)
+        _stderr_console.print(
+            f"[red]File watcher crashed:[/red] {exc} — "
+            "the index will no longer update. Restart the server."
+        )
+
+
+class _PrimaryRuntime:
+    """Storage + socket server + watcher bundle for a primary instance.
+
+    Shared by ``_serve_primary`` (primary from startup) and the proxy
+    promotion path (proxy takes over after the primary dies), so both
+    wire up the exact same machinery.
+    """
+
+    def __init__(self, repo_path: Path, data_dir: Path, lock_mgr) -> None:
+        self._repo_path = repo_path
+        self._data_dir = data_dir
+        self._lock_mgr = lock_mgr
+        self.storage = None
+        self.socket_server = None
+        self.watch_task = None
+
+    async def start(self, stop_event) -> None:
+        """Initialise storage, start the socket server and file watcher."""
+        import asyncio
+
+        from synaptiq.core.daemon.rwlock import AsyncRWLock
+        from synaptiq.core.daemon.socket_server import SocketServer
+        from synaptiq.core.ingestion.watcher import watch_repo
+        from synaptiq.mcp.server import (
+            dispatch_resource,
+            dispatch_tool,
+            set_rwlock,
+            set_storage,
+        )
+
+        repo_path = self._repo_path
+        data_dir = self._data_dir
+
+        storage = _init_storage_with_index(repo_path, data_dir, output=_stderr_console)
+
+        rwlock = AsyncRWLock()
+        set_storage(storage)
+        set_rwlock(rwlock)
+
+        def dispatch(method: str, params: dict) -> str:
+            if method == "ping":
+                return "pong"
+            if method == "tool":
+                return dispatch_tool(params.get("name", ""), params.get("arguments", {}), storage)
+            if method == "resource":
+                return dispatch_resource(params.get("uri", ""), storage)
+            return f"Unknown method: {method}"
+
+        async def _reindex_async(params: dict) -> str:
+            """Reindex with minimal lock hold: build lock-free, commit locked.
+
+            Holding the write lock across the whole pipeline (plus embedding
+            generation) would block every agent query for its full duration.
+
+            The commit is shielded from cancellation: if the dispatch timeout
+            fires mid-commit, the commit must run to completion while still
+            holding the writer lock — a cancelled `async with rwlock.writer()`
+            would release the lock while the commit thread keeps resetting the
+            database under live readers.
+            """
+            import time as _time
+
+            from synaptiq.core.ingestion.pipeline import build_full_index, commit_full_index
+
+            start = _time.monotonic()
+            graph, embeddings, result = await asyncio.to_thread(
+                build_full_index,
+                repo_path,
+                full=params.get("full", True),
+                skip_embeddings=params.get("skip_embeddings", False),
+            )
+
+            async def _locked_commit() -> None:
+                # Generous acquisition timeout: a single read dispatch may
+                # legitimately hold the reader lock for up to the server's
+                # 120s budget — the default 60s would discard the whole build.
+                async with rwlock.writer(timeout=300.0):
+                    await asyncio.to_thread(commit_full_index, storage, graph, embeddings)
+
+            await asyncio.shield(_locked_commit())
+            _write_meta(data_dir, repo_path, result)
+            return _reindex_stats_json(result, _time.monotonic() - start)
+
+        socket_server = SocketServer(
+            self._lock_mgr.socket_path,
+            dispatch,
+            rwlock=rwlock,
+            async_handlers={"reindex": _reindex_async},
+        )
+        await socket_server.start()
+
+        watch_task = asyncio.create_task(
+            watch_repo(repo_path, storage, stop_event=stop_event, rwlock=rwlock)
+        )
+        watch_task.add_done_callback(_report_watch_death)
+
+        self.storage = storage
+        self.socket_server = socket_server
+        self.watch_task = watch_task
+
+    async def stop(self) -> None:
+        """Stop the watcher and socket server, close storage."""
+        import asyncio
+        import contextlib
+
+        if self.watch_task is not None:
+            self.watch_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self.watch_task
+            self.watch_task = None
+        if self.socket_server is not None:
+            await self.socket_server.stop()
+            self.socket_server = None
+        if self.storage is not None:
+            self.storage.close()
+            self.storage = None
+
+
 def _serve_primary(
     repo_path: Path,
     data_dir: Path,
@@ -670,82 +817,9 @@ def _serve_primary(
     """Run as primary: DB + watcher + MCP + socket server."""
     import asyncio
 
-    from synaptiq.core.daemon.rwlock import AsyncRWLock
-    from synaptiq.core.daemon.socket_server import SocketServer
-    from synaptiq.core.ingestion.watcher import watch_repo
-    from synaptiq.mcp.server import dispatch_resource, dispatch_tool, set_rwlock, set_storage
     from synaptiq.mcp.server import server as mcp_server
 
-    storage = _init_storage_with_index(repo_path, data_dir, output=_stderr_console)
-
-    rwlock = AsyncRWLock()
-    set_storage(storage)
-    set_rwlock(rwlock)
-
-    def dispatch(method: str, params: dict) -> str:
-        if method == "ping":
-            return "pong"
-        if method == "tool":
-            return dispatch_tool(params.get("name", ""), params.get("arguments", {}), storage)
-        if method == "resource":
-            return dispatch_resource(params.get("uri", ""), storage)
-        return f"Unknown method: {method}"
-
-    async def _reindex_async(params: dict) -> str:
-        """Reindex with minimal lock hold: build lock-free, commit locked.
-
-        Holding the write lock across the whole pipeline (plus embedding
-        generation) would block every agent query for its full duration.
-
-        The commit is shielded from cancellation: if the dispatch timeout
-        fires mid-commit, the commit must run to completion while still
-        holding the writer lock — a cancelled `async with rwlock.writer()`
-        would release the lock while the commit thread keeps resetting the
-        database under live readers.
-        """
-        import time as _time
-
-        from synaptiq.core.ingestion.pipeline import build_full_index, commit_full_index
-
-        start = _time.monotonic()
-        graph, embeddings, result = await asyncio.to_thread(
-            build_full_index,
-            repo_path,
-            full=params.get("full", True),
-            skip_embeddings=params.get("skip_embeddings", False),
-        )
-
-        async def _locked_commit() -> None:
-            # Generous acquisition timeout: a single read dispatch may
-            # legitimately hold the reader lock for up to the server's
-            # 120s budget — the default 60s would discard the whole build.
-            async with rwlock.writer(timeout=300.0):
-                await asyncio.to_thread(commit_full_index, storage, graph, embeddings)
-
-        await asyncio.shield(_locked_commit())
-        _write_meta(data_dir, repo_path, result)
-        return _reindex_stats_json(result, _time.monotonic() - start)
-
-    socket_server = SocketServer(
-        lock_mgr.socket_path,
-        dispatch,
-        rwlock=rwlock,
-        async_handlers={"reindex": _reindex_async},
-    )
-
-    def _report_watch_death(task) -> None:
-        """A dead watcher silently serves an ever-staler index — say so."""
-        if task.cancelled():
-            return
-        exc = task.exception()
-        if exc is not None:
-            import logging
-
-            logging.getLogger(__name__).error("File watcher crashed", exc_info=exc)
-            _stderr_console.print(
-                f"[red]File watcher crashed:[/red] {exc} — "
-                "the index will no longer update. Restart the server."
-            )
+    runtime = _PrimaryRuntime(repo_path, data_dir, lock_mgr)
 
     async def _run() -> None:
         import signal
@@ -756,7 +830,8 @@ def _serve_primary(
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, stop.set)
 
-        await socket_server.start()
+        await runtime.start(stop)
+        watch_task = runtime.watch_task
         try:
             if transport == "http":
                 import uvicorn
@@ -771,10 +846,6 @@ def _serve_primary(
                 uv_server = uvicorn.Server(config)
 
                 mcp_task = asyncio.create_task(uv_server.serve())
-                watch_task = asyncio.create_task(
-                    watch_repo(repo_path, storage, stop_event=stop, rwlock=rwlock)
-                )
-                watch_task.add_done_callback(_report_watch_death)
 
                 async def _wait_stop():
                     await stop.wait()
@@ -796,10 +867,6 @@ def _serve_primary(
                     mcp_task = asyncio.create_task(
                         mcp_server.run(read, write, mcp_server.create_initialization_options())
                     )
-                    watch_task = asyncio.create_task(
-                        watch_repo(repo_path, storage, stop_event=stop, rwlock=rwlock)
-                    )
-                    watch_task.add_done_callback(_report_watch_death)
 
                     async def _wait_stop():
                         await stop.wait()
@@ -815,25 +882,59 @@ def _serve_primary(
                         return_exceptions=True,
                     )
         finally:
-            await socket_server.stop()
+            await runtime.stop()
 
     try:
         asyncio.run(_run())
     except KeyboardInterrupt:
         pass
     finally:
-        storage.close()
         lock_mgr.release()
 
 
-def _serve_proxy(socket_path: str) -> None:
-    """Run as proxy: MCP over stdio, forwarding to primary via socket."""
+def _serve_proxy(socket_path: str, repo_path: Path, data_dir: Path) -> None:
+    """Run as proxy: MCP over stdio, forwarding to primary via socket.
+
+    When the primary dies for good (stale or missing lock after reconnect
+    failures), the proxy takes over: it acquires the lock, starts the full
+    primary runtime in-process, and dispatches locally from then on.
+    """
     import asyncio
 
+    from synaptiq.core.daemon.lock import LockManager
     from synaptiq.core.daemon.socket_client import SocketClient
     from synaptiq.mcp.server import set_proxy_client
 
-    client = SocketClient(Path(socket_path))
+    lock_mgr = LockManager(data_dir)
+    runtime = _PrimaryRuntime(repo_path, data_dir, lock_mgr)
+    stop = asyncio.Event()
+    promoted = False
+
+    async def _on_primary_lost() -> bool:
+        nonlocal promoted
+        if promoted:
+            return True
+        if lock_mgr.try_acquire() is None:
+            # Another proxy won the takeover race — its lock file points
+            # at the new socket; the next reconnect follows it.
+            return False
+        try:
+            await runtime.start(stop)
+        except Exception:
+            lock_mgr.release()
+            raise
+        set_proxy_client(None)
+        promoted = True
+        _stderr_console.print(
+            "[yellow]Primary daemon lost — this instance promoted itself to primary.[/yellow]"
+        )
+        return True
+
+    client = SocketClient(
+        Path(socket_path),
+        lock_reader=lock_mgr.read_existing,
+        on_primary_lost=_on_primary_lost,
+    )
 
     async def _run() -> None:
         from mcp.server.stdio import stdio_server
@@ -856,7 +957,11 @@ def _serve_proxy(socket_path: str) -> None:
             async with stdio_server() as (read, write):
                 await mcp_server.run(read, write, mcp_server.create_initialization_options())
         finally:
+            stop.set()
             await client.close()
+            if promoted:
+                await runtime.stop()
+                lock_mgr.release()
 
     try:
         asyncio.run(_run())

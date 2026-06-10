@@ -348,6 +348,38 @@ export class Game {
     assert "achievementManager" in check_calls[0].receiver
 
 
+def test_awaited_generic_call_extracted(ts_parser: TypeScriptParser) -> None:
+    """``await fn<T>(args)`` binds ``await`` to the callee in the grammar.
+
+    The function field becomes an await_expression wrapper; without
+    unwrapping it the call is silently dropped and the target gets
+    false-flagged as dead code.
+    """
+    code = """\
+async function run() {
+    const a = await performKpiCalculation<Raw, Processed, Chart>(config, params);
+    const b = await checkPreCalculated<Raw>(companyId);
+    const c = await this.processBatch<T>(items);
+    const d = ready!<T>(arg);
+    const e = (await getHandler())(arg);
+}
+"""
+    result = ts_parser.parse(code, "kpi.ts")
+    call_names = [c.name for c in result.calls]
+
+    assert "performKpiCalculation" in call_names
+    assert "checkPreCalculated" in call_names
+    assert "ready" in call_names
+
+    batch_calls = [c for c in result.calls if c.name == "processBatch"]
+    assert len(batch_calls) == 1
+    assert batch_calls[0].receiver == "this"
+
+    # Indirect call through an awaited result has no static callee name;
+    # only the inner getHandler() call is captured.
+    assert "getHandler" in call_names
+
+
 # ---------------------------------------------------------------------------
 # module.exports handling
 # ---------------------------------------------------------------------------

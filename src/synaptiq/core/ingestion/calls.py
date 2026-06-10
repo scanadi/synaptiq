@@ -380,9 +380,12 @@ def process_calls(
         import_cache = _build_import_cache(fpd.file_path, graph)
 
         for call in fpd.parse_result.calls:
-            # Skip builtins/stdlib names unless it's a self/this method call.
-            if call.name in _CALL_BLOCKLIST and call.receiver not in ("self", "this"):
-                continue
+            # Builtin/stdlib names never resolve as call targets, but their
+            # callback arguments are real references — `rows.map(formatRow)`
+            # must still link formatRow or dead-code false-flags it.
+            blocklisted = (
+                call.name in _CALL_BLOCKLIST and call.receiver not in ("self", "this")
+            )
 
             source_id = find_containing_symbol(
                 call.line, fpd.file_path, file_sym_index
@@ -393,26 +396,27 @@ def process_calls(
                 # CALLS edge (prevents false-positive dead-code flags).
                 source_id = generate_id(NodeLabel.FILE, fpd.file_path)
 
-            # Determine caller class for self/this resolution.
-            caller_class_name: str | None = None
-            if call.receiver in ("self", "this"):
-                source_node = graph.get_node(source_id)
-                if source_node is not None:
-                    caller_class_name = source_node.class_name
+            if not blocklisted:
+                # Determine caller class for self/this resolution.
+                caller_class_name: str | None = None
+                if call.receiver in ("self", "this"):
+                    source_node = graph.get_node(source_id)
+                    if source_node is not None:
+                        caller_class_name = source_node.class_name
 
-            target_id, confidence = resolve_call(
-                call, fpd.file_path, call_index, graph,
-                caller_class_name=caller_class_name,
-                import_cache=import_cache,
-            )
-            if target_id is not None:
-                # Weak references (object-literal shorthand) resolved only by
-                # global fuzzy matching keep their edge — removing it would
-                # let dead-code flag genuinely-referenced symbols — but at a
-                # confidence that marks them clearly uncertain.
-                if call.is_weak_ref and confidence < 0.8:
-                    confidence = _WEAK_REF_CONFIDENCE
-                _add_calls_edge(source_id, target_id, confidence, graph, seen)
+                target_id, confidence = resolve_call(
+                    call, fpd.file_path, call_index, graph,
+                    caller_class_name=caller_class_name,
+                    import_cache=import_cache,
+                )
+                if target_id is not None:
+                    # Weak references (object-literal shorthand) resolved only
+                    # by global fuzzy matching keep their edge — removing it
+                    # would let dead-code flag genuinely-referenced symbols —
+                    # but at a confidence that marks them clearly uncertain.
+                    if call.is_weak_ref and confidence < 0.8:
+                        confidence = _WEAK_REF_CONFIDENCE
+                    _add_calls_edge(source_id, target_id, confidence, graph, seen)
 
             # Callback arguments: bare identifiers passed as arguments
             # (e.g. map(transform, items), Depends(get_db)).
@@ -429,6 +433,8 @@ def process_calls(
 
             # Receiver: link to the class and resolve the method on it.
             receiver = call.receiver
+            if blocklisted:
+                continue
             if receiver and receiver not in ("self", "this"):
                 receiver_call = CallInfo(name=receiver, line=call.line)
                 recv_id, recv_conf = resolve_call(

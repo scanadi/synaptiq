@@ -29,7 +29,11 @@ logger = logging.getLogger(__name__)
 
 # Timeout for dispatching a single request (seconds).
 DISPATCH_TIMEOUT = 120.0
-WRITE_DISPATCH_TIMEOUT = 600.0
+# Full rebuild of a multi-thousand-file monorepo (parse + analyses +
+# embeddings) runs well past 10 minutes; 600s cancelled the dispatch while
+# the un-cancellable build thread kept running, so the rebuild burned CPU
+# and never committed.
+WRITE_DISPATCH_TIMEOUT = 3600.0
 
 # Maximum number of concurrent socket dispatch operations.
 MAX_CONCURRENT_DISPATCHES = 16

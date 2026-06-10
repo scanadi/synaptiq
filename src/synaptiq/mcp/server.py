@@ -31,6 +31,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Resource, TextContent, Tool
 
 from synaptiq.core.daemon.rwlock import AsyncRWLock
+from synaptiq.core.daemon.socket_client import PrimaryPromotedError
 from synaptiq.core.daemon.socket_server import DISPATCH_TIMEOUT
 from synaptiq.core.storage.kuzu_backend import KuzuBackend
 from synaptiq.mcp.resources import get_dead_code_list, get_overview, get_schema
@@ -231,6 +232,10 @@ TOOLS: list[Tool] = [
                     "description": "Maximum traversal depth (default 3, max 10).",
                     "default": 3,
                 },
+                "max_tokens": {
+                    "type": "integer",
+                    "description": "Maximum response size in tokens.",
+                },
             },
             "required": ["symbol"],
         },
@@ -240,7 +245,12 @@ TOOLS: list[Tool] = [
         description="List all symbols detected as dead (unreachable) code.",
         inputSchema={
             "type": "object",
-            "properties": {},
+            "properties": {
+                "max_tokens": {
+                    "type": "integer",
+                    "description": "Maximum response size in tokens.",
+                },
+            },
         },
     ),
     Tool(
@@ -334,6 +344,10 @@ TOOLS: list[Tool] = [
                     "type": "string",
                     "description": "Optional community name to drill into.",
                 },
+                "max_tokens": {
+                    "type": "integer",
+                    "description": "Maximum response size in tokens.",
+                },
             },
         },
     ),
@@ -400,6 +414,10 @@ TOOLS: list[Tool] = [
                     "type": "integer",
                     "description": "Minimum cycle size to report (default 2).",
                     "default": 2,
+                },
+                "max_tokens": {
+                    "type": "integer",
+                    "description": "Maximum response size in tokens.",
                 },
             },
         },
@@ -678,8 +696,13 @@ def dispatch_tool(name: str, arguments: dict, storage: KuzuBackend) -> str:
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     """Dispatch a tool call to the appropriate handler."""
     if _proxy_client is not None:
-        result = await _proxy_client.call_tool(name, arguments)
-        return [TextContent(type="text", text=result)]
+        try:
+            result = await _proxy_client.call_tool(name, arguments)
+            return [TextContent(type="text", text=result)]
+        except PrimaryPromotedError:
+            # The primary died and this process took over — storage and
+            # rwlock are now local; fall through to local dispatch.
+            pass
 
     storage = _get_storage()
     result = await _dispatch_under_read_lock(dispatch_tool, name, arguments, storage)
@@ -729,7 +752,10 @@ def dispatch_resource(uri_str: str, storage: KuzuBackend) -> str:
 async def read_resource(uri) -> str:
     """Read the contents of an Synaptiq resource."""
     if _proxy_client is not None:
-        return await _proxy_client.read_resource(str(uri))
+        try:
+            return await _proxy_client.read_resource(str(uri))
+        except PrimaryPromotedError:
+            pass
 
     storage = _get_storage()
     return await _dispatch_under_read_lock(dispatch_resource, str(uri), storage)

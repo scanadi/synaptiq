@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from synaptiq.core.diff import StructuralDiff, diff_graphs, format_diff
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from synaptiq.core.diff import StructuralDiff, diff_branches, diff_graphs, format_diff
 from synaptiq.core.graph.model import (
     GraphNode,
     GraphRelationship,
@@ -290,3 +295,115 @@ class TestFormatDiffFullSummary:
         result = format_diff(diff)
 
         assert "3 changes" in result
+
+
+# ---------------------------------------------------------------------------
+# Tests: scoped diff_branches against a real git repo
+# ---------------------------------------------------------------------------
+
+
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-c", "user.name=test", "-c", "user.email=test@test", *args],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+
+
+@pytest.fixture()
+def ts_repo(tmp_path: Path) -> Path:
+    """Two-commit repo: v1 defines helper+main, v2 reshapes both files."""
+    repo = tmp_path
+    _git(repo, "init", "-b", "main")
+
+    src = repo / "src"
+    src.mkdir()
+    (src / "app.ts").write_text(
+        "import { helper } from './util';\n"
+        "export function main(): void {\n"
+        "  helper();\n"
+        "}\n"
+        "function legacy(): void {}\n"
+    )
+    (src / "util.ts").write_text("export function helper(): void {}\n")
+    (repo / "README.md").write_text("v1\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "v1")
+
+    (src / "app.ts").write_text(
+        "import { helper, extra } from './util';\n"
+        "export function main(): void {\n"
+        "  helper();\n"
+        "  freshOne();\n"
+        "}\n"
+        "export function freshOne(): void {}\n"
+    )
+    (repo / "README.md").write_text("v2 — not an indexed language\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "v2")
+    return repo
+
+
+class TestScopedDiffBranches:
+    def test_two_ref_diff_detects_node_changes(self, ts_repo: Path) -> None:
+        result = diff_branches(ts_repo, "HEAD~1..HEAD")
+
+        added = {n.name for n in result.added_nodes}
+        removed = {n.name for n in result.removed_nodes}
+        modified = {c.name for _b, c in result.modified_nodes}
+
+        assert added == {"freshOne"}
+        assert removed == {"legacy"}
+        assert "main" in modified
+        # util.ts did not change between the refs — helper stays untouched.
+        assert "helper" not in added | removed | modified
+
+    def test_call_and_import_edges_within_changed_files(self, ts_repo: Path) -> None:
+        result = diff_branches(ts_repo, "HEAD~1..HEAD")
+
+        added_calls = {
+            (r.source, r.target)
+            for r in result.added_relationships
+            if r.type is RelType.CALLS
+        }
+        assert any(
+            "main" in src and "freshOne" in dst for src, dst in added_calls
+        )
+
+        added_imports = [
+            r for r in result.added_relationships if r.type is RelType.IMPORTS
+        ]
+        removed_imports = [
+            r for r in result.removed_relationships if r.type is RelType.IMPORTS
+        ]
+        # Import list changed (helper -> helper,extra): old keyed edge out,
+        # new keyed edge in.
+        assert any("extra" in r.properties.get("symbols", "") for r in added_imports)
+        assert len(removed_imports) == 1
+
+    def test_working_tree_diff(self, ts_repo: Path) -> None:
+        (ts_repo / "src" / "app.ts").write_text(
+            "export function main(): void {}\n"
+        )
+
+        result = diff_branches(ts_repo, "HEAD")
+
+        removed = {n.name for n in result.removed_nodes}
+        assert "freshOne" in removed
+
+    def test_no_changes_returns_empty(self, ts_repo: Path) -> None:
+        result = diff_branches(ts_repo, "HEAD..HEAD")
+        assert format_diff(result) == "No structural differences found."
+
+    def test_invalid_ref_raises(self, ts_repo: Path) -> None:
+        with pytest.raises(RuntimeError):
+            diff_branches(ts_repo, "no-such-ref..HEAD")
+
+    def test_deleted_file_symbols_reported_removed(self, ts_repo: Path) -> None:
+        _git(ts_repo, "rm", "src/util.ts")
+        _git(ts_repo, "commit", "-m", "drop util")
+
+        result = diff_branches(ts_repo, "HEAD~1..HEAD")
+        removed = {n.name for n in result.removed_nodes}
+        assert "helper" in removed

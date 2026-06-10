@@ -57,3 +57,23 @@ class TestTruncateResponse:
         result = truncate_response(text, 10)
         assert "[... truncated to fit token budget]" in result
         assert len(result) < 1000
+
+
+class TestToolSchemaBudgets:
+    def test_verbose_tools_declare_max_tokens(self):
+        from synaptiq.mcp.server import TOOLS
+
+        budgeted = {
+            "synaptiq_communities",
+            "synaptiq_dead_code",
+            "synaptiq_cycles",
+            "synaptiq_impact",
+            "synaptiq_query",
+            "synaptiq_context",
+            "synaptiq_export",
+        }
+        found = {t.name for t in TOOLS if t.name in budgeted}
+        assert found == budgeted
+        for tool in TOOLS:
+            if tool.name in budgeted:
+                assert "max_tokens" in tool.inputSchema["properties"], tool.name
