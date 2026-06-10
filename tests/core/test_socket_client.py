@@ -183,3 +183,25 @@ class TestLockAwareRecovery:
         with pytest.raises(ConnectionError) as excinfo:
             await cli.ping()
         assert not isinstance(excinfo.value, PrimaryPromotedError)
+
+
+class TestLargeResponses:
+    """Responses must survive asyncio's default 64KB StreamReader limit."""
+
+    async def test_large_response_round_trips(self, socket_path: Path) -> None:
+        """A response well past 64KB arrives intact instead of killing the connection."""
+        payload = "x" * (256 * 1024)
+
+        def fat_dispatch(method: str, params: dict) -> str:
+            return payload
+
+        srv = SocketServer(socket_path, fat_dispatch)
+        await srv.start()
+        cli = SocketClient(socket_path)
+        await cli.connect()
+        try:
+            result = await cli.call_tool("anything", {})
+            assert result == payload
+        finally:
+            await cli.close()
+            await srv.stop()

@@ -43,6 +43,11 @@ REINDEX_TIMEOUT = WRITE_DISPATCH_TIMEOUT + 10.0
 MAX_RECONNECT_ATTEMPTS = 3
 RECONNECT_DELAY = 0.5
 
+# StreamReader buffer limit for responses.  asyncio's default is 64KB and
+# a single line-delimited JSON response easily exceeds that (tool responses
+# can run hundreds of KB) — overflowing the limit kills the connection.
+SOCKET_READ_LIMIT = 16 * 1024 * 1024
+
 
 class PrimaryPromotedError(ConnectionError):
     """The primary daemon is gone and this process promoted itself.
@@ -110,6 +115,7 @@ class SocketClient:
         try:
             self._reader, self._writer = await asyncio.open_unix_connection(
                 str(self._socket_path),
+                limit=SOCKET_READ_LIMIT,
             )
         except (OSError, ConnectionRefusedError) as exc:
             raise ConnectionError(
@@ -213,6 +219,7 @@ class SocketClient:
                 try:
                     self._reader, self._writer = await asyncio.open_unix_connection(
                         str(self._socket_path),
+                        limit=SOCKET_READ_LIMIT,
                     )
                     self._reader_task = asyncio.create_task(self._read_loop())
                     logger.info("Reconnected to primary daemon (attempt %d)", attempt + 1)
@@ -259,6 +266,7 @@ class SocketClient:
             try:
                 self._reader, self._writer = await asyncio.open_unix_connection(
                     str(new_path),
+                    limit=SOCKET_READ_LIMIT,
                 )
             except (OSError, ConnectionRefusedError):
                 return False
