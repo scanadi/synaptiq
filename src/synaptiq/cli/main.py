@@ -687,6 +687,63 @@ def _report_watch_death(task) -> None:
         )
 
 
+# The MCP SDK's server.run() can outlive its session: it neither returns on
+# stdin EOF nor honours task cancellation, so a serve process would otherwise
+# wedge forever while holding the kuzu lock.  Two defenses:
+#   - a stdin sentinel that turns pipe hangup into the stop event, and
+#   - a watchdog that force-exits after a bounded grace once stop fires,
+#     running the cleanup callback (lock release) first.
+
+_SHUTDOWN_GRACE_SECONDS = 20.0
+
+
+def _watch_stdin_hup(loop, stop_event) -> None:
+    """Set *stop_event* when stdin's write end closes (pipe hangup)."""
+    import select
+    import threading
+
+    try:
+        fd = sys.stdin.fileno()
+    except (ValueError, OSError):
+        return
+
+    def _poll_for_hup() -> None:
+        poller = select.poll()
+        # events=0: POLLHUP/POLLERR/POLLNVAL are always reported, and we
+        # never consume data the MCP stdio reader owns.
+        poller.register(fd, 0)
+        while True:
+            for _fd, event in poller.poll(1000):
+                if event & (select.POLLHUP | select.POLLERR | select.POLLNVAL):
+                    loop.call_soon_threadsafe(stop_event.set)
+                    return
+
+    threading.Thread(target=_poll_for_hup, name="stdin-hup-watch", daemon=True).start()
+
+
+def _arm_shutdown_watchdog(stop_event, cleanup=None, *, grace: float = _SHUTDOWN_GRACE_SECONDS):
+    """Return a task that force-exits *grace* seconds after stop fires."""
+    import asyncio
+    import os
+    import threading
+
+    def _force_exit() -> None:
+        if cleanup is not None:
+            try:
+                cleanup()
+            except Exception:
+                pass
+        os._exit(0)
+
+    async def _watchdog() -> None:
+        await stop_event.wait()
+        timer = threading.Timer(grace, _force_exit)
+        timer.daemon = True
+        timer.start()
+
+    return asyncio.create_task(_watchdog())
+
+
 class _PrimaryRuntime:
     """Storage + socket server + watcher bundle for a primary instance.
 
@@ -830,6 +887,10 @@ def _serve_primary(
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, stop.set)
 
+        watchdog = _arm_shutdown_watchdog(stop, lock_mgr.release)
+        if transport == "stdio":
+            _watch_stdin_hup(loop, stop)
+
         await runtime.start(stop)
         watch_task = runtime.watch_task
         try:
@@ -882,7 +943,9 @@ def _serve_primary(
                         return_exceptions=True,
                     )
         finally:
+            stop.set()
             await runtime.stop()
+            watchdog.cancel()
 
     try:
         asyncio.run(_run())
@@ -941,6 +1004,15 @@ def _serve_proxy(socket_path: str, repo_path: Path, data_dir: Path) -> None:
 
         from synaptiq.mcp.server import server as mcp_server
 
+        def _watchdog_cleanup() -> None:
+            # A plain proxy owns nothing; releasing would unlink the live
+            # primary's lock and socket files.
+            if promoted:
+                lock_mgr.release()
+
+        watchdog = _arm_shutdown_watchdog(stop, _watchdog_cleanup)
+        _watch_stdin_hup(asyncio.get_running_loop(), stop)
+
         # Retry connection — the primary may still be starting its socket server.
         for attempt in range(5):
             try:
@@ -962,6 +1034,7 @@ def _serve_proxy(socket_path: str, repo_path: Path, data_dir: Path) -> None:
             if promoted:
                 await runtime.stop()
                 lock_mgr.release()
+            watchdog.cancel()
 
     try:
         asyncio.run(_run())

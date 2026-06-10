@@ -124,8 +124,8 @@ def diff_branches(
     additions/removals/modifications are exact.  Relationship changes cover
     import statements and calls originating in changed files, resolved
     against the changed-file symbol set — edges into unchanged files are out
-    of scope.  Untracked files are not included when diffing against the
-    working tree.
+    of scope.  When diffing against the working tree, untracked (but not
+    ignored) files count as added.
 
     ``full=True``: legacy mode — build the complete graph for both sides in
     temporary worktrees.  Cost scales with repository size.
@@ -229,6 +229,18 @@ def _changed_files(
         path = path.strip()
         if status and path:
             changed.append((status, path))
+
+    if current_ref is None:
+        untracked = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+        )
+        if untracked.returncode == 0:
+            changed.extend(
+                ("A", path) for path in untracked.stdout.splitlines() if path.strip()
+            )
     return changed
 
 def _file_content(repo_path: Path, ref: str | None, path: str) -> str | None:

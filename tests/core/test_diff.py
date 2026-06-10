@@ -392,6 +392,16 @@ class TestScopedDiffBranches:
         removed = {n.name for n in result.removed_nodes}
         assert "freshOne" in removed
 
+    def test_untracked_file_counts_as_added(self, ts_repo: Path) -> None:
+        (ts_repo / "src" / "brand-new.ts").write_text(
+            "export function neverCommitted(): void {}\n"
+        )
+
+        result = diff_branches(ts_repo, "HEAD")
+
+        added = {n.name for n in result.added_nodes}
+        assert "neverCommitted" in added
+
     def test_no_changes_returns_empty(self, ts_repo: Path) -> None:
         result = diff_branches(ts_repo, "HEAD..HEAD")
         assert format_diff(result) == "No structural differences found."
