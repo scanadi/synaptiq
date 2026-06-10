@@ -27,7 +27,12 @@ if TYPE_CHECKING:
 def _get_model(model_name: str) -> TextEmbedding:
     from fastembed import TextEmbedding
 
-    return TextEmbedding(model_name=model_name)
+    from synaptiq.core.resources import current_limits
+
+    # Under the server profile this caps ONNX intra-op threads so watcher
+    # rebuilds can't saturate the machine; 0 → fastembed/ONNX default.
+    threads = current_limits().embed_threads
+    return TextEmbedding(model_name=model_name, threads=threads or None)
 
 # Labels worth embedding — skip Folder, Community, Process (structural only).
 EMBEDDABLE_LABELS: frozenset[NodeLabel] = frozenset(

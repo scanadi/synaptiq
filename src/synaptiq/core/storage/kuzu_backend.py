@@ -205,6 +205,15 @@ class KuzuBackend:
         self._reads_cv = threading.Condition()
         self._active_reads = 0
 
+    @property
+    def generation(self) -> int:
+        """Monotonic counter bumped on every (re)initialize.
+
+        Cache key for data derived from the graph (e.g. the PageRank
+        projection): a bump means the underlying data may have changed.
+        """
+        return self._generation
+
     def initialize(self, path: Path, *, read_only: bool = False) -> None:
         """Open or create the KuzuDB database at *path* and set up the schema.
 
@@ -218,8 +227,18 @@ class KuzuBackend:
                 synaptiq fails loudly instead of silently returning
                 empty results for every query.
         """
+        from synaptiq.core.resources import current_limits
+
+        limits = current_limits()
         self._db_path = path
-        self._db = kuzu.Database(str(path), read_only=read_only)
+        # 0 for either cap means Kuzu's library default (all cores /
+        # default buffer pool) — the interactive profile resolves to that.
+        self._db = kuzu.Database(
+            str(path),
+            read_only=read_only,
+            max_num_threads=limits.kuzu_threads,
+            buffer_pool_size=limits.kuzu_buffer_bytes,
+        )
         self._conn = kuzu.Connection(self._db)
         with self._pool_lock:
             self._generation += 1

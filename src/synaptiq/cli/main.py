@@ -413,6 +413,10 @@ def watch() -> None:
 
     from synaptiq.core.daemon.lock import LockManager
     from synaptiq.core.ingestion.watcher import watch_repo
+    from synaptiq.core.resources import set_profile
+
+    # Background daemon — rebuilds and re-embeds must stay polite.
+    set_profile("server")
 
     repo_path = Path.cwd().resolve()
     data_dir = repo_path / ".synaptiq"
@@ -485,8 +489,10 @@ def mcp() -> None:
     """Start MCP server (stdio transport)."""
     import asyncio
 
+    from synaptiq.core.resources import set_profile
     from synaptiq.mcp.server import main as mcp_main
 
+    set_profile("server")
     asyncio.run(mcp_main())
 
 
@@ -508,7 +514,13 @@ def serve(
     import asyncio
     import os
 
+    from synaptiq.core.resources import set_profile
     from synaptiq.mcp.server import main as mcp_main
+
+    # Long-running daemon beside the user's real work — cap engine
+    # threads, buffer pool, and embedding threads (covers primary,
+    # proxy, and proxy-promoted-to-primary paths).
+    set_profile("server")
 
     if transport not in ("stdio", "http"):
         _stderr_console.print(

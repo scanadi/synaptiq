@@ -90,6 +90,10 @@ Data stored in `.synaptiq/` directory within each indexed repo.
 
 `src/synaptiq/core/search/hybrid.py` implements BM25 + vector (384-dim BAAI/bge-small-en-v1.5 via fastembed) + fuzzy search fused with Reciprocal Rank Fusion.
 
+### Resource Profiles
+
+`src/synaptiq/core/resources.py` defines role-aware engine limits. Long-running daemons (`serve`, `mcp`, `watch`) call `set_profile("server")` at entry and get strict caps: Kuzu task-scheduler threads `max(2, cores//4)`, 512 MB buffer pool, capped ONNX embedding threads. One-shot CLI commands (`analyze`, `query`, ...) keep library defaults (all cores, Kuzu's default buffer pool). `KuzuBackend.initialize()` and the embedders read `current_limits()` at creation time — set the profile before creating either. Env overrides: `SYNAPTIQ_KUZU_THREADS`, `SYNAPTIQ_KUZU_MEMORY_MB`, `SYNAPTIQ_EMBED_THREADS`.
+
 ### Multi-Instance Concurrency
 
 `src/synaptiq/core/daemon/` implements a primary/proxy pattern for concurrent MCP sessions:

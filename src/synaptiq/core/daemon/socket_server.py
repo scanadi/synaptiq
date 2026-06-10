@@ -35,8 +35,11 @@ DISPATCH_TIMEOUT = 120.0
 # and never committed.
 WRITE_DISPATCH_TIMEOUT = 3600.0
 
-# Maximum number of concurrent socket dispatch operations.
-MAX_CONCURRENT_DISPATCHES = 16
+# Maximum number of concurrent socket dispatch operations.  Kept low on
+# purpose: every dispatch fans out across Kuzu's shared task-scheduler
+# pool, so this bounds total engine load — excess requests queue instead
+# of thrashing the scheduler.
+MAX_CONCURRENT_DISPATCHES = 4
 
 
 class SocketServer:

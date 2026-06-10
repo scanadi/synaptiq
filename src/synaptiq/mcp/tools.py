@@ -35,7 +35,12 @@ def _get_query_embedding(query: str) -> list[float] | None:
         if _query_model is None:
             from fastembed import TextEmbedding
 
-            _query_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
+            from synaptiq.core.resources import current_limits
+
+            threads = current_limits().embed_threads
+            _query_model = TextEmbedding(
+                model_name="BAAI/bge-small-en-v1.5", threads=threads or None
+            )
         return next(iter(_query_model.embed([query]))).tolist()
     except Exception:
         logger.debug("Query embedding generation failed", exc_info=True)

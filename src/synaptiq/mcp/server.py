@@ -762,6 +762,10 @@ async def read_resource(uri) -> str:
 
 async def main() -> None:
     """Run the Synaptiq MCP server over stdio transport."""
+    from synaptiq.core.resources import set_profile
+
+    # Idempotent with the CLI entry points; covers `python -m synaptiq.mcp.server`.
+    set_profile("server")
     async with stdio_server() as (read, write):
         await server.run(read, write, server.create_initialization_options())
 

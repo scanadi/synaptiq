@@ -352,7 +352,7 @@ class TestEmbedGraphModelConfig:
 
         embed_graph(sample_graph)
 
-        mock_te_cls.assert_called_once_with(model_name="BAAI/bge-small-en-v1.5")
+        mock_te_cls.assert_called_once_with(model_name="BAAI/bge-small-en-v1.5", threads=None)
 
     @patch("fastembed.TextEmbedding")
     def test_custom_model_name(self, mock_te_cls: MagicMock, sample_graph: KnowledgeGraph) -> None:
@@ -365,7 +365,7 @@ class TestEmbedGraphModelConfig:
 
         embed_graph(sample_graph, model_name="BAAI/bge-base-en-v1.5")
 
-        mock_te_cls.assert_called_once_with(model_name="BAAI/bge-base-en-v1.5")
+        mock_te_cls.assert_called_once_with(model_name="BAAI/bge-base-en-v1.5", threads=None)
 
     @patch("fastembed.TextEmbedding")
     def test_custom_batch_size_passed_to_embed(
