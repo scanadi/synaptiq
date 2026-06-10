@@ -59,20 +59,26 @@ Guards: must be on `main`, clean working tree, synced with remote, tag must not 
 
 ### Ingestion Pipeline
 
-The core of Synaptiq is `src/synaptiq/core/ingestion/pipeline.py` which orchestrates 11 analysis phases plus an optional embedding phase:
+The core of Synaptiq is `src/synaptiq/core/ingestion/pipeline.py` which orchestrates 12 analysis phases plus an optional embedding phase:
 
 1. `walker.py` — file discovery respecting `.gitignore`
 2. `structure.py` — folder/file hierarchy (CONTAINS edges)
 3. `parser_phase.py` — tree-sitter AST extraction → Function/Class/Method/Interface/Enum/TypeAlias nodes
 4. `imports.py` — import resolution to actual files (IMPORTS edges)
-5. `calls.py` — call tracing with confidence scores (CALLS edges, 1.0=exact, 0.5=fuzzy)
-6. `heritage.py` — class inheritance (EXTENDS) and interface implementation (IMPLEMENTS)
-7. `types.py` — type references from params/returns/variables (USES_TYPE edges)
-8. `community.py` — Leiden algorithm clustering (MEMBER_OF edges)
-9. `processes.py` — framework-aware entry point detection + BFS flow tracing
-10. `dead_code.py` — multi-pass dead code analysis with exemptions for decorators, protocols, overrides
-11. `coupling.py` — git history co-change analysis (COUPLED_WITH edges)
-12. Embeddings (optional) — fastembed BAAI/bge-small-en-v1.5 384-dim vectors for semantic search. Skippable via `--no-embeddings` flag on `analyze`.
+5. `calls.py` — call tracing with confidence scores (CALLS edges, 1.0=exact, 0.8=receiver, 0.5=fuzzy)
+6. `rest_linking.py` — REST endpoint ↔ HTTP client call linking across services (CALLS edges with `rest_link`)
+7. `heritage.py` — class inheritance (EXTENDS) and interface implementation (IMPLEMENTS)
+8. `types.py` — type references from params/returns/variables (USES_TYPE edges)
+9. `community.py` — Leiden algorithm clustering (MEMBER_OF edges), seeded for determinism
+10. `processes.py` — framework-aware entry point detection + BFS flow tracing
+11. `dead_code.py` — multi-pass dead code analysis with exemptions for decorators, protocols, overrides
+12. `coupling.py` — git history co-change analysis (COUPLED_WITH edges)
+13. Embeddings (optional) — fastembed BAAI/bge-small-en-v1.5 384-dim vectors for semantic search. Skippable via `--no-embeddings` flag on `analyze`.
+
+Note: all edges are stored in a single Kuzu rel table group `CodeRelation` with the
+logical kind in its `rel_type` property — Cypher must filter on `r.rel_type`, not
+use logical labels like `[:CALLS]`. Node `properties` dicts are persisted in the
+`properties_json` column.
 
 ### Storage Layer
 

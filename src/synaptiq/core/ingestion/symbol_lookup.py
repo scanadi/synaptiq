@@ -39,24 +39,30 @@ class FileSymbolIndex:
 
     Stores ``(start_line, end_line, span, node_id)`` tuples sorted by
     ``start_line`` alongside a pre-computed ``start_lines`` list for
-    O(log N) binary search without per-lookup list creation.
+    O(log N) binary search without per-lookup list creation.  The per-file
+    maximum span bounds the leftward scan during containment lookups.
     """
 
-    __slots__ = ("_entries", "_start_lines")
+    __slots__ = ("_entries", "_start_lines", "_max_spans")
 
     def __init__(
         self,
         entries: dict[str, list[tuple[int, int, int, str]]],
         start_lines: dict[str, list[int]],
+        max_spans: dict[str, int],
     ) -> None:
         self._entries = entries
         self._start_lines = start_lines
+        self._max_spans = max_spans
 
     def get_entries(self, file_path: str) -> list[tuple[int, int, int, str]] | None:
         return self._entries.get(file_path)
 
     def get_start_lines(self, file_path: str) -> list[int] | None:
         return self._start_lines.get(file_path)
+
+    def get_max_span(self, file_path: str) -> int:
+        return self._max_spans.get(file_path, 0)
 
 def build_file_symbol_index(
     graph: KnowledgeGraph,
@@ -92,7 +98,11 @@ def build_file_symbol_index(
         fp: [e[0] for e in file_entries] for fp, file_entries in entries.items()
     }
 
-    return FileSymbolIndex(entries, start_lines)
+    max_spans: dict[str, int] = {
+        fp: max(e[2] for e in file_entries) for fp, file_entries in entries.items()
+    }
+
+    return FileSymbolIndex(entries, start_lines, max_spans)
 
 def find_containing_symbol(
     line: int,
@@ -122,18 +132,27 @@ def find_containing_symbol(
     if not start_lines:
         return None
     idx = bisect.bisect_right(start_lines, line) - 1
+    if idx < 0:
+        return None
 
-    best_id: str | None = None
-    best_span = float("inf")
+    # Entries after idx start past *line* and cannot contain it.  Scanning
+    # left, no entry whose start is more than max_span lines before *line*
+    # can contain it either — that bound makes the scan exact (unlike a
+    # fixed window, which silently missed wide enclosing symbols).
+    #
+    # Symbol ranges come from tree-sitter AST nodes, which nest properly:
+    # two ranges that both contain *line* must be ancestor/descendant, and
+    # the one with the later start is the inner one.  The FIRST containing
+    # entry found scanning leftward is therefore the most specific — return
+    # immediately instead of scanning on for a smaller span (which kept the
+    # scan O(file) when one symbol spanned the whole file).
+    min_start = line - file_symbol_index.get_max_span(file_path)
 
-    # Scan a small window around idx to handle nested/overlapping symbols.
-    search_start = max(0, idx - 10)
-    search_end = min(len(entries), idx + 5)
+    for i in range(idx, -1, -1):
+        start, end, _span, nid = entries[i]
+        if start < min_start:
+            break
+        if start <= line <= end:
+            return nid
 
-    for i in range(search_start, search_end):
-        start, end, span, nid = entries[i]
-        if start <= line <= end and span < best_span:
-            best_span = span
-            best_id = nid
-
-    return best_id
+    return None

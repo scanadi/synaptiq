@@ -111,33 +111,33 @@ def _get_storage() -> KuzuBackend:
     mid-write kill), the kuzu directory and meta.json are deleted so
     the next ``serve --watch`` or ``analyze`` invocation rebuilds cleanly.
     """
-    import shutil
+    from synaptiq.core.storage.kuzu_backend import open_with_recovery
 
     global _storage  # noqa: PLW0603
     if _storage is None:
-        _storage = KuzuBackend()
         db_path = Path.cwd() / ".synaptiq" / "kuzu"
         if db_path.exists():
             try:
-                _storage.initialize(db_path, read_only=True)
+                _storage = open_with_recovery(
+                    db_path,
+                    Path.cwd() / ".synaptiq" / "meta.json",
+                    read_only=True,
+                )
                 logger.info("Initialised storage (read-only) from %s", db_path)
             except RuntimeError as exc:
-                msg = str(exc).lower()
-                if "primary key" in msg or "corrupt" in msg:
-                    logger.warning("Corrupted index detected, removing %s", db_path)
-                    _storage.close()
-                    if db_path.is_dir():
-                        shutil.rmtree(db_path, ignore_errors=True)
-                    else:
-                        db_path.unlink(missing_ok=True)
-                        # Clean up WAL/shadow files left alongside a file-based DB.
-                        for suffix in (".wal", ".shadow"):
-                            db_path.with_suffix(suffix).unlink(missing_ok=True)
-                    (Path.cwd() / ".synaptiq" / "meta.json").unlink(missing_ok=True)
-                    _storage = KuzuBackend()
-                else:
-                    raise
+                if "lock on file" in str(exc).lower():
+                    # Another process holds the database read-write
+                    # (e.g. ``synaptiq serve --watch``). Kuzu allows
+                    # read-only opens only when no writer exists.
+                    raise RuntimeError(
+                        "The Synaptiq database is locked by another process "
+                        "(likely `synaptiq serve --watch`). Connect through "
+                        "that server instead of starting a standalone "
+                        "`synaptiq mcp` instance."
+                    ) from exc
+                raise
         else:
+            _storage = KuzuBackend()
             logger.warning("No .synaptiq/kuzu directory found in %s", Path.cwd())
     return _storage
 
@@ -549,82 +549,124 @@ def _apply_response_pipeline(result: str, max_tokens: int | None = None) -> str:
     return wrap_with_metadata(result)
 
 
+def _as_int(value: object, default: int) -> int:
+    """Coerce an MCP argument to int; inputSchema types are advisory only."""
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_float(value: object, default: float) -> float:
+    """Coerce an MCP argument to float."""
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_bool(value: object, default: bool) -> bool:
+    """Coerce an MCP argument to bool, accepting common string forms."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        if value.lower() in ("true", "1", "yes"):
+            return True
+        if value.lower() in ("false", "0", "no"):
+            return False
+    return default
+
+
+def _as_str_list(value: object) -> list[str] | None:
+    """Coerce an MCP argument to a list of strings, or None."""
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    if isinstance(value, str):
+        return [value]
+    return None
+
+
 def dispatch_tool(name: str, arguments: dict, storage: KuzuBackend) -> str:
     """Synchronous tool dispatch — called directly or via ``asyncio.to_thread``."""
-    max_tokens = arguments.get("max_tokens")
+    max_tokens = _as_int(arguments.get("max_tokens"), 0) or None
 
     if name == "synaptiq_list_repos":
         result = handle_list_repos()
     elif name == "synaptiq_query":
         result = handle_query(
             storage,
-            arguments.get("query", ""),
-            limit=arguments.get("limit", 20),
-            focus_files=arguments.get("focus_files"),
+            str(arguments.get("query", "")),
+            limit=_as_int(arguments.get("limit"), 20),
+            focus_files=_as_str_list(arguments.get("focus_files")),
         )
     elif name == "synaptiq_context":
         result = handle_context(
             storage,
-            arguments.get("symbol", ""),
-            focus_files=arguments.get("focus_files"),
+            str(arguments.get("symbol", "")),
+            focus_files=_as_str_list(arguments.get("focus_files")),
         )
     elif name == "synaptiq_impact":
         result = handle_impact(
-            storage, arguments.get("symbol", ""), depth=arguments.get("depth", 3)
+            storage, str(arguments.get("symbol", "")), depth=_as_int(arguments.get("depth"), 3)
         )
     elif name == "synaptiq_dead_code":
         result = handle_dead_code(storage)
     elif name == "synaptiq_detect_changes":
-        result = handle_detect_changes(storage, arguments.get("diff", ""))
+        result = handle_detect_changes(storage, str(arguments.get("diff", "")))
     elif name == "synaptiq_cypher":
-        result = handle_cypher(storage, arguments.get("query", ""))
+        result = handle_cypher(storage, str(arguments.get("query", "")))
     elif name == "synaptiq_coupling":
         result = handle_coupling(
             storage,
-            arguments.get("file_path", ""),
-            min_strength=arguments.get("min_strength", 0.3),
+            str(arguments.get("file_path", "")),
+            min_strength=_as_float(arguments.get("min_strength"), 0.3),
         )
     elif name == "synaptiq_call_path":
         result = handle_call_path(
             storage,
-            arguments.get("from_symbol", ""),
-            arguments.get("to_symbol", ""),
-            max_depth=arguments.get("max_depth", 10),
+            str(arguments.get("from_symbol", "")),
+            str(arguments.get("to_symbol", "")),
+            max_depth=_as_int(arguments.get("max_depth"), 10),
         )
     elif name == "synaptiq_communities":
-        result = handle_communities(storage, community=arguments.get("community"))
+        community = arguments.get("community")
+        result = handle_communities(
+            storage, community=str(community) if community is not None else None
+        )
     elif name == "synaptiq_explain":
-        result = handle_explain(storage, arguments.get("symbol", ""))
+        result = handle_explain(storage, str(arguments.get("symbol", "")))
     elif name == "synaptiq_review_risk":
-        result = handle_review_risk(storage, arguments.get("diff", ""))
+        result = handle_review_risk(storage, str(arguments.get("diff", "")))
     elif name == "synaptiq_file_context":
-        result = handle_file_context(storage, arguments.get("file_path", ""))
+        result = handle_file_context(storage, str(arguments.get("file_path", "")))
     elif name == "synaptiq_cycles":
-        result = handle_cycles(storage, min_size=arguments.get("min_size", 2))
+        result = handle_cycles(storage, min_size=_as_int(arguments.get("min_size"), 2))
     elif name == "synaptiq_test_impact":
         result = handle_test_impact(
             storage,
-            diff=arguments.get("diff", ""),
-            symbols=arguments.get("symbols"),
+            diff=str(arguments.get("diff", "") or ""),
+            symbols=_as_str_list(arguments.get("symbols")),
         )
     elif name == "synaptiq_remember":
         result = handle_remember(
-            arguments.get("key", ""),
-            arguments.get("value", ""),
-            category=arguments.get("category", ""),
+            str(arguments.get("key", "")),
+            str(arguments.get("value", "")),
+            category=str(arguments.get("category", "") or ""),
         )
     elif name == "synaptiq_recall":
-        result = handle_recall(arguments.get("query", ""))
+        result = handle_recall(str(arguments.get("query", "")))
     elif name == "synaptiq_forget":
-        result = handle_forget(arguments.get("key", ""))
+        result = handle_forget(str(arguments.get("key", "")))
     elif name == "synaptiq_suggest":
-        result = handle_suggest(storage, arguments.get("question", ""))
+        result = handle_suggest(storage, str(arguments.get("question", "")))
     elif name == "synaptiq_export":
         result = handle_export(
             storage,
-            arguments.get("symbol", ""),
-            depth=arguments.get("depth", 2),
-            include_source=arguments.get("include_source", True),
+            str(arguments.get("symbol", "")),
+            depth=_as_int(arguments.get("depth"), 2),
+            include_source=_as_bool(arguments.get("include_source"), True),
         )
     else:
         result = f"Unknown tool: {name}"

@@ -377,9 +377,36 @@ class TestHandleCypher:
     def test_query_error(self, mock_storage):
         """Returns error message when query execution fails."""
         mock_storage.execute_raw.side_effect = RuntimeError("Syntax error")
-        result = handle_cypher(mock_storage, "INVALID QUERY")
+        result = handle_cypher(mock_storage, "MATCH (n) RETURN nonexistent_fn(n)")
         assert "failed" in result.lower()
         assert "Syntax error" in result
+
+    def test_rejects_non_read_clause(self, mock_storage):
+        """Queries not starting with a read clause are rejected before execution."""
+        result = handle_cypher(mock_storage, "INVALID QUERY")
+        assert "rejected" in result.lower()
+        mock_storage.execute_raw.assert_not_called()
+
+    def test_rejects_ddl_and_export(self, mock_storage):
+        """ALTER / EXPORT DATABASE / ATTACH are rejected by the deny-list."""
+        for query in (
+            "ALTER TABLE Function ADD COLUMN x STRING",
+            "EXPORT DATABASE '/tmp/exfil'",
+            "ATTACH 'other.db' AS other",
+            "MATCH (n) WITH n CALL something() RETURN n",
+        ):
+            result = handle_cypher(mock_storage, query)
+            assert "rejected" in result.lower(), query
+        mock_storage.execute_raw.assert_not_called()
+
+    def test_allows_fts_call(self, mock_storage):
+        """Read-only CALL QUERY_FTS_INDEX passes the allow-list."""
+        mock_storage.execute_raw.return_value = []
+        result = handle_cypher(
+            mock_storage,
+            "CALL QUERY_FTS_INDEX('Function', 'function_fts', 'auth') RETURN node.id",
+        )
+        assert "rejected" not in result.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -393,9 +420,9 @@ class TestResources:
         from synaptiq.mcp.resources import get_schema
 
         result = get_schema()
-        assert "Node Labels:" in result
-        assert "Relationship Types:" in result
-        assert "CALLS" in result
+        assert "Node Tables" in result
+        assert "CodeRelation" in result
+        assert "rel_type" in result
         assert "Function" in result
 
     def test_get_overview(self, mock_storage):

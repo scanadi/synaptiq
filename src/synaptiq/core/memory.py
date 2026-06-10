@@ -1,17 +1,26 @@
 """Persistent memory store for agent-discovered facts.
 
 Stores key-value facts in ``.synaptiq/memory.json`` so they survive
-re-indexing and persist across agent sessions.  Uses file-level locking
-for safe concurrent writes.
+re-indexing and persist across agent sessions.
+
+Concurrency: every read-modify-write cycle holds an exclusive ``flock``
+on a dedicated lock file (``memory.lock``), and saves go through a
+uniquely-named temp file followed by an atomic rename.  Locking the data
+file itself would not work — ``open(..., "w")`` truncates *before* the
+lock can be acquired.
 """
 
 from __future__ import annotations
 
 import fcntl
 import json
+import os
+import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Iterator
 
 
 @dataclass
@@ -38,6 +47,7 @@ class MemoryStore:
         if synaptiq_dir is None:
             synaptiq_dir = Path.cwd() / ".synaptiq"
         self._path = synaptiq_dir / "memory.json"
+        self._lock_path = synaptiq_dir / "memory.lock"
 
     # ------------------------------------------------------------------
     # Public API
@@ -49,18 +59,21 @@ class MemoryStore:
         If a fact with the same *key* already exists its value, category,
         and ``updated_at`` timestamp are updated.
         """
-        data = self._load()
-        now = time.time()
-        existing = data.get(key)
-        if existing:
-            existing["value"] = value
-            existing["category"] = category or existing.get("category", "")
-            existing["updated_at"] = now
-            fact = Fact(**existing)
-        else:
-            fact = Fact(key=key, value=value, category=category, created_at=now, updated_at=now)
-            data[key] = asdict(fact)
-        self._save(data)
+        with self._locked():
+            data = self._load()
+            now = time.time()
+            existing = data.get(key)
+            if existing:
+                existing["value"] = value
+                existing["category"] = category or existing.get("category", "")
+                existing["updated_at"] = now
+                fact = Fact(**existing)
+            else:
+                fact = Fact(
+                    key=key, value=value, category=category, created_at=now, updated_at=now
+                )
+                data[key] = asdict(fact)
+            self._save(data)
         return fact
 
     def recall(self, query: str, limit: int = 10) -> list[Fact]:
@@ -94,11 +107,12 @@ class MemoryStore:
 
     def forget(self, key: str) -> bool:
         """Remove a fact by key.  Returns ``True`` if it existed."""
-        data = self._load()
-        if key not in data:
-            return False
-        del data[key]
-        self._save(data)
+        with self._locked():
+            data = self._load()
+            if key not in data:
+                return False
+            del data[key]
+            self._save(data)
         return True
 
     def list_all(self, category: str | None = None) -> list[Fact]:
@@ -114,6 +128,20 @@ class MemoryStore:
     # Internal
     # ------------------------------------------------------------------
 
+    @contextmanager
+    def _locked(self) -> Iterator[None]:
+        """Hold an exclusive flock on the lock file for a read-modify-write."""
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(self._lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
     def _load(self) -> dict:
         if not self._path.exists():
             return {}
@@ -124,11 +152,15 @@ class MemoryStore:
 
     def _save(self, data: dict) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._path.with_suffix(".tmp")
-        with open(tmp, "w") as fh:
-            fcntl.flock(fh, fcntl.LOCK_EX)
-            try:
+        # Unique temp name + atomic rename: concurrent writers can never
+        # truncate each other's in-progress file.
+        fd, tmp_name = tempfile.mkstemp(
+            prefix="memory.", suffix=".tmp", dir=str(self._path.parent)
+        )
+        try:
+            with os.fdopen(fd, "w") as fh:
                 json.dump(data, fh, indent=2)
-            finally:
-                fcntl.flock(fh, fcntl.LOCK_UN)
-        tmp.replace(self._path)
+            os.replace(tmp_name, self._path)
+        except BaseException:
+            Path(tmp_name).unlink(missing_ok=True)
+            raise

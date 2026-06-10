@@ -20,9 +20,12 @@ Phases executed:
 
 from __future__ import annotations
 
+import json
+import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from synaptiq.config.ignore import load_gitignore
@@ -234,3 +237,75 @@ def build_graph(repo_path: Path) -> KnowledgeGraph:
     """
     graph, _ = run_pipeline(repo_path)
     return graph
+
+
+logger = logging.getLogger(__name__)
+
+
+def build_full_index(
+    repo_path: Path,
+    *,
+    full: bool = True,
+    skip_embeddings: bool = False,
+):
+    """CPU phase of a full rebuild: pipeline + embeddings, no DB access.
+
+    Runs WITHOUT any lock so concurrent queries keep flowing while the
+    pipeline crunches.  Embedding failures (model unavailable, offline)
+    degrade gracefully — the graph is still usable without fresh vectors.
+
+    Returns ``(graph, embeddings, result)``.  Shared by the watcher's
+    global phase and the server-side reindex so the build/commit split
+    has exactly one implementation.
+    """
+    graph, result = run_pipeline(repo_path, None, full=full)
+
+    embeddings: list = []
+    if not skip_embeddings:
+        try:
+            from synaptiq.core.embeddings.embedder import embed_graph
+
+            embeddings = embed_graph(graph)
+            result.embeddings = len(embeddings)
+        except Exception:
+            logger.warning(
+                "Embedding generation failed; vector search will be stale "
+                "until it succeeds",
+                exc_info=True,
+            )
+    return graph, embeddings, result
+
+
+def commit_full_index(storage: StorageBackend, graph: KnowledgeGraph, embeddings: list) -> None:
+    """I/O phase of a full rebuild — caller must hold the exclusive write lock.
+
+    ``bulk_load`` resets the entire database including the embedding table,
+    so embeddings must be re-stored here or vector search silently degrades
+    to keyword-only.
+    """
+    storage.bulk_load(graph)
+    if embeddings:
+        storage.store_embeddings(embeddings)
+
+
+def write_meta(data_dir: Path, repo_path: Path, result: PipelineResult) -> None:
+    """Write ``meta.json`` with index stats and the indexing timestamp."""
+    from synaptiq import __version__
+
+    meta = {
+        "version": __version__,
+        "name": repo_path.name,
+        "path": str(repo_path),
+        "stats": {
+            "files": result.files,
+            "symbols": result.symbols,
+            "relationships": result.relationships,
+            "clusters": result.clusters,
+            "flows": result.processes,
+            "dead_code": result.dead_code,
+            "coupled_pairs": result.coupled_pairs,
+            "embeddings": result.embeddings,
+        },
+        "last_indexed_at": datetime.now(tz=timezone.utc).isoformat(),
+    }
+    (data_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")

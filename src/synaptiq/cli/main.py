@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import shutil
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -20,24 +19,10 @@ _stderr_console = Console(stderr=True)
 
 
 def _write_meta(data_dir: Path, repo_path: Path, result: object) -> None:
-    """Write meta.json with index stats."""
-    meta = {
-        "version": __version__,
-        "name": repo_path.name,
-        "path": str(repo_path),
-        "stats": {
-            "files": result.files,
-            "symbols": result.symbols,
-            "relationships": result.relationships,
-            "clusters": result.clusters,
-            "flows": result.processes,
-            "dead_code": result.dead_code,
-            "coupled_pairs": result.coupled_pairs,
-            "embeddings": result.embeddings,
-        },
-        "last_indexed_at": datetime.now(tz=timezone.utc).isoformat(),
-    }
-    (data_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    """Write meta.json with index stats (shared implementation in pipeline)."""
+    from synaptiq.core.ingestion.pipeline import write_meta
+
+    write_meta(data_dir, repo_path, result)
 
 
 def _load_storage(repo_path: Path | None = None) -> "KuzuBackend":  # noqa: F821
@@ -53,8 +38,91 @@ def _load_storage(repo_path: Path | None = None) -> "KuzuBackend":  # noqa: F821
         raise typer.Exit(code=1)
 
     storage = KuzuBackend()
-    storage.initialize(db_path, read_only=True)
+    try:
+        storage.initialize(db_path, read_only=True)
+    except RuntimeError as exc:
+        if "lock on file" in str(exc).lower():
+            console.print(
+                "[red]Error:[/red] The database is locked by a running "
+                "`synaptiq serve` instance and it could not be reached "
+                "over its socket. Stop the server or retry."
+            )
+            raise typer.Exit(code=1) from exc
+        raise
     return storage
+
+
+def _healthy_server_socket(data_dir: Path) -> str | None:
+    """Return the socket path of a healthy running server, or ``None``."""
+    from synaptiq.core.daemon.lock import LockManager
+
+    existing = LockManager(data_dir).read_existing()
+    if existing is not None and not existing.is_stale():
+        return existing.socket
+    return None
+
+
+def _call_tool_via_server(socket_path: str, tool: str, arguments: dict) -> str:
+    """Forward a tool call to a running server over its Unix socket."""
+    import asyncio
+
+    from synaptiq.core.daemon.socket_client import SocketClient
+
+    async def _do() -> str:
+        client = SocketClient(Path(socket_path))
+        await client.connect()
+        try:
+            return await client.call_tool(tool, arguments)
+        finally:
+            await client.close()
+
+    return asyncio.run(_do())
+
+
+def _run_read_tool(tool: str, arguments: dict) -> str:
+    """Run a read-only tool locally, or via a running server's socket.
+
+    While ``synaptiq serve --watch`` holds the database read-write, Kuzu
+    refuses read-only opens from other processes — so CLI reads must go
+    through the server instead of opening the database directly.
+
+    Error routing matters here: only ConnectionError means the server is
+    actually unreachable (fall back to direct access).  A RuntimeError is
+    the server *responding* with an error, and a TimeoutError means it is
+    up but slow — in both cases falling back would just hit Kuzu's file
+    lock and mask the real cause.
+    """
+    from synaptiq.mcp.token_budget import strip_metadata
+
+    data_dir = Path.cwd().resolve() / ".synaptiq"
+    socket_path = _healthy_server_socket(data_dir)
+    if socket_path is not None:
+        try:
+            result = _call_tool_via_server(socket_path, tool, arguments)
+            return strip_metadata(result)
+        except ConnectionError as exc:
+            _stderr_console.print(
+                f"[yellow]Warning:[/yellow] could not reach running server "
+                f"({exc}); falling back to direct database access."
+            )
+        except TimeoutError as exc:
+            console.print(
+                f"[red]Error:[/red] the running synaptiq server did not "
+                f"respond in time ({exc or 'timeout'})."
+            )
+            raise typer.Exit(code=1) from exc
+        except RuntimeError as exc:
+            console.print(f"[red]Error from server:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+
+    from synaptiq.mcp.server import dispatch_tool
+
+    storage = _load_storage()
+    try:
+        result = dispatch_tool(tool, arguments, storage)
+        return strip_metadata(result)
+    finally:
+        storage.close()
 
 
 app = typer.Typer(
@@ -104,7 +172,7 @@ def analyze(
     """Index a repository into a knowledge graph."""
     from synaptiq.core.daemon.lock import LockManager
     from synaptiq.core.ingestion.pipeline import PipelineResult, run_pipeline
-    from synaptiq.core.storage.kuzu_backend import KuzuBackend
+    from synaptiq.core.storage.kuzu_backend import open_with_recovery
 
     repo_path = path.resolve()
     if not repo_path.is_dir():
@@ -124,7 +192,7 @@ def analyze(
             console.print(
                 f"[bold]Server running (PID {existing.pid}), requesting reindex...[/bold]"
             )
-            _reindex_via_server(existing.socket, full=full)
+            _reindex_via_server(existing.socket, full=full, skip_embeddings=no_embeddings)
             return
         # Stale lock — clean up and retry.
         lock_mgr.force_cleanup()
@@ -139,26 +207,7 @@ def analyze(
         console.print(f"[bold]Indexing[/bold] {repo_path}")
 
         db_path = data_dir / "kuzu"
-
-        storage = KuzuBackend()
-        try:
-            storage.initialize(db_path)
-        except RuntimeError as exc:
-            msg = str(exc).lower()
-            if "primary key" in msg or "corrupt" in msg:
-                _stderr_console.print("[yellow]Corrupted index detected, rebuilding...[/yellow]")
-                storage.close()
-                if db_path.is_dir():
-                    shutil.rmtree(db_path, ignore_errors=True)
-                else:
-                    db_path.unlink(missing_ok=True)
-                    for suffix in (".wal", ".shadow"):
-                        db_path.with_suffix(suffix).unlink(missing_ok=True)
-                (data_dir / "meta.json").unlink(missing_ok=True)
-                storage = KuzuBackend()
-                storage.initialize(db_path)
-            else:
-                raise
+        storage = open_with_recovery(db_path, data_dir / "meta.json")
 
         result: PipelineResult | None = None
         with Progress(
@@ -257,6 +306,14 @@ def clean(
         console.print(f"[red]Error:[/red] No index found at {repo_path}. Nothing to clean.")
         raise typer.Exit(code=1)
 
+    socket_path = _healthy_server_socket(data_dir)
+    if socket_path is not None:
+        console.print(
+            "[red]Error:[/red] A synaptiq server is running against this index. "
+            "Stop it before cleaning — deleting a live database can corrupt it."
+        )
+        raise typer.Exit(code=1)
+
     if not force:
         confirm = typer.confirm(f"Delete index at {data_dir}?")
         if not confirm:
@@ -273,12 +330,8 @@ def query(
     limit: int = typer.Option(20, "--limit", "-n", help="Maximum number of results."),
 ) -> None:
     """Search the knowledge graph."""
-    from synaptiq.mcp.tools import handle_query
-
-    storage = _load_storage()
-    result = handle_query(storage, q, limit=limit)
+    result = _run_read_tool("synaptiq_query", {"query": q, "limit": limit})
     console.print(result)
-    storage.close()
 
 
 @app.command()
@@ -286,12 +339,8 @@ def context(
     name: str = typer.Argument(..., help="Symbol name to inspect."),
 ) -> None:
     """Show 360-degree view of a symbol."""
-    from synaptiq.mcp.tools import handle_context
-
-    storage = _load_storage()
-    result = handle_context(storage, name)
+    result = _run_read_tool("synaptiq_context", {"symbol": name})
     console.print(result)
-    storage.close()
 
 
 @app.command()
@@ -300,23 +349,15 @@ def impact(
     depth: int = typer.Option(3, "--depth", "-d", help="Traversal depth."),
 ) -> None:
     """Show blast radius of changing a symbol."""
-    from synaptiq.mcp.tools import handle_impact
-
-    storage = _load_storage()
-    result = handle_impact(storage, target, depth=depth)
+    result = _run_read_tool("synaptiq_impact", {"symbol": target, "depth": depth})
     console.print(result)
-    storage.close()
 
 
 @app.command(name="dead-code")
 def dead_code() -> None:
     """List all detected dead code."""
-    from synaptiq.mcp.tools import handle_dead_code
-
-    storage = _load_storage()
-    result = handle_dead_code(storage)
+    result = _run_read_tool("synaptiq_dead_code", {})
     console.print(result)
-    storage.close()
 
 
 @app.command()
@@ -324,12 +365,8 @@ def cypher(
     query: str = typer.Argument(..., help="Raw Cypher query to execute."),
 ) -> None:
     """Execute raw Cypher against the knowledge graph."""
-    from synaptiq.mcp.tools import handle_cypher
-
-    storage = _load_storage()
-    result = handle_cypher(storage, query)
+    result = _run_read_tool("synaptiq_cypher", {"query": query})
     console.print(result)
-    storage.close()
 
 
 @app.command()
@@ -509,33 +546,10 @@ def serve(
 def _init_storage_with_index(repo_path: Path, data_dir: Path, *, output=console):
     """Initialise KuzuDB and run the first index if no meta.json exists."""
     from synaptiq.core.ingestion.pipeline import run_pipeline
-    from synaptiq.core.storage.kuzu_backend import KuzuBackend
+    from synaptiq.core.storage.kuzu_backend import open_with_recovery
 
     kuzu_path = data_dir / "kuzu"
-    storage = KuzuBackend()
-
-    try:
-        storage.initialize(kuzu_path)
-    except RuntimeError as exc:
-        msg = str(exc).lower()
-        if "primary key" in msg or "corrupt" in msg:
-            print(
-                "Corrupted index detected, rebuilding...",
-                file=sys.stderr,
-            )
-            storage.close()
-            if kuzu_path.is_dir():
-                shutil.rmtree(kuzu_path, ignore_errors=True)
-            else:
-                kuzu_path.unlink(missing_ok=True)
-                for suffix in (".wal", ".shadow"):
-                    kuzu_path.with_suffix(suffix).unlink(missing_ok=True)
-            meta_path = data_dir / "meta.json"
-            meta_path.unlink(missing_ok=True)
-            storage = KuzuBackend()
-            storage.initialize(kuzu_path)
-        else:
-            raise
+    storage = open_with_recovery(kuzu_path, data_dir / "meta.json")
 
     if not (data_dir / "meta.json").exists():
         import time as _time
@@ -569,7 +583,9 @@ def _init_storage_with_index(repo_path: Path, data_dir: Path, *, output=console)
     return storage
 
 
-def _reindex_via_server(socket_path: str, *, full: bool = True) -> None:
+def _reindex_via_server(
+    socket_path: str, *, full: bool = True, skip_embeddings: bool = False
+) -> None:
     """Send a reindex request to a running synaptiq server via its Unix socket."""
     import asyncio
 
@@ -579,15 +595,15 @@ def _reindex_via_server(socket_path: str, *, full: bool = True) -> None:
         client = SocketClient(Path(socket_path))
         await client.connect()
         try:
-            return await client.reindex(full=full)
+            return await client.reindex(full=full, skip_embeddings=skip_embeddings)
         finally:
             await client.close()
 
     console.print("[dim]Waiting for reindex to complete...[/dim]")
     try:
         result_str = asyncio.run(_do())
-    except (ConnectionError, RuntimeError) as exc:
-        console.print(f"[red]Error:[/red] {exc}")
+    except (ConnectionError, RuntimeError, TimeoutError) as exc:
+        console.print(f"[red]Error:[/red] {exc or 'reindex request timed out'}")
         raise typer.Exit(code=1) from exc
 
     result = json.loads(result_str)
@@ -612,17 +628,7 @@ def _reindex_via_server(socket_path: str, *, full: bool = True) -> None:
         console.print(f"  {'Duration:':<16}{result['duration']:.2f}s")
 
 
-def _handle_reindex(repo_path: Path, data_dir: Path, storage: object, full: bool = True) -> str:
-    """Run a full reindex — called from the socket server dispatch."""
-    import time
-
-    from synaptiq.core.ingestion.pipeline import run_pipeline
-
-    start = time.monotonic()
-    _, result = run_pipeline(repo_path, storage, full=full)
-    _write_meta(data_dir, repo_path, result)
-    duration = time.monotonic() - start
-
+def _reindex_stats_json(result, duration: float) -> str:
     return json.dumps(
         {
             "stats": {
@@ -679,17 +685,67 @@ def _serve_primary(
     def dispatch(method: str, params: dict) -> str:
         if method == "ping":
             return "pong"
-        if method == "reindex":
-            return _handle_reindex(repo_path, data_dir, storage, full=params.get("full", True))
         if method == "tool":
             return dispatch_tool(params.get("name", ""), params.get("arguments", {}), storage)
         if method == "resource":
             return dispatch_resource(params.get("uri", ""), storage)
         return f"Unknown method: {method}"
 
+    async def _reindex_async(params: dict) -> str:
+        """Reindex with minimal lock hold: build lock-free, commit locked.
+
+        Holding the write lock across the whole pipeline (plus embedding
+        generation) would block every agent query for its full duration.
+
+        The commit is shielded from cancellation: if the dispatch timeout
+        fires mid-commit, the commit must run to completion while still
+        holding the writer lock — a cancelled `async with rwlock.writer()`
+        would release the lock while the commit thread keeps resetting the
+        database under live readers.
+        """
+        import time as _time
+
+        from synaptiq.core.ingestion.pipeline import build_full_index, commit_full_index
+
+        start = _time.monotonic()
+        graph, embeddings, result = await asyncio.to_thread(
+            build_full_index,
+            repo_path,
+            full=params.get("full", True),
+            skip_embeddings=params.get("skip_embeddings", False),
+        )
+
+        async def _locked_commit() -> None:
+            # Generous acquisition timeout: a single read dispatch may
+            # legitimately hold the reader lock for up to the server's
+            # 120s budget — the default 60s would discard the whole build.
+            async with rwlock.writer(timeout=300.0):
+                await asyncio.to_thread(commit_full_index, storage, graph, embeddings)
+
+        await asyncio.shield(_locked_commit())
+        _write_meta(data_dir, repo_path, result)
+        return _reindex_stats_json(result, _time.monotonic() - start)
+
     socket_server = SocketServer(
-        lock_mgr.socket_path, dispatch, rwlock=rwlock, write_methods={"reindex"}
+        lock_mgr.socket_path,
+        dispatch,
+        rwlock=rwlock,
+        async_handlers={"reindex": _reindex_async},
     )
+
+    def _report_watch_death(task) -> None:
+        """A dead watcher silently serves an ever-staler index — say so."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            import logging
+
+            logging.getLogger(__name__).error("File watcher crashed", exc_info=exc)
+            _stderr_console.print(
+                f"[red]File watcher crashed:[/red] {exc} — "
+                "the index will no longer update. Restart the server."
+            )
 
     async def _run() -> None:
         import signal
@@ -718,6 +774,7 @@ def _serve_primary(
                 watch_task = asyncio.create_task(
                     watch_repo(repo_path, storage, stop_event=stop, rwlock=rwlock)
                 )
+                watch_task.add_done_callback(_report_watch_death)
 
                 async def _wait_stop():
                     await stop.wait()
@@ -742,6 +799,7 @@ def _serve_primary(
                     watch_task = asyncio.create_task(
                         watch_repo(repo_path, storage, stop_event=stop, rwlock=rwlock)
                     )
+                    watch_task.add_done_callback(_report_watch_death)
 
                     async def _wait_stop():
                         await stop.wait()

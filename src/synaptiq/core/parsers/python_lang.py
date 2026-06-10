@@ -103,7 +103,9 @@ class PythonParser(LanguageParser):
         name = name_node.text.decode("utf8")
         start_line = node.start_point[0] + 1
         end_line = node.end_point[0] + 1
-        node_content = content[node.start_byte : node.end_byte]
+        # node.text is the node's exact source bytes — slicing the str with
+        # byte offsets would drift on any non-ASCII content.
+        node_content = node.text.decode("utf8")
 
         kind = "method" if class_name else "function"
         signature = self._build_signature(node, content)
@@ -265,7 +267,7 @@ class PythonParser(LanguageParser):
         class_name = name_node.text.decode("utf8")
         start_line = node.start_point[0] + 1
         end_line = node.end_point[0] + 1
-        node_content = content[node.start_byte : node.end_byte]
+        node_content = node.text.decode("utf8")
 
         result.symbols.append(
             SymbolInfo(

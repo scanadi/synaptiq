@@ -21,7 +21,7 @@ from synaptiq.core.graph.model import (
     RelType,
     generate_id,
 )
-from synaptiq.core.ingestion.parser_phase import FileParseData
+from synaptiq.core.ingestion.parser_phase import FileParseData, assign_symbol_ids
 from synaptiq.core.ingestion.symbol_lookup import (
     build_file_symbol_index,
     build_name_index,
@@ -37,11 +37,11 @@ _CALLABLE_LABELS: tuple[NodeLabel, ...] = (
     NodeLabel.CLASS,
 )
 
-_KIND_TO_LABEL: dict[str, NodeLabel] = {
-    "function": NodeLabel.FUNCTION,
-    "method": NodeLabel.METHOD,
-    "class": NodeLabel.CLASS,
-}
+# Confidence assigned to weak references (object-literal shorthand) that
+# only resolve via global fuzzy matching.  Low enough to read as "uncertain"
+# in every consumer, but the edge still exists — dropping it entirely made
+# dead-code detection flag symbols whose only reference was the shorthand.
+_WEAK_REF_CONFIDENCE = 0.3
 
 # Names that should never produce CALLS edges.  These are language builtins,
 # stdlib utilities, framework hooks, and common JS/TS globals whose definitions
@@ -406,6 +406,12 @@ def process_calls(
                 import_cache=import_cache,
             )
             if target_id is not None:
+                # Weak references (object-literal shorthand) resolved only by
+                # global fuzzy matching keep their edge — removing it would
+                # let dead-code flag genuinely-referenced symbols — but at a
+                # confidence that marks them clearly uncertain.
+                if call.is_weak_ref and confidence < 0.8:
+                    confidence = _WEAK_REF_CONFIDENCE
                 _add_calls_edge(source_id, target_id, confidence, graph, seen)
 
             # Callback arguments: bare identifiers passed as arguments
@@ -444,20 +450,13 @@ def process_calls(
 
         # Decorators are implicit calls — @cost_decorator on a function is
         # equivalent to calling cost_decorator(func).  Create CALLS edges
-        # from the decorated symbol to the decorator definition.
-        for symbol in fpd.parse_result.symbols:
-            if not symbol.decorators:
+        # from the decorated symbol to the decorator definition.  IDs come
+        # from the same assignment logic as the parser phase so collision
+        # suffixes (#L) attach the edge to the right duplicate.
+        symbol_ids = assign_symbol_ids(fpd.parse_result.symbols, fpd.file_path)
+        for symbol, source_id in zip(fpd.parse_result.symbols, symbol_ids):
+            if not symbol.decorators or source_id is None:
                 continue
-
-            symbol_name = (
-                f"{symbol.class_name}.{symbol.name}"
-                if symbol.kind == "method" and symbol.class_name
-                else symbol.name
-            )
-            label = _KIND_TO_LABEL.get(symbol.kind)
-            if label is None:
-                continue
-            source_id = generate_id(label, fpd.file_path, symbol_name)
 
             for dec_name in symbol.decorators:
                 # Strip the base name for dotted decorators (e.g. "app.route" → "route")

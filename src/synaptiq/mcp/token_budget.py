@@ -20,6 +20,18 @@ def wrap_with_metadata(text: str) -> str:
     return f"{text}\n\n--- tokens: {tokens} ---"
 
 
+_METADATA_FOOTER = re.compile(r"\n*--- tokens: \d+ ---\s*$")
+
+
+def strip_metadata(text: str) -> str:
+    """Remove the footer added by :func:`wrap_with_metadata`.
+
+    Lives here so the footer format has exactly one owner — consumers
+    (e.g. the CLI) must not hardcode the pattern.
+    """
+    return _METADATA_FOOTER.sub("", text)
+
+
 def truncate_response(text: str, max_tokens: int) -> str:
     """Truncate *text* to fit within *max_tokens*.
 

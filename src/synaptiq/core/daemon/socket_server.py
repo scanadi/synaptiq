@@ -21,7 +21,7 @@ import asyncio
 import json
 import logging
 from pathlib import Path
-from typing import Callable
+from typing import Awaitable, Callable
 
 from synaptiq.core.daemon.rwlock import AsyncRWLock
 
@@ -44,12 +44,16 @@ class SocketServer:
         dispatch: Callable[[str, dict], str],
         *,
         rwlock: AsyncRWLock | None = None,
-        write_methods: set[str] | None = None,
+        async_handlers: dict[str, Callable[[dict], Awaitable[str]]] | None = None,
     ) -> None:
         self._socket_path = socket_path
         self._dispatch = dispatch
         self._rwlock = rwlock
-        self._write_methods = write_methods or set()
+        # One dispatch model: sync methods run in a thread under the shared
+        # READ lock; anything that writes must be an async handler that
+        # manages its own locking and lock granularity (e.g. reindex builds
+        # lock-free and only takes the write lock for the commit).
+        self._async_handlers = async_handlers or {}
         self._server: asyncio.AbstractServer | None = None
         # Semaphore to limit concurrent dispatches.
         self._semaphore = asyncio.Semaphore(MAX_CONCURRENT_DISPATCHES)
@@ -129,18 +133,19 @@ class SocketServer:
 
         try:
             async with self._semaphore:
-                coro = asyncio.to_thread(self._dispatch, method, params)
-                is_write = method in self._write_methods
-                timeout = WRITE_DISPATCH_TIMEOUT if is_write else DISPATCH_TIMEOUT
-                if self._rwlock is not None:
-                    if is_write:
-                        async with self._rwlock.writer():
-                            result = await asyncio.wait_for(coro, timeout=timeout)
-                    else:
-                        async with self._rwlock.reader():
-                            result = await asyncio.wait_for(coro, timeout=timeout)
+                if method in self._async_handlers:
+                    # Handler manages its own locking and lock granularity.
+                    result = await asyncio.wait_for(
+                        self._async_handlers[method](params),
+                        timeout=WRITE_DISPATCH_TIMEOUT,
+                    )
                 else:
-                    result = await asyncio.wait_for(coro, timeout=timeout)
+                    coro = asyncio.to_thread(self._dispatch, method, params)
+                    if self._rwlock is not None:
+                        async with self._rwlock.reader():
+                            result = await asyncio.wait_for(coro, timeout=DISPATCH_TIMEOUT)
+                    else:
+                        result = await asyncio.wait_for(coro, timeout=DISPATCH_TIMEOUT)
             return json.dumps({"id": req_id, "result": result}) + "\n"
         except asyncio.TimeoutError:
             return json.dumps({

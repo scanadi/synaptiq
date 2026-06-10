@@ -8,6 +8,7 @@ relationships between the importing file and the target file.
 from __future__ import annotations
 
 import logging
+import posixpath
 from pathlib import PurePosixPath
 
 from synaptiq.core.graph.graph import KnowledgeGraph
@@ -22,7 +23,7 @@ from synaptiq.core.parsers.base import ImportInfo
 
 logger = logging.getLogger(__name__)
 
-_JS_TS_EXTENSIONS = (".ts", ".js", ".tsx", ".jsx")
+_JS_TS_EXTENSIONS = (".ts", ".js", ".tsx", ".jsx", ".mjs", ".cjs")
 
 def build_file_index(graph: KnowledgeGraph) -> dict[str, str]:
     """Build an index mapping file paths to their graph node IDs.
@@ -140,7 +141,7 @@ def _detect_language(file_path: str) -> str:
         return "python"
     if suffix in (".ts", ".tsx"):
         return "typescript"
-    if suffix in (".js", ".jsx"):
+    if suffix in (".js", ".jsx", ".mjs", ".cjs"):
         return "javascript"
     return ""
 
@@ -261,9 +262,9 @@ def _resolve_js_ts(
         return None
 
     base = PurePosixPath(importing_file).parent
-    resolved = base / module
-
-    resolved_str = str(PurePosixPath(*resolved.parts))
+    # posixpath.normpath collapses './' and '../' segments — PurePosixPath
+    # keeps '..' literal, which would never match the file index.
+    resolved_str = posixpath.normpath(str(base / module))
 
     return _try_js_ts_paths(resolved_str, file_index)
 

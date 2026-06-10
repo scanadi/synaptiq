@@ -23,11 +23,16 @@ import logging
 import uuid
 from pathlib import Path
 
+from synaptiq.core.daemon.socket_server import DISPATCH_TIMEOUT, WRITE_DISPATCH_TIMEOUT
+
 logger = logging.getLogger(__name__)
 
-# Timeout for individual requests (seconds).
-REQUEST_TIMEOUT = 60.0
-REINDEX_TIMEOUT = 600.0
+# Client-side timeouts derive from the server's dispatch budgets so the
+# server always times out first and the client relays its error instead of
+# abandoning an in-flight request.  Anyone changing the server constants
+# keeps this invariant automatically.
+REQUEST_TIMEOUT = DISPATCH_TIMEOUT + 10.0
+REINDEX_TIMEOUT = WRITE_DISPATCH_TIMEOUT + 10.0
 
 # Reconnection settings.
 MAX_RECONNECT_ATTEMPTS = 3
@@ -49,6 +54,11 @@ class SocketClient:
         self._pending: dict[str, asyncio.Future[dict]] = {}
         # Lock to serialize writes (reads are demuxed by the reader task).
         self._write_lock = asyncio.Lock()
+        # Serializes reconnection: when the read loop fails every pending
+        # future at once, all waiters try to reconnect — without the lock
+        # each teardown would close the connection another waiter just
+        # opened.
+        self._reconnect_lock = asyncio.Lock()
         # Background task that reads responses and dispatches to futures.
         self._reader_task: asyncio.Task | None = None
 
@@ -146,25 +156,39 @@ class SocketClient:
     # ------------------------------------------------------------------
 
     async def _reconnect(self) -> None:
-        """Attempt to reconnect to the primary daemon."""
-        await self._teardown()
+        """Attempt to reconnect to the primary daemon (serialized).
 
-        for attempt in range(MAX_RECONNECT_ATTEMPTS):
-            try:
-                self._reader, self._writer = await asyncio.open_unix_connection(
-                    str(self._socket_path),
-                )
-                self._reader_task = asyncio.create_task(self._read_loop())
-                logger.info("Reconnected to primary daemon (attempt %d)", attempt + 1)
-                return
-            except (OSError, ConnectionRefusedError):
-                if attempt < MAX_RECONNECT_ATTEMPTS - 1:
-                    await asyncio.sleep(RECONNECT_DELAY * (attempt + 1))
+        Concurrent waiters queue on the lock; whoever arrives after a
+        successful reconnect sees a healthy connection and returns
+        immediately instead of tearing it down again.
+        """
+        async with self._reconnect_lock:
+            if (
+                self._writer is not None
+                and not self._writer.is_closing()
+                and self._reader_task is not None
+                and not self._reader_task.done()
+            ):
+                return  # another waiter already reconnected
 
-        raise ConnectionError(
-            f"Failed to reconnect to {self._socket_path} "
-            f"after {MAX_RECONNECT_ATTEMPTS} attempts"
-        )
+            await self._teardown()
+
+            for attempt in range(MAX_RECONNECT_ATTEMPTS):
+                try:
+                    self._reader, self._writer = await asyncio.open_unix_connection(
+                        str(self._socket_path),
+                    )
+                    self._reader_task = asyncio.create_task(self._read_loop())
+                    logger.info("Reconnected to primary daemon (attempt %d)", attempt + 1)
+                    return
+                except (OSError, ConnectionRefusedError):
+                    if attempt < MAX_RECONNECT_ATTEMPTS - 1:
+                        await asyncio.sleep(RECONNECT_DELAY * (attempt + 1))
+
+            raise ConnectionError(
+                f"Failed to reconnect to {self._socket_path} "
+                f"after {MAX_RECONNECT_ATTEMPTS} attempts"
+            )
 
     # ------------------------------------------------------------------
     # Low-level request/response
@@ -221,6 +245,21 @@ class SocketClient:
             except asyncio.TimeoutError:
                 self._pending.pop(req_id, None)
                 raise
+            except ConnectionError as exc:
+                # Connection dropped between write and response.  The server
+                # may already be EXECUTING the request, so re-sending could
+                # double-run a non-idempotent method (reindex, forget) —
+                # reconnect so future requests work, but surface the error.
+                self._pending.pop(req_id, None)
+                logger.warning("Connection lost mid-request: %s", exc)
+                try:
+                    await self._reconnect()
+                except ConnectionError:
+                    pass
+                raise ConnectionError(
+                    f"Connection lost while awaiting response (the request may "
+                    f"or may not have executed): {exc}"
+                ) from exc
 
             if "error" in response:
                 raise RuntimeError(response["error"]["message"])
@@ -246,6 +285,10 @@ class SocketClient:
         """Forward a resource read to the primary daemon."""
         return await self._request("resource", {"uri": uri})
 
-    async def reindex(self, *, full: bool = True) -> str:
+    async def reindex(self, *, full: bool = True, skip_embeddings: bool = False) -> str:
         """Request a full reindex from the primary daemon."""
-        return await self._request("reindex", {"full": full}, timeout=REINDEX_TIMEOUT)
+        return await self._request(
+            "reindex",
+            {"full": full, "skip_embeddings": skip_embeddings},
+            timeout=REINDEX_TIMEOUT,
+        )

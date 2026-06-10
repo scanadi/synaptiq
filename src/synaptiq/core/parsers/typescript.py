@@ -72,23 +72,12 @@ class TypeScriptParser(LanguageParser):
         self._walk(tree.root_node, content, result)
         return result
 
-    def _walk(
-        self, node: Node, source: str, result: ParseResult, visited: set[int] | None = None
-    ) -> None:
+    def _walk(self, node: Node, source: str, result: ParseResult) -> None:
         """Walk the tree recursively, dispatching on node type.
 
-        Uses a *visited* set (keyed by node ``id``) to avoid processing
-        the same subtree twice — e.g. class bodies that are walked by both
-        ``_extract_class`` and the generic child recursion.
+        Each node is visited exactly once: the extractors never recurse
+        back into ``_walk``, only the single child loop below does.
         """
-        if visited is None:
-            visited = set()
-
-        node_key = node.id
-        if node_key in visited:
-            return
-        visited.add(node_key)
-
         ntype = node.type
 
         if ntype == "export_statement":
@@ -122,13 +111,15 @@ class TypeScriptParser(LanguageParser):
         elif ntype == "pair":
             self._extract_object_property_callback(node, source, result)
         elif ntype == "shorthand_property_identifier":
-            # { handleClick } is shorthand for { handleClick: handleClick }
+            # { handleClick } is shorthand for { handleClick: handleClick }.
+            # Plain data objects ({ id, name }) produce the same node type,
+            # so mark as weak — only high-confidence resolution links it.
             name = node.text.decode()
             line = node.start_point[0] + 1
-            result.calls.append(CallInfo(name=name, line=line))
+            result.calls.append(CallInfo(name=name, line=line, is_weak_ref=True))
 
         for child in node.children:
-            self._walk(child, source, result, visited)
+            self._walk(child, source, result)
 
     def _extract_export(
         self, node: Node, source: str, result: ParseResult

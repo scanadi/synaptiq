@@ -9,6 +9,7 @@ to Symbol.
 from __future__ import annotations
 
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
@@ -44,13 +45,18 @@ class FileParseData:
     parse_result: ParseResult
     content: str = ""
 
-_PARSER_CACHE: dict[str, LanguageParser] = {}
+# Parser instances are cached per (thread, language).  tree-sitter parser
+# objects are stateful and documented as single-thread-at-a-time, and
+# ``process_parsing`` calls this from a thread pool — sharing one parser
+# instance across threads would race inside the native parse call.
+_PARSER_LOCAL = threading.local()
 
 def get_parser(language: str) -> LanguageParser:
     """Return the appropriate tree-sitter parser for *language*.
 
-    Parser instances are cached per language to avoid repeated instantiation
-    of tree-sitter ``Parser`` objects.
+    Parser instances are cached per language *per thread* to avoid repeated
+    instantiation while keeping each tree-sitter ``Parser`` confined to a
+    single thread.
 
     Args:
         language: One of ``"python"``, ``"typescript"``, or ``"javascript"``.
@@ -61,7 +67,12 @@ def get_parser(language: str) -> LanguageParser:
     Raises:
         ValueError: If *language* is not supported.
     """
-    cached = _PARSER_CACHE.get(language)
+    cache: dict[str, LanguageParser] | None = getattr(_PARSER_LOCAL, "cache", None)
+    if cache is None:
+        cache = {}
+        _PARSER_LOCAL.cache = cache
+
+    cached = cache.get(language)
     if cached is not None:
         return cached
 
@@ -91,8 +102,41 @@ def get_parser(language: str) -> LanguageParser:
             f"Expected one of: python, typescript, javascript"
         )
 
-    _PARSER_CACHE[language] = parser
+    cache[language] = parser
     return parser
+
+def assign_symbol_ids(symbols: list, file_path: str) -> list[str | None]:
+    """Compute the final graph node ID for each symbol in *symbols*.
+
+    Applies the same collision handling as :func:`process_parsing` —
+    same-named duplicates get a ``#L{start_line}`` suffix — so any phase
+    that needs a symbol's node ID (e.g. decorator CALLS edges) derives
+    the exact ID the node was stored under.  Entries are ``None`` for
+    unknown kinds or unresolvable collisions.
+    """
+    seen: set[str] = set()
+    ids: list[str | None] = []
+    for symbol in symbols:
+        label = _KIND_TO_LABEL.get(symbol.kind)
+        if label is None:
+            ids.append(None)
+            continue
+
+        symbol_name = (
+            f"{symbol.class_name}.{symbol.name}"
+            if symbol.kind == "method" and symbol.class_name
+            else symbol.name
+        )
+        symbol_id = generate_id(label, file_path, symbol_name)
+        if symbol_id in seen:
+            symbol_id = generate_id(label, file_path, f"{symbol_name}#L{symbol.start_line}")
+            if symbol_id in seen:
+                ids.append(None)
+                continue
+        seen.add(symbol_id)
+        ids.append(symbol_id)
+    return ids
+
 
 def parse_file(file_path: str, content: str, language: str) -> FileParseData:
     """Parse a single file and return structured parse data.
@@ -158,6 +202,7 @@ def process_parsing(
     for file_entry, parse_data in zip(files, all_parse_data):
         file_id = generate_id(NodeLabel.FILE, file_entry.path)
         exported_names: set[str] = set(parse_data.parse_result.exports)
+        symbol_ids = assign_symbol_ids(parse_data.parse_result.symbols, file_entry.path)
 
         # Build class -> base class names for storing on class nodes.
         class_bases: dict[str, list[str]] = {}
@@ -165,9 +210,8 @@ def process_parsing(
             if kind == "extends":
                 class_bases.setdefault(cls_name, []).append(parent_name)
 
-        for symbol in parse_data.parse_result.symbols:
-            label = _KIND_TO_LABEL.get(symbol.kind)
-            if label is None:
+        for symbol, symbol_id in zip(parse_data.parse_result.symbols, symbol_ids):
+            if symbol_id is None:
                 logger.warning(
                     "Unknown symbol kind %r for %s in %s, skipping",
                     symbol.kind,
@@ -175,16 +219,7 @@ def process_parsing(
                     file_entry.path,
                 )
                 continue
-
-            # For methods, use "ClassName.method_name" as the symbol name
-            # to disambiguate methods across different classes.
-            symbol_name = (
-                f"{symbol.class_name}.{symbol.name}"
-                if symbol.kind == "method" and symbol.class_name
-                else symbol.name
-            )
-
-            symbol_id = generate_id(label, file_entry.path, symbol_name)
+            label = _KIND_TO_LABEL[symbol.kind]
 
             props: dict[str, Any] = {}
             if symbol.decorators:
