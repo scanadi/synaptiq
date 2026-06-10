@@ -1634,7 +1634,7 @@ wheels = [
 
 [[package]]
 name = "synaptiq"
-version = "0.5.13"
+version = "1.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastembed" },
