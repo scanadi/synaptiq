@@ -818,14 +818,25 @@ class _PrimaryRuntime:
             """
             import time as _time
 
-            from synaptiq.core.ingestion.pipeline import build_full_index, commit_full_index
+            from synaptiq.core.ingestion.pipeline import (
+                build_full_index,
+                commit_full_index,
+                load_previous_embeddings,
+            )
 
             start = _time.monotonic()
+            skip_embeddings = params.get("skip_embeddings", False)
+            previous = (
+                {}
+                if skip_embeddings
+                else await asyncio.to_thread(load_previous_embeddings, storage)
+            )
             graph, embeddings, result = await asyncio.to_thread(
                 build_full_index,
                 repo_path,
                 full=params.get("full", True),
-                skip_embeddings=params.get("skip_embeddings", False),
+                skip_embeddings=skip_embeddings,
+                previous_embeddings=previous,
             )
 
             async def _locked_commit() -> None:

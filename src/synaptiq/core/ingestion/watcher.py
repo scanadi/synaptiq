@@ -136,6 +136,7 @@ async def watch_repo(
         apply_reindex,
         build_full_index,
         commit_full_index,
+        load_previous_embeddings,
         parse_files,
         write_meta,
     )
@@ -158,8 +159,11 @@ async def watch_repo(
             dirty_event.clear()
             try:
                 logger.info("Running global analysis phases...")
+                # Snapshot current vectors first (plain read, no lock) so
+                # only changed symbols are re-encoded.
+                previous = await asyncio.to_thread(load_previous_embeddings, storage)
                 full_graph, embeddings, result = await asyncio.to_thread(
-                    build_full_index, repo_path
+                    build_full_index, repo_path, previous_embeddings=previous
                 )
                 if _stopped():
                     return

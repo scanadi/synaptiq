@@ -73,7 +73,7 @@ The core of Synaptiq is `src/synaptiq/core/ingestion/pipeline.py` which orchestr
 10. `processes.py` — framework-aware entry point detection + BFS flow tracing
 11. `dead_code.py` — multi-pass dead code analysis with exemptions for decorators, protocols, overrides
 12. `coupling.py` — git history co-change analysis (COUPLED_WITH edges)
-13. Embeddings (optional) — fastembed BAAI/bge-small-en-v1.5 384-dim vectors for semantic search. Skippable via `--no-embeddings` flag on `analyze`.
+13. Embeddings (optional) — fastembed BAAI/bge-small-en-v1.5 384-dim vectors for semantic search. Skippable via `--no-embeddings` flag on `analyze`. Incremental across rebuilds: vectors carry a `text_sha` of their source text, and `embed_graph(previous=...)` reuses stored vectors (snapshot via `load_previous_embeddings` BEFORE `bulk_load` wipes the DB) so only changed symbols hit ONNX — a one-file change re-encodes a handful of symbols, not all ~19k.
 
 Note: all edges are stored in a single Kuzu rel table group `CodeRelation` with the
 logical kind in its `rel_type` property — Cypher must filter on `r.rel_type`, not

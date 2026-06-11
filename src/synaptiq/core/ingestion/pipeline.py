@@ -167,6 +167,12 @@ def run_pipeline(
     report("Analyzing git history", 1.0)
 
     if storage is not None:
+        # Snapshot before bulk_load — it resets the whole database,
+        # embedding table included.
+        previous_embeddings = (
+            load_previous_embeddings(storage) if not skip_embeddings else {}
+        )
+
         report("Loading to storage", 0.0)
         storage.bulk_load(graph)
         report("Loading to storage", 1.0)
@@ -175,7 +181,7 @@ def run_pipeline(
             report("Generating embeddings", 0.0)
             from synaptiq.core.embeddings.embedder import embed_graph
 
-            embeddings = embed_graph(graph)
+            embeddings = embed_graph(graph, previous=previous_embeddings)
             if embeddings:
                 storage.store_embeddings(embeddings)
             result.embeddings = len(embeddings)
@@ -242,17 +248,40 @@ def build_graph(repo_path: Path) -> KnowledgeGraph:
 logger = logging.getLogger(__name__)
 
 
+def load_previous_embeddings(storage: StorageBackend) -> dict:
+    """Snapshot stored embeddings so unchanged symbols skip re-encoding.
+
+    Optional capability: backends without ``load_embeddings`` (or with a
+    pre-``text_sha`` schema) yield ``{}``, which falls back to encoding
+    everything.  Safe to call concurrently with readers — it is a plain
+    read and needs no lock.
+    """
+    loader = getattr(storage, "load_embeddings", None)
+    if loader is None:
+        return {}
+    try:
+        return loader() or {}
+    except Exception:
+        logger.debug("Could not load previous embeddings", exc_info=True)
+        return {}
+
+
 def build_full_index(
     repo_path: Path,
     *,
     full: bool = True,
     skip_embeddings: bool = False,
+    previous_embeddings: dict | None = None,
 ):
     """CPU phase of a full rebuild: pipeline + embeddings, no DB access.
 
     Runs WITHOUT any lock so concurrent queries keep flowing while the
     pipeline crunches.  Embedding failures (model unavailable, offline)
     degrade gracefully — the graph is still usable without fresh vectors.
+
+    *previous_embeddings* (``{node_id: (text_sha, vector)}``, from
+    :func:`load_previous_embeddings`) lets the embed step reuse vectors
+    for symbols whose text did not change.
 
     Returns ``(graph, embeddings, result)``.  Shared by the watcher's
     global phase and the server-side reindex so the build/commit split
@@ -265,7 +294,7 @@ def build_full_index(
         try:
             from synaptiq.core.embeddings.embedder import embed_graph
 
-            embeddings = embed_graph(graph)
+            embeddings = embed_graph(graph, previous=previous_embeddings)
             result.embeddings = len(embeddings)
         except Exception:
             logger.warning(

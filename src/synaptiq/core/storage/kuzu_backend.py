@@ -137,8 +137,12 @@ _VECTOR_INDEX_NAME = "embedding_vec_idx"
 
 
 def _embedding_ddl(dim: int) -> str:
-    """Embedding table column DDL for *dim*-wide vectors."""
-    return f"node_id STRING, vec FLOAT[{dim}], PRIMARY KEY(node_id)"
+    """Embedding table column DDL for *dim*-wide vectors.
+
+    ``text_sha`` records the hash of the text each vector was generated
+    from, so rebuilds can reuse vectors for unchanged symbols.
+    """
+    return f"node_id STRING, vec FLOAT[{dim}], text_sha STRING, PRIMARY KEY(node_id)"
 
 # Maximum number of read connections to keep in the pool.
 _MAX_POOL_SIZE = 8
@@ -953,8 +957,12 @@ class KuzuBackend:
                 try:
                     self._conn.execute(
                         "MERGE (e:Embedding {node_id: $nid}) "
-                        f"SET e.vec = CAST($vec AS FLOAT[{dim}])",
-                        parameters={"nid": emb.node_id, "vec": emb.embedding},
+                        f"SET e.vec = CAST($vec AS FLOAT[{dim}]), e.text_sha = $sha",
+                        parameters={
+                            "nid": emb.node_id,
+                            "vec": emb.embedding,
+                            "sha": emb.text_sha,
+                        },
                     )
                 except Exception:
                     logger.debug(
@@ -995,6 +1003,30 @@ class KuzuBackend:
             )
         except Exception:
             pass
+
+    def load_embeddings(self) -> dict[str, tuple[str, list[float]]]:
+        """Return ``{node_id: (text_sha, vector)}`` for all stored embeddings.
+
+        Snapshot taken before a full rebuild so vectors for unchanged
+        symbols are carried across instead of re-encoded.  Returns ``{}``
+        for pre-``text_sha`` schemas — the next store recreates the table
+        with the column, so the cost is one full re-encode after upgrade.
+        """
+        mapping: dict[str, tuple[str, list[float]]] = {}
+        with self._read_conn() as conn:
+            try:
+                rows = self._drain(conn.execute(
+                    "MATCH (e:Embedding) RETURN e.node_id, e.text_sha, e.vec"
+                ))
+            except Exception:
+                logger.debug(
+                    "load_embeddings failed (pre-text_sha schema?)", exc_info=True
+                )
+                return {}
+        for row in rows:
+            if row[0] and row[1] and row[2]:
+                mapping[row[0]] = (row[1], [float(v) for v in row[2]])
+        return mapping
 
     def vector_search(self, vector: list[float], limit: int) -> list[SearchResult]:
         """Find the closest nodes to *vector* via the HNSW vector index.
@@ -1317,7 +1349,8 @@ class KuzuBackend:
 
             self._csv_copy("Embedding", [
                 [emb.node_id,
-                 "[" + ",".join(str(v) for v in emb.embedding) + "]"]
+                 "[" + ",".join(str(v) for v in emb.embedding) + "]",
+                 emb.text_sha]
                 for emb in embeddings
             ])
             return True

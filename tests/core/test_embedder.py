@@ -497,3 +497,68 @@ class TestEmbedGraphBatchProcessing:
         assert embed_call.kwargs.get("batch_size") == 64 or (
             len(embed_call.args) > 1 and embed_call.args[1] == 64
         )
+
+
+class TestIncrementalReuse:
+    """embed_graph(previous=...) reuses vectors for unchanged texts."""
+
+    @patch("fastembed.TextEmbedding")
+    def test_full_reuse_never_loads_model(
+        self, mock_te_cls: MagicMock, sample_graph: KnowledgeGraph
+    ) -> None:
+        """When every text is unchanged, the ONNX model is not even created."""
+        mock_model = MagicMock()
+        mock_model.embed.return_value = iter(
+            [np.array([0.1, 0.2, 0.3]), np.array([0.4, 0.5, 0.6])]
+        )
+        mock_te_cls.return_value = mock_model
+
+        first = embed_graph(sample_graph)
+        assert all(e.text_sha for e in first)
+
+        previous = {e.node_id: (e.text_sha, e.embedding) for e in first}
+        _get_model.cache_clear()
+        mock_te_cls.reset_mock()
+
+        second = embed_graph(sample_graph, previous=previous)
+
+        mock_te_cls.assert_not_called()
+        assert {e.node_id: e.embedding for e in second} == {
+            e.node_id: e.embedding for e in first
+        }
+        assert {e.node_id: e.text_sha for e in second} == {
+            e.node_id: e.text_sha for e in first
+        }
+
+    @patch("fastembed.TextEmbedding")
+    def test_changed_text_reencodes_only_that_symbol(
+        self, mock_te_cls: MagicMock, sample_graph: KnowledgeGraph
+    ) -> None:
+        """A stale text_sha re-encodes that symbol; the rest are reused."""
+        mock_model = MagicMock()
+        mock_model.embed.return_value = iter(
+            [np.array([0.1, 0.2, 0.3]), np.array([0.4, 0.5, 0.6])]
+        )
+        mock_te_cls.return_value = mock_model
+
+        first = embed_graph(sample_graph)
+        previous = {e.node_id: (e.text_sha, e.embedding) for e in first}
+        changed_id = first[0].node_id
+        previous[changed_id] = ("stale-sha", previous[changed_id][1])
+
+        _get_model.cache_clear()
+        fresh_model = MagicMock()
+        fresh_model.embed.return_value = iter([np.array([0.7, 0.8, 0.9])])
+        mock_te_cls.reset_mock()
+        mock_te_cls.return_value = fresh_model
+
+        second = embed_graph(sample_graph, previous=previous)
+
+        # Exactly one text went through the model.
+        texts_encoded = fresh_model.embed.call_args.args[0]
+        assert len(texts_encoded) == 1
+        by_id = {e.node_id: e for e in second}
+        assert by_id[changed_id].embedding == [0.7, 0.8, 0.9]
+        assert by_id[changed_id].text_sha != "stale-sha"
+        for e in first[1:]:
+            assert by_id[e.node_id].embedding == e.embedding

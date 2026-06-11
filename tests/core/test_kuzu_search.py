@@ -234,6 +234,37 @@ class TestEmbeddingsAndVectorSearch:
         )
         assert rows and rows[0][0] == node.id
 
+    def test_load_embeddings_round_trip(self, backend: KuzuBackend) -> None:
+        """load_embeddings returns the stored (text_sha, vector) per node."""
+        node = _make_node(name="rt_func", file_path="src/rt.py")
+        backend.add_nodes([node])
+        backend.store_embeddings(
+            [NodeEmbedding(node_id=node.id, embedding=[1.0, 0.0, 0.5], text_sha="abc123")]
+        )
+
+        loaded = backend.load_embeddings()
+        assert node.id in loaded
+        sha, vec = loaded[node.id]
+        assert sha == "abc123"
+        assert vec == pytest.approx([1.0, 0.0, 0.5], abs=1e-6)
+
+    def test_load_embeddings_empty_on_legacy_schema(
+        self, backend: KuzuBackend
+    ) -> None:
+        """Pre-text_sha schemas yield {} so callers fall back to a full encode."""
+        assert backend._conn is not None
+        backend._conn.execute("DROP TABLE Embedding")
+        backend._conn.execute(
+            "CREATE NODE TABLE Embedding(node_id STRING, vec DOUBLE[], "
+            "PRIMARY KEY(node_id))"
+        )
+        backend._conn.execute(
+            "MERGE (e:Embedding {node_id: $nid}) SET e.vec = $vec",
+            parameters={"nid": "function:src/x.py:f", "vec": [1.0, 0.0]},
+        )
+
+        assert backend.load_embeddings() == {}
+
     def test_vector_search_falls_back_on_legacy_schema(
         self, backend: KuzuBackend
     ) -> None:
