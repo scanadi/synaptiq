@@ -88,7 +88,7 @@ Data stored in `.synaptiq/` directory within each indexed repo.
 
 ### Search
 
-`src/synaptiq/core/search/hybrid.py` implements BM25 + vector (384-dim BAAI/bge-small-en-v1.5 via fastembed) + fuzzy search fused with Reciprocal Rank Fusion.
+`src/synaptiq/core/search/hybrid.py` implements BM25 + vector (384-dim BAAI/bge-small-en-v1.5 via fastembed) + fuzzy search fused with Reciprocal Rank Fusion. Vector search is served by a Kuzu HNSW index (`embedding_vec_idx`, cosine metric) rebuilt by `store_embeddings`; pre-index databases (legacy `DOUBLE[]` column) fall back to a full `array_cosine_similarity` scan. The index pins the Embedding table — drop it before `DROP TABLE` or column updates.
 
 ### Resource Profiles
 

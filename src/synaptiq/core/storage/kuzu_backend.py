@@ -127,7 +127,18 @@ def deserialize_properties(raw: Any) -> dict[str, Any]:
         return {}
     return parsed if isinstance(parsed, dict) else {}
 
-_EMBEDDING_PROPERTIES = "node_id STRING, vec DOUBLE[], PRIMARY KEY(node_id)"
+# Embedding vectors use a fixed-dimension FLOAT column so Kuzu's HNSW
+# vector index can be built on them; 384 matches BAAI/bge-small-en-v1.5.
+# The bulk store path recreates the table from the actual embedding width,
+# so this constant only shapes the empty table created at schema time.
+EMBEDDING_DIM = 384
+
+_VECTOR_INDEX_NAME = "embedding_vec_idx"
+
+
+def _embedding_ddl(dim: int) -> str:
+    """Embedding table column DDL for *dim*-wide vectors."""
+    return f"node_id STRING, vec FLOAT[{dim}], PRIMARY KEY(node_id)"
 
 # Maximum number of read connections to keep in the pool.
 _MAX_POOL_SIZE = 8
@@ -924,7 +935,7 @@ class KuzuBackend:
         return candidates[:limit]
 
     def store_embeddings(self, embeddings: list[NodeEmbedding]) -> None:
-        """Persist embedding vectors into the Embedding node table.
+        """Persist embedding vectors and build the HNSW vector index.
 
         Attempts batch CSV COPY FROM first, falls back to individual MERGE.
         """
@@ -932,48 +943,77 @@ class KuzuBackend:
         if not embeddings:
             return
 
-        if self._bulk_store_embeddings_csv(embeddings):
-            return
+        # The HNSW index pins the table: DROP TABLE (bulk path) and SET on
+        # the indexed column (fallback path) both fail while it exists.
+        self._drop_vector_index()
 
-        for emb in embeddings:
-            try:
-                self._conn.execute(
-                    "MERGE (e:Embedding {node_id: $nid}) SET e.vec = $vec",
-                    parameters={"nid": emb.node_id, "vec": emb.embedding},
-                )
-            except Exception:
-                logger.debug(
-                    "store_embeddings failed for node %s", emb.node_id, exc_info=True
-                )
+        if not self._bulk_store_embeddings_csv(embeddings):
+            dim = len(embeddings[0].embedding)
+            for emb in embeddings:
+                try:
+                    self._conn.execute(
+                        "MERGE (e:Embedding {node_id: $nid}) "
+                        f"SET e.vec = CAST($vec AS FLOAT[{dim}])",
+                        parameters={"nid": emb.node_id, "vec": emb.embedding},
+                    )
+                except Exception:
+                    logger.debug(
+                        "store_embeddings failed for node %s", emb.node_id, exc_info=True
+                    )
+
+        self._create_vector_index()
+
+    def _create_vector_index(self) -> None:
+        """(Re)build the HNSW index over Embedding.vec.
+
+        Failure is non-fatal — :meth:`vector_search` falls back to a full
+        cosine-similarity scan when the index is missing.
+        """
+        assert self._conn is not None
+        try:
+            self._conn.execute("LOAD EXTENSION vector")
+        except Exception:
+            pass  # statically linked or already loaded
+        self._drop_vector_index()
+        try:
+            self._conn.execute(
+                f"CALL CREATE_VECTOR_INDEX('Embedding', '{_VECTOR_INDEX_NAME}', "
+                f"'vec', metric := 'cosine')"
+            )
+        except Exception:
+            logger.warning(
+                "Vector index creation failed — semantic search will use a full scan",
+                exc_info=True,
+            )
+
+    def _drop_vector_index(self) -> None:
+        """Drop the HNSW index if present (no-op when absent)."""
+        assert self._conn is not None
+        try:
+            self._conn.execute(
+                f"CALL DROP_VECTOR_INDEX('Embedding', '{_VECTOR_INDEX_NAME}')"
+            )
+        except Exception:
+            pass
 
     def vector_search(self, vector: list[float], limit: int) -> list[SearchResult]:
-        """Find the closest nodes to *vector* using native ``array_cosine_similarity``.
+        """Find the closest nodes to *vector* via the HNSW vector index.
 
-        Computes cosine similarity directly in KuzuDB's Cypher engine —
-        no Python-side computation or full-table load required.  Joins with
-        node tables to fetch metadata in a single query.
+        Falls back to a full ``array_cosine_similarity`` scan when the index
+        is unavailable (pre-index database or failed index build).  Joins
+        with node tables to fetch metadata in a single query.
         """
         limit = max(1, int(limit))
-        # Vector literals must be inlined — KuzuDB parameterized queries
-        # cannot distinguish DOUBLE[] from LIST for array_cosine_similarity.
+        # Vector literals must be inlined — KuzuDB cannot bind a parameter
+        # in the index-function argument position, nor distinguish DOUBLE[]
+        # from LIST for array_cosine_similarity.
         vec_literal = "[" + ", ".join(str(float(v)) for v in vector) + "]"
+        dim = len(vector)
 
         with self._read_conn() as conn:
-            try:
-                emb_raw = self._drain(conn.execute(
-                    f"MATCH (e:Embedding) "
-                    f"RETURN e.node_id, "
-                    f"array_cosine_similarity(e.vec, {vec_literal}) AS sim "
-                    f"ORDER BY sim DESC LIMIT {limit}"
-                ))
-            except Exception:
-                logger.debug("vector_search failed", exc_info=True)
-                return []
-
-            emb_rows: list[tuple[str, float]] = [
-                (row[0] or "", float(row[1]) if row[1] is not None else 0.0)
-                for row in emb_raw
-            ]
+            emb_rows = self._vector_index_query(conn, vec_literal, dim, limit)
+            if emb_rows is None:
+                emb_rows = self._vector_scan_query(conn, vec_literal, dim, limit)
             if not emb_rows:
                 return []
 
@@ -1014,6 +1054,58 @@ class KuzuBackend:
                 )
             )
         return results
+
+    @classmethod
+    def _vector_index_query(
+        cls, conn: kuzu.Connection, vec_literal: str, dim: int, limit: int
+    ) -> list[tuple[str, float]] | None:
+        """K-nearest via the HNSW index; ``None`` when the index is unavailable.
+
+        Cosine *distance* from the index is converted to similarity
+        (``1 - distance``) so scores match the full-scan fallback.
+        """
+        query = (
+            f"CALL QUERY_VECTOR_INDEX('Embedding', '{_VECTOR_INDEX_NAME}', "
+            f"CAST({vec_literal} AS FLOAT[{dim}]), {limit}) "
+            f"RETURN node.node_id, distance ORDER BY distance"
+        )
+        try:
+            rows = cls._drain(conn.execute(query))
+        except Exception:
+            logger.debug("Vector index unavailable, falling back to scan", exc_info=True)
+            return None
+        return [
+            (row[0] or "", 1.0 - float(row[1]) if row[1] is not None else 0.0)
+            for row in rows
+        ]
+
+    @classmethod
+    def _vector_scan_query(
+        cls, conn: kuzu.Connection, vec_literal: str, dim: int, limit: int
+    ) -> list[tuple[str, float]]:
+        """Full-scan cosine similarity over all embeddings.
+
+        Tries the plain literal first (matches the legacy ``DOUBLE[]``
+        column), then a ``FLOAT[dim]`` cast (new column type without an
+        index, e.g. after a failed index build).
+        """
+        for vec_expr in (vec_literal, f"CAST({vec_literal} AS FLOAT[{dim}])"):
+            query = (
+                f"MATCH (e:Embedding) "
+                f"RETURN e.node_id, "
+                f"array_cosine_similarity(e.vec, {vec_expr}) AS sim "
+                f"ORDER BY sim DESC LIMIT {limit}"
+            )
+            try:
+                rows = cls._drain(conn.execute(query))
+            except Exception:
+                logger.debug("vector scan failed for %s", vec_expr[:40], exc_info=True)
+                continue
+            return [
+                (row[0] or "", float(row[1]) if row[1] is not None else 0.0)
+                for row in rows
+            ]
+        return []
 
     def get_indexed_files(self) -> dict[str, str]:
         """Return ``{file_path: sha256(content)}`` for all File nodes."""
@@ -1215,8 +1307,12 @@ class KuzuBackend:
                 self._conn.execute("DROP TABLE Embedding")
             except Exception:
                 pass
+            # Recreate at the actual vector width so the FLOAT[dim] column
+            # (required by the HNSW index) matches whatever model produced
+            # these embeddings.
             self._conn.execute(
-                f"CREATE NODE TABLE IF NOT EXISTS Embedding({_EMBEDDING_PROPERTIES})"
+                "CREATE NODE TABLE IF NOT EXISTS "
+                f"Embedding({_embedding_ddl(len(embeddings[0].embedding))})"
             )
 
             self._csv_copy("Embedding", [
@@ -1239,6 +1335,12 @@ class KuzuBackend:
         except Exception:
             logger.debug("FTS extension load skipped (may already be loaded)", exc_info=True)
 
+        try:
+            self._conn.execute("INSTALL vector")
+            self._conn.execute("LOAD EXTENSION vector")
+        except Exception:
+            logger.debug("Vector extension load skipped (may already be loaded)", exc_info=True)
+
         for table in _NODE_TABLE_NAMES:
             stmt = f"CREATE NODE TABLE IF NOT EXISTS {table}({_NODE_PROPERTIES})"
             self._conn.execute(stmt)
@@ -1248,7 +1350,7 @@ class KuzuBackend:
         self._migrate_schema()
 
         self._conn.execute(
-            f"CREATE NODE TABLE IF NOT EXISTS Embedding({_EMBEDDING_PROPERTIES})"
+            f"CREATE NODE TABLE IF NOT EXISTS Embedding({_embedding_ddl(EMBEDDING_DIM)})"
         )
 
         # Build the REL TABLE GROUP covering all table-to-table combinations.
