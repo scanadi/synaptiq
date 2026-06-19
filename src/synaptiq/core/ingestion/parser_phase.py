@@ -34,7 +34,13 @@ _KIND_TO_LABEL: dict[str, NodeLabel] = {
     "interface": NodeLabel.INTERFACE,
     "type_alias": NodeLabel.TYPE_ALIAS,
     "enum": NodeLabel.ENUM,
+    "module": NodeLabel.MODULE,
 }
+
+# Symbol kinds that are intentionally parsed but not materialized as graph
+# nodes (no corresponding NodeLabel).  Skipped silently to avoid log noise.
+_UNMAPPED_KINDS: frozenset[str] = frozenset({"constant"})
+
 
 @dataclass
 class FileParseData:
@@ -50,6 +56,7 @@ class FileParseData:
 # ``process_parsing`` calls this from a thread pool — sharing one parser
 # instance across threads would race inside the native parse call.
 _PARSER_LOCAL = threading.local()
+
 
 def get_parser(language: str) -> LanguageParser:
     """Return the appropriate tree-sitter parser for *language*.
@@ -96,10 +103,15 @@ def get_parser(language: str) -> LanguageParser:
 
         parser = TypeScriptParser(dialect="javascript")
 
+    elif language == "ruby":
+        from synaptiq.core.parsers.ruby_lang import RubyParser
+
+        parser = RubyParser()
+
     else:
         raise ValueError(
             f"Unsupported language {language!r}. "
-            f"Expected one of: python, typescript, javascript"
+            f"Expected one of: python, typescript, javascript, ruby"
         )
 
     cache[language] = parser
@@ -164,6 +176,7 @@ def parse_file(file_path: str, content: str, language: str) -> FileParseData:
         file_path=file_path, language=language, parse_result=result, content=content
     )
 
+
 def process_parsing(
     files: list[FileEntry],
     graph: KnowledgeGraph,
@@ -212,6 +225,8 @@ def process_parsing(
 
         for symbol, symbol_id in zip(parse_data.parse_result.symbols, symbol_ids):
             if symbol_id is None:
+                if symbol.kind in _UNMAPPED_KINDS:
+                    continue
                 logger.warning(
                     "Unknown symbol kind %r for %s in %s, skipping",
                     symbol.kind,

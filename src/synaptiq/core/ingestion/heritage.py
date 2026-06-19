@@ -1,10 +1,12 @@
 """Phase 6: Heritage extraction for Synaptiq.
 
-Takes FileParseData from the parser phase and creates EXTENDS / IMPLEMENTS
-relationships between Class and Interface nodes in the knowledge graph.
+Takes FileParseData from the parser phase and creates EXTENDS / IMPLEMENTS /
+MIXES_IN relationships between Class, Interface, and Module nodes in the
+knowledge graph.
 
 Heritage tuples have the shape ``(class_name, kind, parent_name)`` where
-*kind* is either ``"extends"`` or ``"implements"``.
+*kind* is one of ``"extends"``, ``"implements"``, or ``"mixin"`` (Ruby
+``include``/``extend``/``prepend``).
 """
 
 from __future__ import annotations
@@ -22,14 +24,20 @@ from synaptiq.core.ingestion.symbol_lookup import build_name_index
 
 logger = logging.getLogger(__name__)
 
-_HERITAGE_LABELS: tuple[NodeLabel, ...] = (NodeLabel.CLASS, NodeLabel.INTERFACE)
+_HERITAGE_LABELS: tuple[NodeLabel, ...] = (
+    NodeLabel.CLASS,
+    NodeLabel.INTERFACE,
+    NodeLabel.MODULE,
+)
 
 _KIND_TO_REL: dict[str, RelType] = {
     "extends": RelType.EXTENDS,
     "implements": RelType.IMPLEMENTS,
+    "mixin": RelType.MIXES_IN,
 }
 
 _PROTOCOL_MARKERS: frozenset[str] = frozenset({"Protocol", "ABC", "ABCMeta"})
+
 
 def _resolve_node(
     name: str,
@@ -56,6 +64,7 @@ def _resolve_node(
             return nid
 
     return candidate_ids[0]
+
 
 def process_heritage(
     parse_data: list[FileParseData],
@@ -89,12 +98,8 @@ def process_heritage(
                 )
                 continue
 
-            child_id = _resolve_node(
-                class_name, fpd.file_path, symbol_index, graph
-            )
-            parent_id = _resolve_node(
-                parent_name, fpd.file_path, symbol_index, graph
-            )
+            child_id = _resolve_node(class_name, fpd.file_path, symbol_index, graph)
+            parent_id = _resolve_node(parent_name, fpd.file_path, symbol_index, graph)
 
             if child_id is None:
                 logger.debug(

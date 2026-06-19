@@ -8,6 +8,7 @@ represent end-to-end execution paths through the codebase.
 from __future__ import annotations
 
 import logging
+import re
 from collections import deque
 
 from synaptiq.core.graph.graph import KnowledgeGraph
@@ -47,9 +48,53 @@ _TS_ENTRY_SUFFIXES: tuple[str, ...] = (
 )
 
 
+# Ruby/Rails class-name suffixes whose public methods are invoked by the
+# framework (controller actions, ActiveJob#perform, ActionMailer methods).
+_RUBY_ENTRY_CLASS_SUFFIXES: tuple[str, ...] = (
+    "Controller",
+    "Job",
+    "Mailer",
+)
+
+# Ruby file-path suffixes whose methods are framework-dispatched entry points
+# (covers the same conventions when the class name is unavailable).
+_RUBY_ENTRY_FILE_SUFFIXES: tuple[str, ...] = (
+    "_controller.rb",
+    "_job.rb",
+    "_mailer.rb",
+)
+
+# Ruby files where top-level definitions are entry points even with no callers:
+# rake tasks, RSpec/Minitest specs, and the Rack/Rake bootstrap files. These
+# now route to the Ruby parser (Task 1's special-file mapping).
+_RUBY_ENTRY_FILE_HEURISTICS: tuple[str, ...] = (
+    "_spec.rb",
+    "_test.rb",
+    ".rake",
+    "config.ru",
+    "Rakefile",
+)
+
+# Sinatra / Rails inline route DSL at the start of a (possibly indented) line,
+# e.g. ``get "/users/:id" do``. Anchored to avoid matching identifiers that
+# merely end in a verb (``widget "..."`` must not match ``get "``).
+_RUBY_ROUTE_RE = re.compile(
+    r"^\s*(get|post|put|patch|delete|head|options)\s+['\"]",
+    re.MULTILINE,
+)
+
+
 def _is_ts_entry_file(file_path: str) -> bool:
     """Return ``True`` if *file_path* is a recognised TypeScript entry file."""
     return any(file_path.endswith(suffix) for suffix in _TS_ENTRY_SUFFIXES)
+
+def _is_ruby_entry_file(file_path: str) -> bool:
+    """Return ``True`` if *file_path* is a recognised Ruby entry file.
+
+    Covers rake task files, RSpec/Minitest spec/test files, and the
+    Rack/Rake bootstrap files (``config.ru``, ``Rakefile``).
+    """
+    return any(file_path.endswith(suffix) for suffix in _RUBY_ENTRY_FILE_HEURISTICS)
 
 def find_entry_points(graph: KnowledgeGraph) -> list[GraphNode]:
     """Find functions/methods that serve as execution entry points.
@@ -62,6 +107,9 @@ def find_entry_points(graph: KnowledgeGraph) -> list[GraphNode]:
       ``@app.route``, ``@router``, ``@click.command``.
     - **TypeScript**: functions named ``handler`` or ``middleware``,
       exported functions.
+    - **Ruby**: methods on ``*Controller``/``*Job``/``*Mailer`` classes,
+      Sinatra/Rails inline route handler blocks, and definitions in rake
+      task files, RSpec/Minitest specs, and ``config.ru``/``Rakefile``.
 
     Each identified entry point has its ``is_entry_point`` attribute set
     to ``True``.
@@ -107,6 +155,9 @@ def _is_entry_point(node: GraphNode, graph: KnowledgeGraph) -> bool:
     ):
         return True
 
+    if _is_ruby_entry_file(node.file_path):
+        return True
+
     return False
 
 def _matches_framework_pattern(node: GraphNode) -> bool:
@@ -130,6 +181,19 @@ def _matches_framework_pattern(node: GraphNode) -> bool:
         if name in ("handler", "middleware"):
             return True
         if node.is_exported and _is_ts_entry_file(node.file_path):
+            return True
+
+    # Ruby branch. Deliberately omits the ``""`` empty-language fallback the
+    # Python/TS branches use, so it never double-matches those files.
+    if language == "ruby" or node.file_path.endswith(".rb"):
+        # Rails controller actions, ActiveJob#perform, ActionMailer methods:
+        # public methods on these classes are dispatched by the framework.
+        if node.class_name.endswith(_RUBY_ENTRY_CLASS_SUFFIXES):
+            return True
+        if node.file_path.endswith(_RUBY_ENTRY_FILE_SUFFIXES):
+            return True
+        # Sinatra / Rails inline route handler blocks.
+        if _RUBY_ROUTE_RE.search(content):
             return True
 
     return False

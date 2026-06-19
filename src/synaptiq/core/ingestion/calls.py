@@ -80,6 +80,27 @@ _CALL_BLOCKLIST: frozenset[str] = frozenset({
     "useDebugValue", "useId", "useTransition", "useDeferredValue",
 })
 
+# Ruby Kernel / Enumerable builtins and common framework macros whose
+# definitions do not live in the user's codebase.  These are kept separate
+# from ``_CALL_BLOCKLIST`` and applied ONLY to Ruby files: many of these names
+# (``find``, ``select``, ``count``, ``merge``, ``send``, ``first``, ``sort`` …)
+# are perfectly ordinary user-defined function/method names in Python and
+# TS/JS, so blocklisting them globally would silently drop legitimate CALLS
+# edges in non-Ruby codebases.
+_RUBY_CALL_BLOCKLIST: frozenset[str] = frozenset({
+    "puts", "p", "pp", "require_relative", "autoload", "load",
+    "attr_accessor", "attr_reader", "attr_writer", "include", "prepend",
+    "raise", "fail", "throw", "catch", "loop", "lambda", "proc", "send",
+    "public_send", "respond_to?", "instance_variable_get",
+    "instance_variable_set", "define_method", "method_missing",
+    "new", "dup", "clone", "to_s", "to_sym", "to_a", "to_h", "to_i", "to_f",
+    "each", "each_with_index", "each_with_object", "select", "reject",
+    "reduce", "inject", "find", "detect", "collect", "flat_map", "sort",
+    "sort_by", "group_by", "count", "first", "last", "push", "concat",
+    "fetch", "merge", "key?", "nil?", "empty?", "blank?", "present?",
+    "freeze!", "tap", "then", "yield_self",
+})
+
 
 def _build_import_cache(
     file_path: str,
@@ -379,12 +400,20 @@ def process_calls(
     for fpd in parse_data:
         import_cache = _build_import_cache(fpd.file_path, graph)
 
+        # Ruby's Enumerable/Kernel names collide with ordinary user function
+        # names in other languages, so only fold them in for Ruby files.
+        blocklist = (
+            _CALL_BLOCKLIST | _RUBY_CALL_BLOCKLIST
+            if fpd.language == "ruby"
+            else _CALL_BLOCKLIST
+        )
+
         for call in fpd.parse_result.calls:
             # Builtin/stdlib names never resolve as call targets, but their
             # callback arguments are real references — `rows.map(formatRow)`
             # must still link formatRow or dead-code false-flags it.
             blocklisted = (
-                call.name in _CALL_BLOCKLIST and call.receiver not in ("self", "this")
+                call.name in blocklist and call.receiver not in ("self", "this")
             )
 
             source_id = find_containing_symbol(
@@ -421,7 +450,7 @@ def process_calls(
             # Callback arguments: bare identifiers passed as arguments
             # (e.g. map(transform, items), Depends(get_db)).
             for arg_name in call.arguments:
-                if arg_name in _CALL_BLOCKLIST:
+                if arg_name in blocklist:
                     continue
                 arg_call = CallInfo(name=arg_name, line=call.line)
                 arg_id, arg_conf = resolve_call(

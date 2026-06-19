@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Synaptiq is a graph-powered code intelligence engine that indexes codebases into a knowledge graph (KuzuDB) and exposes it via MCP tools for AI agents and a Typer CLI for developers. It supports Python, TypeScript, and JavaScript via tree-sitter parsing.
+Synaptiq is a graph-powered code intelligence engine that indexes codebases into a knowledge graph (KuzuDB) and exposes it via MCP tools for AI agents and a Typer CLI for developers. It supports Python, TypeScript, JavaScript, and Ruby via tree-sitter parsing.
 
 Package name: `synaptiq` (published to PyPI). Python 3.11+ required.
 
@@ -63,15 +63,15 @@ The core of Synaptiq is `src/synaptiq/core/ingestion/pipeline.py` which orchestr
 
 1. `walker.py` — file discovery respecting `.gitignore`
 2. `structure.py` — folder/file hierarchy (CONTAINS edges)
-3. `parser_phase.py` — tree-sitter AST extraction → Function/Class/Method/Interface/Enum/TypeAlias nodes
+3. `parser_phase.py` — tree-sitter AST extraction → Function/Class/Method/Module/Interface/Enum/TypeAlias nodes
 4. `imports.py` — import resolution to actual files (IMPORTS edges)
 5. `calls.py` — call tracing with confidence scores (CALLS edges, 1.0=exact, 0.8=receiver, 0.5=fuzzy)
-6. `rest_linking.py` — REST endpoint ↔ HTTP client call linking across services (CALLS edges with `rest_link`)
-7. `heritage.py` — class inheritance (EXTENDS) and interface implementation (IMPLEMENTS)
+6. `rest_linking.py` — links REST endpoints to HTTP client calls across services (Python FastAPI/Flask, TS Express/axios, Ruby Sinatra/Rails routes + HTTParty/Faraday/RestClient/Typhoeus/Net::HTTP). Per-language regex extractors live in `extract_rest_info_from_source`.
+7. `heritage.py` — class inheritance (EXTENDS), interface implementation (IMPLEMENTS), and Ruby module mixins (MIXES_IN, from `include`/`extend`/`prepend`)
 8. `types.py` — type references from params/returns/variables (USES_TYPE edges)
 9. `community.py` — Leiden algorithm clustering (MEMBER_OF edges), seeded for determinism
 10. `processes.py` — framework-aware entry point detection + BFS flow tracing
-11. `dead_code.py` — multi-pass dead code analysis with exemptions for decorators, protocols, overrides
+11. `dead_code.py` — multi-pass dead code analysis with exemptions for decorators, protocols, overrides; Ruby adds `initialize` constructors, metaprogramming hooks (`method_missing`, `inherited`, ...), `attr_*`/Rails-callback macro methods, and Rails framework base classes
 12. `coupling.py` — git history co-change analysis (COUPLED_WITH edges)
 13. Embeddings (optional) — fastembed BAAI/bge-small-en-v1.5 384-dim vectors for semantic search. Skippable via `--no-embeddings` flag on `analyze`. Incremental across rebuilds: vectors carry a `text_sha` of their source text, and `embed_graph(previous=...)` reuses stored vectors (snapshot via `load_previous_embeddings` BEFORE `bulk_load` wipes the DB) so only changed symbols hit ONNX — a one-file change re-encodes a handful of symbols, not all ~19k.
 
@@ -113,7 +113,9 @@ The `serve` command auto-detects role at startup. Design doc: `docs/plans/2026-0
 
 ### Parsers
 
-`src/synaptiq/core/parsers/` — `BaseParser` base class in `base.py`, with `python_lang.py` and `typescript.py` implementations. New language parsers extend `BaseParser` and register in `config/languages.py`.
+`src/synaptiq/core/parsers/` — `BaseParser` base class in `base.py`, with `python_lang.py`, `typescript.py`, and `ruby_lang.py` implementations. New language parsers extend `BaseParser` and register in `config/languages.py`.
+
+Ruby support recognizes `.rb`, `.rake`, `.gemspec`, `.ru`, `.rbi` extensions plus suffix-less special files (`Rakefile`, `Gemfile`, `Guardfile`, `Capfile`, `Vagrantfile`, `Brewfile`, `Podfile`) via `SPECIAL_FILENAMES`. The parser emits `module` symbols (→ `MODULE` nodes) and a heritage `kind="mixin"` for `include`/`extend`/`prepend` (→ `MIXES_IN` edges); `class A < B` stays `EXTENDS`. Plain Ruby has no type annotations, so `types.py`/`USES_TYPE` emission is out of scope (future Sorbet/RBS work).
 
 ## Code Style
 

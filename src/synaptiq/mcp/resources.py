@@ -121,6 +121,7 @@ Node Tables (use as labels in MATCH):
   - Interface  : Interface / protocol definition
   - TypeAlias  : Type alias definition
   - Enum       : Enumeration definition
+  - Module     : Module / namespace definition (e.g. Ruby module)
   - Community  : Detected community cluster (via Leiden algorithm)
   - Process    : Business process / workflow
 
@@ -145,6 +146,8 @@ Relationships — IMPORTANT:
     'imports'         : File imports another file (symbols property)
     'extends'         : Class extends another class
     'implements'      : Class implements an interface
+    'mixes_in'        : Class/module mixes in a module
+                        (Ruby include/extend/prepend)
     'member_of'       : Symbol belongs to a Community
     'step_in_process' : Symbol is a step in a Process (step_number)
     'uses_type'       : Symbol references a type (role property)

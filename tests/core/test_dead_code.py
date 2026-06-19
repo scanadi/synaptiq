@@ -899,3 +899,211 @@ class TestSkipsAliveObjectLiteralMethods:
         method_node = g.get_node(method_id)
         assert method_node is not None
         assert method_node.is_dead is True
+
+
+# ---------------------------------------------------------------------------
+# Ruby exemption tests (Task 10)
+# ---------------------------------------------------------------------------
+
+
+class TestRubyConstructorExempt:
+    """Ruby ``initialize`` is treated as a constructor and never flagged dead."""
+
+    def test_initialize_not_dead(self) -> None:
+        g = KnowledgeGraph()
+        _add_file_node(g, "app/models/user.rb")
+        node_id = _add_symbol_node(
+            g, NodeLabel.METHOD, "app/models/user.rb", "initialize",
+            class_name="User",
+        )
+
+        process_dead_code(g)
+
+        node = g.get_node(node_id)
+        assert node is not None
+        assert node.is_dead is False
+
+
+class TestRubyMetaprogrammingHooksExempt:
+    """method_missing / respond_to_missing? and friends are never flagged dead."""
+
+    @pytest.mark.parametrize(
+        "name",
+        ["method_missing", "respond_to_missing?", "const_missing", "inherited"],
+    )
+    def test_metaprogramming_hook_not_dead(self, name: str) -> None:
+        g = KnowledgeGraph()
+        _add_file_node(g, "app/models/proxy.rb")
+        node_id = _add_symbol_node(
+            g, NodeLabel.METHOD, "app/models/proxy.rb", name, class_name="Proxy"
+        )
+
+        process_dead_code(g)
+
+        node = g.get_node(node_id)
+        assert node is not None
+        assert node.is_dead is False
+
+
+class TestRubyTestFilesExempt:
+    """Symbols in *_spec.rb / *_test.rb files and spec/ dirs are not flagged."""
+
+    @pytest.mark.parametrize(
+        "file_path",
+        [
+            "spec/models/user_spec.rb",
+            "test/models/user_test.rb",
+            "app/services/foo_spec.rb",
+            "spec/support/helper.rb",
+        ],
+    )
+    def test_ruby_test_file_symbol_not_dead(self, file_path: str) -> None:
+        g = KnowledgeGraph()
+        _add_file_node(g, file_path)
+        node_id = _add_symbol_node(g, NodeLabel.FUNCTION, file_path, "build_widget")
+
+        process_dead_code(g)
+
+        node = g.get_node(node_id)
+        assert node is not None
+        assert node.is_dead is False
+
+
+class TestRubyAttrAccessorExempt:
+    """Methods generated/named by attr_* macros (recorded on the class) are exempt."""
+
+    def test_attr_accessor_method_not_dead(self) -> None:
+        g = KnowledgeGraph()
+        _add_file_node(g, "app/models/user.rb")
+        class_id = _add_symbol_node(g, NodeLabel.CLASS, "app/models/user.rb", "User")
+        cls = g.get_node(class_id)
+        assert cls is not None
+        cls.properties["decorators"] = ["attr_reader:name", "attr_accessor:email"]
+
+        name_id = _add_symbol_node(
+            g, NodeLabel.METHOD, "app/models/user.rb", "name", class_name="User"
+        )
+        email_id = _add_symbol_node(
+            g, NodeLabel.METHOD, "app/models/user.rb", "email", class_name="User"
+        )
+
+        process_dead_code(g)
+
+        assert g.get_node(name_id).is_dead is False
+        assert g.get_node(email_id).is_dead is False
+
+    def test_attr_macro_on_module_method_not_dead(self) -> None:
+        g = KnowledgeGraph()
+        _add_file_node(g, "app/models/concerns/named.rb")
+        mod_id = _add_symbol_node(
+            g, NodeLabel.MODULE, "app/models/concerns/named.rb", "Named"
+        )
+        mod = g.get_node(mod_id)
+        assert mod is not None
+        mod.properties["decorators"] = ["attr_writer:label"]
+
+        method_id = _add_symbol_node(
+            g, NodeLabel.METHOD, "app/models/concerns/named.rb", "label",
+            class_name="Named",
+        )
+
+        process_dead_code(g)
+
+        assert g.get_node(method_id).is_dead is False
+
+
+class TestRubyCallbackTargetsExempt:
+    """Methods registered as Rails callbacks (before_action, etc.) are exempt."""
+
+    def test_callback_target_method_not_dead(self) -> None:
+        g = KnowledgeGraph()
+        _add_file_node(g, "app/controllers/users_controller.rb")
+        class_id = _add_symbol_node(
+            g, NodeLabel.CLASS, "app/controllers/users_controller.rb",
+            "UsersController",
+        )
+        cls = g.get_node(class_id)
+        assert cls is not None
+        cls.properties["decorators"] = [
+            "before_action:authenticate_user",
+            "after_save:notify",
+        ]
+
+        auth_id = _add_symbol_node(
+            g, NodeLabel.METHOD, "app/controllers/users_controller.rb",
+            "authenticate_user", class_name="UsersController",
+        )
+        notify_id = _add_symbol_node(
+            g, NodeLabel.METHOD, "app/controllers/users_controller.rb",
+            "notify", class_name="UsersController",
+        )
+
+        process_dead_code(g)
+
+        assert g.get_node(auth_id).is_dead is False
+        assert g.get_node(notify_id).is_dead is False
+
+
+class TestRubyRailsModelBasesExempt:
+    """Classes extending Rails base classes are not flagged dead."""
+
+    @pytest.mark.parametrize(
+        "base_name",
+        ["ApplicationRecord", "ApplicationController", "ApplicationJob",
+         "ApplicationMailer", "Base"],
+    )
+    def test_rails_base_class_not_dead(self, base_name: str) -> None:
+        g = KnowledgeGraph()
+        _add_file_node(g, "app/models/widget.rb")
+        node_id = _add_symbol_node(g, NodeLabel.CLASS, "app/models/widget.rb", "Widget")
+        node = g.get_node(node_id)
+        assert node is not None
+        node.properties["bases"] = [base_name]
+
+        process_dead_code(g)
+
+        assert node.is_dead is False
+
+
+class TestRubyUnusedPrivateMethodStillDead:
+    """A genuinely unused private Ruby method (no macro, no caller) is flagged dead."""
+
+    def test_unused_private_method_is_dead(self) -> None:
+        g = KnowledgeGraph()
+        _add_file_node(g, "app/services/report.rb")
+        # An alive class so the alive-class pass could otherwise un-flag publics,
+        # but a leading-underscore method must remain dead.
+        class_id = _add_symbol_node(
+            g, NodeLabel.CLASS, "app/services/report.rb", "Report"
+        )
+        caller_id = _add_symbol_node(
+            g, NodeLabel.FUNCTION, "app/main.rb", "run", is_entry_point=True
+        )
+        _add_file_node(g, "app/main.rb")
+        _add_calls_relationship(g, caller_id, class_id)
+
+        method_id = _add_symbol_node(
+            g, NodeLabel.METHOD, "app/services/report.rb", "_compute_totals",
+            class_name="Report",
+        )
+
+        process_dead_code(g)
+
+        node = g.get_node(method_id)
+        assert node is not None
+        assert node.is_dead is True
+
+
+def test_ruby_macro_prefixes_stay_in_sync_with_parser():
+    """The dead-code exemption list must match the parser's recorded macros.
+
+    ``dead_code._RUBY_MACRO_PREFIXES`` is intentionally duplicated from
+    ``ruby_lang._SYMBOL_RECORDING_METHODS`` (to avoid importing the tree-sitter
+    parser into every dead-code run).  If the parser starts recording a new
+    macro and this list is not updated, those methods would be wrongly flagged
+    dead.  This test fails loudly on that drift.
+    """
+    from synaptiq.core.ingestion.dead_code import _RUBY_MACRO_PREFIXES
+    from synaptiq.core.parsers.ruby_lang import _SYMBOL_RECORDING_METHODS
+
+    assert set(_RUBY_MACRO_PREFIXES) == set(_SYMBOL_RECORDING_METHODS)

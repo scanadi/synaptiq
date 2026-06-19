@@ -49,6 +49,33 @@ def _add_function(
     return node
 
 
+def _add_method(
+    graph: KnowledgeGraph,
+    name: str,
+    *,
+    class_name: str = "",
+    file_path: str = "app/models/x.rb",
+    content: str = "",
+    language: str = "ruby",
+    is_exported: bool = False,
+) -> GraphNode:
+    """Add a METHOD node and return it."""
+    symbol = f"{class_name}.{name}" if class_name else name
+    node_id = generate_id(NodeLabel.METHOD, file_path, symbol)
+    node = GraphNode(
+        id=node_id,
+        label=NodeLabel.METHOD,
+        name=name,
+        file_path=file_path,
+        content=content,
+        language=language,
+        class_name=class_name,
+        is_exported=is_exported,
+    )
+    graph.add_node(node)
+    return node
+
+
 def _add_call(
     graph: KnowledgeGraph,
     source: GraphNode,
@@ -199,6 +226,161 @@ class TestFindEntryPointsFramework:
         entry_points = find_entry_points(g)
         ep_names = {n.name for n in entry_points}
         assert "handler" in ep_names
+
+
+# ---------------------------------------------------------------------------
+# 2b. Ruby framework entry points
+# ---------------------------------------------------------------------------
+
+
+class TestFindEntryPointsRuby:
+    """Ruby/Rails/Sinatra entry-point conventions are recognised."""
+
+    def test_rails_controller_action_by_class_name(self) -> None:
+        """A method on a *Controller class is an entry point despite callers."""
+        g = KnowledgeGraph()
+        action = _add_method(
+            g,
+            "show",
+            class_name="UsersController",
+            file_path="app/controllers/users_controller.rb",
+        )
+        # Give it an incoming call so only the framework pattern can trigger.
+        caller = _add_function(g, "dispatch", language="ruby")
+        _add_call(g, caller, action)
+
+        ep_names = {n.name for n in find_entry_points(g)}
+        assert "show" in ep_names
+
+    def test_rails_controller_action_by_filename(self) -> None:
+        """A controller action is detected via the *_controller.rb filename."""
+        g = KnowledgeGraph()
+        action = _add_method(
+            g,
+            "index",
+            class_name="",
+            file_path="app/controllers/posts_controller.rb",
+        )
+        caller = _add_function(g, "dispatch", language="ruby")
+        _add_call(g, caller, action)
+
+        ep_names = {n.name for n in find_entry_points(g)}
+        assert "index" in ep_names
+
+    def test_job_perform_is_entry_point(self) -> None:
+        """ActiveJob #perform on a *Job class is a framework entry point."""
+        g = KnowledgeGraph()
+        m = _add_method(
+            g,
+            "perform",
+            class_name="EmailJob",
+            file_path="app/jobs/email_job.rb",
+        )
+        caller = _add_function(g, "enqueue", language="ruby")
+        _add_call(g, caller, m)
+
+        ep_names = {n.name for n in find_entry_points(g)}
+        assert "perform" in ep_names
+
+    def test_sinatra_route_block_is_entry_point(self) -> None:
+        """A handler whose content is an inline route DSL is an entry point."""
+        g = KnowledgeGraph()
+        route = _add_function(
+            g,
+            "get_user",
+            file_path="app.rb",
+            language="ruby",
+            content='get "/users/:id" do\n  User.find(params[:id])\nend',
+        )
+        caller = _add_function(g, "boot", language="ruby")
+        _add_call(g, caller, route)
+
+        ep_names = {n.name for n in find_entry_points(g)}
+        assert "get_user" in ep_names
+
+    def test_rake_task_file_is_entry_point(self) -> None:
+        """A definition in a .rake file is an entry point via heuristic."""
+        g = KnowledgeGraph()
+        _add_function(g, "build", file_path="lib/tasks/build.rake", language="ruby")
+
+        ep_names = {n.name for n in find_entry_points(g)}
+        assert "build" in ep_names
+
+    def test_spec_file_definition_is_entry_point(self) -> None:
+        """A definition in a *_spec.rb file is an entry point via heuristic."""
+        g = KnowledgeGraph()
+        _add_function(
+            g, "setup_data", file_path="spec/models/user_spec.rb", language="ruby"
+        )
+
+        ep_names = {n.name for n in find_entry_points(g)}
+        assert "setup_data" in ep_names
+
+    def test_config_ru_definition_is_entry_point(self) -> None:
+        """A definition in config.ru is an entry point via heuristic."""
+        g = KnowledgeGraph()
+        _add_function(g, "run_app", file_path="config.ru", language="ruby")
+
+        ep_names = {n.name for n in find_entry_points(g)}
+        assert "run_app" in ep_names
+
+    def test_rakefile_definition_is_entry_point(self) -> None:
+        """A definition in a Rakefile is an entry point via heuristic."""
+        g = KnowledgeGraph()
+        _add_function(g, "default_task", file_path="Rakefile", language="ruby")
+
+        ep_names = {n.name for n in find_entry_points(g)}
+        assert "default_task" in ep_names
+
+    def test_plain_private_method_with_caller_not_entry_point(self) -> None:
+        """A plain method with an incoming call is NOT an entry point."""
+        g = KnowledgeGraph()
+        helper = _add_method(
+            g,
+            "calculate_total",
+            class_name="Invoice",
+            file_path="app/models/invoice.rb",
+        )
+        caller = _add_method(
+            g,
+            "total",
+            class_name="Invoice",
+            file_path="app/models/invoice.rb",
+        )
+        _add_call(g, caller, helper)
+
+        ep_names = {n.name for n in find_entry_points(g)}
+        assert "calculate_total" not in ep_names
+
+    def test_non_route_dsl_method_not_misdetected(self) -> None:
+        """A method whose body merely ends in a verb is not a route handler."""
+        g = KnowledgeGraph()
+        m = _add_method(
+            g,
+            "widget",
+            class_name="Builder",
+            file_path="app/models/builder.rb",
+            content='def widget\n  target "x"\nend',
+        )
+        caller = _add_function(g, "render", language="ruby")
+        _add_call(g, caller, m)
+
+        ep_names = {n.name for n in find_entry_points(g)}
+        assert "widget" not in ep_names
+
+    def test_plain_rb_function_without_callers_not_entry_via_heuristic(
+        self,
+    ) -> None:
+        """A regular .rb function with no callers is not an entry point.
+
+        Only special Ruby files (specs, rake, config.ru) qualify via the
+        file heuristic — ordinary library files must not.
+        """
+        g = KnowledgeGraph()
+        _add_function(g, "private_helper", file_path="lib/util.rb", language="ruby")
+
+        ep_names = {n.name for n in find_entry_points(g)}
+        assert "private_helper" not in ep_names
 
 
 # ---------------------------------------------------------------------------

@@ -29,6 +29,7 @@ class TestNodeLabel:
         "INTERFACE",
         "TYPE_ALIAS",
         "ENUM",
+        "MODULE",
         "COMMUNITY",
         "PROCESS",
     ]
@@ -43,6 +44,9 @@ class TestNodeLabel:
     def test_label_values_are_lowercase(self) -> None:
         for label in NodeLabel:
             assert label.value == label.name.lower()
+
+    def test_module_value(self) -> None:
+        assert NodeLabel.MODULE.value == "module"
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +64,7 @@ class TestRelType:
         "IMPORTS",
         "EXTENDS",
         "IMPLEMENTS",
+        "MIXES_IN",
         "MEMBER_OF",
         "STEP_IN_PROCESS",
         "USES_TYPE",
@@ -77,6 +82,9 @@ class TestRelType:
     def test_rel_type_values_are_lowercase(self) -> None:
         for rel in RelType:
             assert rel.value == rel.name.lower()
+
+    def test_mixes_in_value(self) -> None:
+        assert RelType.MIXES_IN.value == "mixes_in"
 
 
 # ---------------------------------------------------------------------------

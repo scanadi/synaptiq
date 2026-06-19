@@ -36,6 +36,11 @@ _FILE_PATHS = [
     ("lib/utils.ts", "typescript"),
     ("lib/models/user.ts", "typescript"),
     ("lib/models/index.ts", "typescript"),
+    # Ruby files
+    ("app/main.rb", "ruby"),
+    ("lib/foo.rb", "ruby"),
+    ("app/services/user_service.rb", "ruby"),
+    ("config/settings.rb", "ruby"),
 ]
 
 
@@ -232,6 +237,99 @@ class TestResolveTsExternal:
 
 
 # ---------------------------------------------------------------------------
+# resolve_import_path — Ruby
+# ---------------------------------------------------------------------------
+
+
+class TestResolveRubyRequireRelative:
+    """require_relative '../lib/foo' in app/main.rb -> lib/foo.rb."""
+
+    def test_resolve_ruby_require_relative(
+        self, file_index: dict[str, str]
+    ) -> None:
+        imp = ImportInfo(module="../lib/foo", names=[], is_relative=True)
+        result = resolve_import_path("app/main.rb", imp, file_index)
+
+        expected_id = generate_id(NodeLabel.FILE, "lib/foo.rb")
+        assert result is not None
+        assert result == expected_id
+
+    def test_resolve_ruby_require_relative_same_dir(self) -> None:
+        """require_relative './service' resolves within the same directory."""
+        g = KnowledgeGraph()
+        for path in ("app/main.rb", "app/service.rb"):
+            g.add_node(
+                GraphNode(
+                    id=generate_id(NodeLabel.FILE, path),
+                    label=NodeLabel.FILE,
+                    name=path.rsplit("/", 1)[-1],
+                    file_path=path,
+                    language="ruby",
+                )
+            )
+        index = build_file_index(g)
+
+        imp = ImportInfo(module="./service", names=[], is_relative=True)
+        result = resolve_import_path("app/main.rb", imp, index)
+
+        assert result == generate_id(NodeLabel.FILE, "app/service.rb")
+
+
+class TestResolveRubyRequire:
+    """require 'config/settings' -> config/settings.rb (project-root path)."""
+
+    def test_resolve_ruby_require_project_path(
+        self, file_index: dict[str, str]
+    ) -> None:
+        imp = ImportInfo(module="config/settings", names=[], is_relative=False)
+        result = resolve_import_path("app/main.rb", imp, file_index)
+
+        expected_id = generate_id(NodeLabel.FILE, "config/settings.rb")
+        assert result == expected_id
+
+
+class TestResolveRubyConvention:
+    """Rails autoload convention: UserService -> app/services/user_service.rb."""
+
+    def test_resolve_ruby_autoload_constant_convention(
+        self, file_index: dict[str, str]
+    ) -> None:
+        imp = ImportInfo(
+            module="user_service", names=["UserService"], is_relative=False
+        )
+        result = resolve_import_path("app/main.rb", imp, file_index)
+
+        expected_id = generate_id(NodeLabel.FILE, "app/services/user_service.rb")
+        assert result == expected_id
+
+    def test_resolve_ruby_convention_from_feature_name(
+        self, file_index: dict[str, str]
+    ) -> None:
+        """A snake_case feature without an explicit constant still resolves."""
+        imp = ImportInfo(module="user_service", names=[], is_relative=False)
+        result = resolve_import_path("app/main.rb", imp, file_index)
+
+        expected_id = generate_id(NodeLabel.FILE, "app/services/user_service.rb")
+        assert result == expected_id
+
+
+class TestResolveRubyExternal:
+    """Gem requires and missing files resolve to None."""
+
+    def test_resolve_ruby_gem_require(self, file_index: dict[str, str]) -> None:
+        imp = ImportInfo(module="rails", names=[], is_relative=False)
+        result = resolve_import_path("app/main.rb", imp, file_index)
+        assert result is None
+
+    def test_resolve_ruby_missing_relative(
+        self, file_index: dict[str, str]
+    ) -> None:
+        imp = ImportInfo(module="../lib/missing", names=[], is_relative=True)
+        result = resolve_import_path("app/main.rb", imp, file_index)
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
 # process_imports — Integration
 # ---------------------------------------------------------------------------
 
@@ -350,6 +448,33 @@ class TestProcessImportsCreatesRelationships:
 
         imports_rels = graph.get_relationships_by_type(RelType.IMPORTS)
         assert len(imports_rels) == 2
+
+    def test_process_imports_ruby_require_relative(
+        self, graph: KnowledgeGraph
+    ) -> None:
+        parse_data = [
+            FileParseData(
+                file_path="app/main.rb",
+                language="ruby",
+                parse_result=ParseResult(
+                    imports=[
+                        ImportInfo(
+                            module="../lib/foo",
+                            names=[],
+                            is_relative=True,
+                        ),
+                    ],
+                ),
+            ),
+        ]
+
+        process_imports(parse_data, graph)
+
+        imports_rels = graph.get_relationships_by_type(RelType.IMPORTS)
+        assert len(imports_rels) == 1
+        rel = imports_rels[0]
+        assert rel.source == generate_id(NodeLabel.FILE, "app/main.rb")
+        assert rel.target == generate_id(NodeLabel.FILE, "lib/foo.rb")
 
 
 class TestProcessImportsNoDuplicates:

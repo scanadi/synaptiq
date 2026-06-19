@@ -174,6 +174,51 @@ class TestGetNode:
 
 
 # ---------------------------------------------------------------------------
+# Module nodes and MIXES_IN relationships (Ruby module/mixin support)
+# ---------------------------------------------------------------------------
+
+
+class TestModuleAndMixesIn:
+    def test_module_node_round_trips(self, backend: KuzuBackend) -> None:
+        """A MODULE node persists to the auto-derived Module table."""
+        node = _make_node(
+            label=NodeLabel.MODULE,
+            file_path="lib/greetable.rb",
+            name="Greetable",
+        )
+        backend.add_nodes([node])
+
+        result = backend.get_node(node.id)
+        assert result is not None
+        assert result.label == NodeLabel.MODULE
+        assert result.name == "Greetable"
+
+        rows = backend.execute_raw("MATCH (n:Module) RETURN n.name")
+        assert rows == [["Greetable"]]
+
+    def test_mixes_in_relationship_round_trips(self, backend: KuzuBackend) -> None:
+        """A MIXES_IN edge from a class to a module persists in the REL TABLE GROUP."""
+        klass = _make_node(
+            label=NodeLabel.CLASS,
+            file_path="lib/user.rb",
+            name="User",
+        )
+        module = _make_node(
+            label=NodeLabel.MODULE,
+            file_path="lib/greetable.rb",
+            name="Greetable",
+        )
+        backend.add_nodes([klass, module])
+        backend.add_relationships([_make_rel(klass.id, module.id, rel_type=RelType.MIXES_IN)])
+
+        rows = backend.execute_raw(
+            "MATCH (c:Class)-[r:CodeRelation]->(m:Module) "
+            "WHERE r.rel_type = 'mixes_in' RETURN c.name, m.name"
+        )
+        assert rows == [["User", "Greetable"]]
+
+
+# ---------------------------------------------------------------------------
 # get_callers / get_callees
 # ---------------------------------------------------------------------------
 
