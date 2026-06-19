@@ -65,15 +65,20 @@ The core of Synaptiq is `src/synaptiq/core/ingestion/pipeline.py` which orchestr
 2. `structure.py` — folder/file hierarchy (CONTAINS edges)
 3. `parser_phase.py` — tree-sitter AST extraction → Function/Class/Method/Module/Interface/Enum/TypeAlias nodes
 4. `imports.py` — import resolution to actual files (IMPORTS edges)
-5. `calls.py` — call tracing with confidence scores (CALLS edges, 1.0=exact, 0.5=fuzzy)
+5. `calls.py` — call tracing with confidence scores (CALLS edges, 1.0=exact, 0.8=receiver, 0.5=fuzzy)
 6. `rest_linking.py` — links REST endpoints to HTTP client calls across services (Python FastAPI/Flask, TS Express/axios, Ruby Sinatra/Rails routes + HTTParty/Faraday/RestClient/Typhoeus/Net::HTTP). Per-language regex extractors live in `extract_rest_info_from_source`.
 7. `heritage.py` — class inheritance (EXTENDS), interface implementation (IMPLEMENTS), and Ruby module mixins (MIXES_IN, from `include`/`extend`/`prepend`)
 8. `types.py` — type references from params/returns/variables (USES_TYPE edges)
-9. `community.py` — Leiden algorithm clustering (MEMBER_OF edges)
+9. `community.py` — Leiden algorithm clustering (MEMBER_OF edges), seeded for determinism
 10. `processes.py` — framework-aware entry point detection + BFS flow tracing
 11. `dead_code.py` — multi-pass dead code analysis with exemptions for decorators, protocols, overrides; Ruby adds `initialize` constructors, metaprogramming hooks (`method_missing`, `inherited`, ...), `attr_*`/Rails-callback macro methods, and Rails framework base classes
 12. `coupling.py` — git history co-change analysis (COUPLED_WITH edges)
-13. Embeddings (optional) — fastembed BAAI/bge-small-en-v1.5 384-dim vectors for semantic search. Skippable via `--no-embeddings` flag on `analyze`.
+13. Embeddings (optional) — fastembed BAAI/bge-small-en-v1.5 384-dim vectors for semantic search. Skippable via `--no-embeddings` flag on `analyze`. Incremental across rebuilds: vectors carry a `text_sha` of their source text, and `embed_graph(previous=...)` reuses stored vectors (snapshot via `load_previous_embeddings` BEFORE `bulk_load` wipes the DB) so only changed symbols hit ONNX — a one-file change re-encodes a handful of symbols, not all ~19k.
+
+Note: all edges are stored in a single Kuzu rel table group `CodeRelation` with the
+logical kind in its `rel_type` property — Cypher must filter on `r.rel_type`, not
+use logical labels like `[:CALLS]`. Node `properties` dicts are persisted in the
+`properties_json` column.
 
 ### Storage Layer
 
@@ -83,7 +88,11 @@ Data stored in `.synaptiq/` directory within each indexed repo.
 
 ### Search
 
-`src/synaptiq/core/search/hybrid.py` implements BM25 + vector (384-dim BAAI/bge-small-en-v1.5 via fastembed) + fuzzy search fused with Reciprocal Rank Fusion.
+`src/synaptiq/core/search/hybrid.py` implements BM25 + vector (384-dim BAAI/bge-small-en-v1.5 via fastembed) + fuzzy search fused with Reciprocal Rank Fusion. Vector search is served by a Kuzu HNSW index (`embedding_vec_idx`, cosine metric) rebuilt by `store_embeddings`; pre-index databases (legacy `DOUBLE[]` column) fall back to a full `array_cosine_similarity` scan. The index pins the Embedding table — drop it before `DROP TABLE` or column updates.
+
+### Resource Profiles
+
+`src/synaptiq/core/resources.py` defines role-aware engine limits. Long-running daemons (`serve`, `mcp`, `watch`) call `set_profile("server")` at entry and get strict caps: Kuzu task-scheduler threads `max(2, cores//4)`, 512 MB buffer pool, capped ONNX embedding threads. One-shot CLI commands (`analyze`, `query`, ...) keep library defaults (all cores, Kuzu's default buffer pool). `KuzuBackend.initialize()` and the embedders read `current_limits()` at creation time — set the profile before creating either. Env overrides: `SYNAPTIQ_KUZU_THREADS`, `SYNAPTIQ_KUZU_MEMORY_MB`, `SYNAPTIQ_EMBED_THREADS`.
 
 ### Multi-Instance Concurrency
 

@@ -108,6 +108,12 @@ sed -i '' "s/^version = \"$CURRENT\"/version = \"$NEW_VERSION\"/" "$PYPROJECT"
 
 sed -i '' "s/__version__ = \"$CURRENT\"/__version__ = \"$NEW_VERSION\"/" "$INIT_PY"
 
+# ── Sync uv.lock with the new version ─────────────────────────────────────────
+# The lockfile records the project's own version; without this the next
+# `uv run` rewrites it, dirtying the tree and blocking the following release.
+
+(cd "$ROOT" && uv lock --quiet)
+
 # ── Verify updates ──────────────────────────────────────────────────────────
 
 echo ""
@@ -118,7 +124,7 @@ grep -n "__version__" "$INIT_PY"
 # ── Commit, tag, push ───────────────────────────────────────────────────────
 
 echo ""
-git -C "$ROOT" add "$PYPROJECT" "$INIT_PY"
+git -C "$ROOT" add "$PYPROJECT" "$INIT_PY" "$ROOT/uv.lock"
 git -C "$ROOT" commit -m "chore: bump version to $NEW_VERSION"
 git -C "$ROOT" tag -a "$TAG" -m "Release $NEW_VERSION"
 

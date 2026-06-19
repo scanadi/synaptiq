@@ -110,6 +110,36 @@ def generate_label(graph: KnowledgeGraph, member_ids: list[str]) -> str:
     label = f"{most_common[0][0]}+{most_common[1][0]}"
     return label.capitalize()
 
+def _all_community_cohesions(
+    ig_graph: ig.Graph,
+    membership: list[int],
+) -> dict[int, float]:
+    """Compute per-community cohesion scores in ``[0.0, 1.0]`` in ONE edge pass.
+
+    Cohesion is the fraction of edges incident to a community's vertices
+    that are *internal* (both endpoints inside it).  1.0 means fully
+    self-contained; values near 0 mean the members mostly talk to other
+    communities.  A single pass over the edge list keeps this O(edges)
+    instead of O(edges × communities).
+    """
+    internal: dict[int, int] = {}
+    incident: dict[int, int] = {}
+    for src, tgt in ig_graph.get_edgelist():
+        src_comm = membership[src]
+        tgt_comm = membership[tgt]
+        incident[src_comm] = incident.get(src_comm, 0) + 1
+        if tgt_comm == src_comm:
+            internal[src_comm] = internal.get(src_comm, 0) + 1
+        else:
+            incident[tgt_comm] = incident.get(tgt_comm, 0) + 1
+
+    return {
+        comm: internal.get(comm, 0) / count
+        for comm, count in incident.items()
+        if count > 0
+    }
+
+
 def process_communities(
     graph: KnowledgeGraph,
     min_community_size: int = 2,
@@ -141,10 +171,14 @@ def process_communities(
         )
         return 0
 
+    # Fixed seed keeps partitions deterministic across runs — without it,
+    # `synaptiq diff` reports phantom community churn between identical trees.
     partition = leidenalg.find_partition(
-        ig_graph, leidenalg.ModularityVertexPartition
+        ig_graph, leidenalg.ModularityVertexPartition, seed=42
     )
-    modularity_score = partition.modularity
+
+    membership = partition.membership
+    cohesions = _all_community_cohesions(ig_graph, membership)
 
     community_count = 0
     for i, members in enumerate(partition):
@@ -155,13 +189,14 @@ def process_communities(
 
         community_id = generate_id(NodeLabel.COMMUNITY, f"community_{i}")
         label = generate_label(graph, member_ids)
+        cohesion = cohesions.get(i, 0.0)
 
         community_node = GraphNode(
             id=community_id,
             label=NodeLabel.COMMUNITY,
             name=label,
             properties={
-                "cohesion": modularity_score,
+                "cohesion": cohesion,
                 "symbol_count": len(member_ids),
             },
         )
@@ -180,11 +215,11 @@ def process_communities(
 
         community_count += 1
         logger.info(
-            "Community %d: %r with %d members (modularity=%.3f)",
+            "Community %d: %r with %d members (cohesion=%.3f)",
             i,
             label,
             len(member_ids),
-            modularity_score,
+            cohesion,
         )
 
     logger.info(

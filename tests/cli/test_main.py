@@ -15,6 +15,13 @@ from synaptiq.cli.main import app
 runner = CliRunner()
 
 
+@pytest.fixture(autouse=True)
+def _no_running_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep CLI tests hermetic: a real `synaptiq serve` running in the
+    developer's cwd must not capture the commands under test."""
+    monkeypatch.setattr("synaptiq.cli.main._healthy_server_socket", lambda _d: None)
+
+
 class TestVersion:
     """Tests for the --version flag."""
 
@@ -179,7 +186,7 @@ class TestQuery:
         mock_storage = MagicMock()
         with patch("synaptiq.cli.main._load_storage", return_value=mock_storage):
             with patch(
-                "synaptiq.mcp.tools.handle_query",
+                "synaptiq.mcp.server.handle_query",
                 return_value="1. MyClass (Class) -- src/main.py",
             ):
                 result = runner.invoke(app, ["query", "find classes"])
@@ -203,7 +210,7 @@ class TestContext:
         mock_storage = MagicMock()
         with patch("synaptiq.cli.main._load_storage", return_value=mock_storage):
             with patch(
-                "synaptiq.mcp.tools.handle_context",
+                "synaptiq.mcp.server.handle_context",
                 return_value="Symbol: MyClass (Class)\nFile: src/main.py:1-50",
             ):
                 result = runner.invoke(app, ["context", "MyClass"])
@@ -227,7 +234,7 @@ class TestImpact:
         mock_storage = MagicMock()
         with patch("synaptiq.cli.main._load_storage", return_value=mock_storage):
             with patch(
-                "synaptiq.mcp.tools.handle_impact",
+                "synaptiq.mcp.server.handle_impact",
                 return_value="Impact analysis for: MyClass.method",
             ):
                 result = runner.invoke(app, ["impact", "MyClass.method", "--depth", "5"])
@@ -240,7 +247,7 @@ class TestImpact:
         mock_storage = MagicMock()
         with patch("synaptiq.cli.main._load_storage", return_value=mock_storage):
             with patch(
-                "synaptiq.mcp.tools.handle_impact",
+                "synaptiq.mcp.server.handle_impact",
                 return_value="Impact analysis for: foo",
             ):
                 result = runner.invoke(app, ["impact", "foo"])
@@ -263,7 +270,7 @@ class TestDeadCode:
         mock_storage = MagicMock()
         with patch("synaptiq.cli.main._load_storage", return_value=mock_storage):
             with patch(
-                "synaptiq.mcp.tools.handle_dead_code",
+                "synaptiq.mcp.server.handle_dead_code",
                 return_value="No dead code detected.",
             ):
                 result = runner.invoke(app, ["dead-code"])
@@ -287,7 +294,7 @@ class TestCypher:
         mock_storage = MagicMock()
         with patch("synaptiq.cli.main._load_storage", return_value=mock_storage):
             with patch(
-                "synaptiq.mcp.tools.handle_cypher",
+                "synaptiq.mcp.server.handle_cypher",
                 return_value="Results (3 rows):\n\n  1. foo",
             ):
                 result = runner.invoke(app, ["cypher", "MATCH (n) RETURN n"])

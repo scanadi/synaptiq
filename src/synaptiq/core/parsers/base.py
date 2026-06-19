@@ -40,6 +40,10 @@ class CallInfo:
     line: int
     receiver: str = ""  # for method calls: the object (e.g., "self", "user")
     arguments: list[str] = field(default_factory=list)  # bare identifier arguments (callbacks)
+    # Weak references (e.g. object-literal shorthand `{ handleClick }`) only
+    # produce CALLS edges when resolved with high confidence — a global
+    # fuzzy match on such a name is almost always noise.
+    is_weak_ref: bool = False
 
 @dataclass
 class TypeRef:

@@ -21,17 +21,40 @@ import asyncio
 import json
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+from synaptiq.core.daemon.socket_server import DISPATCH_TIMEOUT, WRITE_DISPATCH_TIMEOUT
+
+if TYPE_CHECKING:
+    from synaptiq.core.daemon.lock import LockInfo
 
 logger = logging.getLogger(__name__)
 
-# Timeout for individual requests (seconds).
-REQUEST_TIMEOUT = 60.0
-REINDEX_TIMEOUT = 600.0
+# Client-side timeouts derive from the server's dispatch budgets so the
+# server always times out first and the client relays its error instead of
+# abandoning an in-flight request.  Anyone changing the server constants
+# keeps this invariant automatically.
+REQUEST_TIMEOUT = DISPATCH_TIMEOUT + 10.0
+REINDEX_TIMEOUT = WRITE_DISPATCH_TIMEOUT + 10.0
 
 # Reconnection settings.
 MAX_RECONNECT_ATTEMPTS = 3
 RECONNECT_DELAY = 0.5
+
+# StreamReader buffer limit for responses.  asyncio's default is 64KB and
+# a single line-delimited JSON response easily exceeds that (tool responses
+# can run hundreds of KB) — overflowing the limit kills the connection.
+SOCKET_READ_LIMIT = 16 * 1024 * 1024
+
+
+class PrimaryPromotedError(ConnectionError):
+    """The primary daemon is gone and this process promoted itself.
+
+    Raised instead of a plain reconnect failure so callers holding a
+    proxy reference know to dispatch locally from now on.
+    """
 
 
 class SocketClient:
@@ -39,16 +62,44 @@ class SocketClient:
 
     Supports concurrent requests via request-ID multiplexing and
     automatic reconnection on broken connections.
+
+    Parameters
+    ----------
+    socket_path:
+        Unix socket of the primary daemon.
+    lock_reader:
+        Optional callable returning the current :class:`LockInfo` (or
+        ``None``).  When reconnection to the cached socket path fails,
+        the lock file is consulted: a healthy lock with a different
+        socket means the primary moved (follow it); a missing or stale
+        lock means the primary died.
+    on_primary_lost:
+        Optional async callback invoked when the primary is gone for
+        good.  Should attempt takeover and return ``True`` when this
+        process successfully promoted itself to primary.
     """
 
-    def __init__(self, socket_path: Path) -> None:
+    def __init__(
+        self,
+        socket_path: Path,
+        *,
+        lock_reader: Callable[[], "LockInfo | None"] | None = None,
+        on_primary_lost: Callable[[], Awaitable[bool]] | None = None,
+    ) -> None:
         self._socket_path = socket_path
+        self._lock_reader = lock_reader
+        self._on_primary_lost = on_primary_lost
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         # Pending responses keyed by request ID.
         self._pending: dict[str, asyncio.Future[dict]] = {}
         # Lock to serialize writes (reads are demuxed by the reader task).
         self._write_lock = asyncio.Lock()
+        # Serializes reconnection: when the read loop fails every pending
+        # future at once, all waiters try to reconnect — without the lock
+        # each teardown would close the connection another waiter just
+        # opened.
+        self._reconnect_lock = asyncio.Lock()
         # Background task that reads responses and dispatches to futures.
         self._reader_task: asyncio.Task | None = None
 
@@ -64,6 +115,7 @@ class SocketClient:
         try:
             self._reader, self._writer = await asyncio.open_unix_connection(
                 str(self._socket_path),
+                limit=SOCKET_READ_LIMIT,
             )
         except (OSError, ConnectionRefusedError) as exc:
             raise ConnectionError(
@@ -146,25 +198,90 @@ class SocketClient:
     # ------------------------------------------------------------------
 
     async def _reconnect(self) -> None:
-        """Attempt to reconnect to the primary daemon."""
-        await self._teardown()
+        """Attempt to reconnect to the primary daemon (serialized).
 
-        for attempt in range(MAX_RECONNECT_ATTEMPTS):
+        Concurrent waiters queue on the lock; whoever arrives after a
+        successful reconnect sees a healthy connection and returns
+        immediately instead of tearing it down again.
+        """
+        async with self._reconnect_lock:
+            if (
+                self._writer is not None
+                and not self._writer.is_closing()
+                and self._reader_task is not None
+                and not self._reader_task.done()
+            ):
+                return  # another waiter already reconnected
+
+            await self._teardown()
+
+            for attempt in range(MAX_RECONNECT_ATTEMPTS):
+                try:
+                    self._reader, self._writer = await asyncio.open_unix_connection(
+                        str(self._socket_path),
+                        limit=SOCKET_READ_LIMIT,
+                    )
+                    self._reader_task = asyncio.create_task(self._read_loop())
+                    logger.info("Reconnected to primary daemon (attempt %d)", attempt + 1)
+                    return
+                except (OSError, ConnectionRefusedError):
+                    if attempt < MAX_RECONNECT_ATTEMPTS - 1:
+                        await asyncio.sleep(RECONNECT_DELAY * (attempt + 1))
+
+            if await self._recover_from_lock():
+                return
+
+            raise ConnectionError(
+                f"Failed to reconnect to {self._socket_path} "
+                f"after {MAX_RECONNECT_ATTEMPTS} attempts"
+            )
+
+    async def _recover_from_lock(self) -> bool:
+        """Recover after exhausting reconnects to the cached socket path.
+
+        Consults the lock file: a healthy lock pointing at a *different*
+        socket means the primary restarted elsewhere — follow it.  A
+        missing or stale lock means the primary died; invoke the
+        ``on_primary_lost`` callback so the owner can take over.
+
+        Returns ``True`` when reconnected to a moved primary.  Raises
+        :class:`PrimaryPromotedError` when the callback promoted this
+        process.  Returns ``False`` when no recovery was possible.
+        """
+        if self._lock_reader is None:
+            return False
+
+        try:
+            info = self._lock_reader()
+        except Exception:
+            logger.exception("Lock read failed during reconnect recovery")
+            return False
+
+        if info is not None and not info.is_stale():
+            new_path = Path(info.socket)
+            if new_path == self._socket_path:
+                # Primary claims to be alive on the path we already tried —
+                # nothing to recover; let the caller surface the failure.
+                return False
             try:
                 self._reader, self._writer = await asyncio.open_unix_connection(
-                    str(self._socket_path),
+                    str(new_path),
+                    limit=SOCKET_READ_LIMIT,
                 )
-                self._reader_task = asyncio.create_task(self._read_loop())
-                logger.info("Reconnected to primary daemon (attempt %d)", attempt + 1)
-                return
             except (OSError, ConnectionRefusedError):
-                if attempt < MAX_RECONNECT_ATTEMPTS - 1:
-                    await asyncio.sleep(RECONNECT_DELAY * (attempt + 1))
+                return False
+            self._socket_path = new_path
+            self._reader_task = asyncio.create_task(self._read_loop())
+            logger.info("Primary moved — followed lock file to %s", new_path)
+            return True
 
-        raise ConnectionError(
-            f"Failed to reconnect to {self._socket_path} "
-            f"after {MAX_RECONNECT_ATTEMPTS} attempts"
-        )
+        if self._on_primary_lost is not None:
+            if await self._on_primary_lost():
+                logger.info("Primary lost — this instance promoted itself")
+                raise PrimaryPromotedError(
+                    "Primary daemon is gone; this instance promoted itself to primary"
+                )
+        return False
 
     # ------------------------------------------------------------------
     # Low-level request/response
@@ -213,6 +330,8 @@ class SocketClient:
                 try:
                     await self._reconnect()
                     continue
+                except PrimaryPromotedError:
+                    raise
                 except ConnectionError:
                     raise ConnectionError(f"Connection lost: {exc}") from exc
 
@@ -221,6 +340,25 @@ class SocketClient:
             except asyncio.TimeoutError:
                 self._pending.pop(req_id, None)
                 raise
+            except ConnectionError as exc:
+                # Connection dropped between write and response.  The server
+                # may already be EXECUTING the request, so re-sending could
+                # double-run a non-idempotent method (reindex, forget) —
+                # reconnect so future requests work, but surface the error.
+                self._pending.pop(req_id, None)
+                logger.warning("Connection lost mid-request: %s", exc)
+                try:
+                    await self._reconnect()
+                except PrimaryPromotedError:
+                    # The old primary died mid-request taking the in-flight
+                    # work with it; the caller re-dispatches locally.
+                    raise
+                except ConnectionError:
+                    pass
+                raise ConnectionError(
+                    f"Connection lost while awaiting response (the request may "
+                    f"or may not have executed): {exc}"
+                ) from exc
 
             if "error" in response:
                 raise RuntimeError(response["error"]["message"])
@@ -246,6 +384,10 @@ class SocketClient:
         """Forward a resource read to the primary daemon."""
         return await self._request("resource", {"uri": uri})
 
-    async def reindex(self, *, full: bool = True) -> str:
+    async def reindex(self, *, full: bool = True, skip_embeddings: bool = False) -> str:
         """Request a full reindex from the primary daemon."""
-        return await self._request("reindex", {"full": full}, timeout=REINDEX_TIMEOUT)
+        return await self._request(
+            "reindex",
+            {"full": full, "skip_embeddings": skip_embeddings},
+            timeout=REINDEX_TIMEOUT,
+        )

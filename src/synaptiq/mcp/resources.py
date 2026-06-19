@@ -112,7 +112,7 @@ def get_schema() -> str:
     return """Synaptiq Knowledge Graph Schema
 ========================================
 
-Node Labels:
+Node Tables (use as labels in MATCH):
   - File       : Source file in the repository
   - Folder     : Directory in the repository
   - Function   : Top-level function definition
@@ -125,23 +125,35 @@ Node Labels:
   - Community  : Detected community cluster (via Leiden algorithm)
   - Process    : Business process / workflow
 
-Common Node Properties:
-  id, name, file_path, start_line, end_line, content,
-  signature, language, class_name, is_dead, is_entry_point, is_exported
+Node Properties (every table):
+  id, name, file_path, start_line, end_line, content, signature,
+  language, class_name, is_dead, is_entry_point, is_exported,
+  properties_json (JSON string with extra data, e.g. community
+  cohesion/symbol_count, decorators, base classes)
 
-Relationship Types:
-  - CONTAINS      : Folder/File contains a symbol
-  - DEFINES       : File defines a symbol
-  - CALLS         : Symbol calls another symbol
-  - IMPORTS       : File/symbol imports another
-  - EXTENDS       : Class extends another class
-  - IMPLEMENTS    : Class implements an interface
-  - MIXES_IN      : Class/module mixes in a module (Ruby include/extend/prepend)
-  - MEMBER_OF     : Symbol belongs to a community
-  - STEP_IN_PROCESS : Symbol is a step in a process
-  - USES_TYPE     : Symbol references a type
-  - EXPORTS       : Module exports a symbol
-  - COUPLED_WITH  : Temporal coupling between symbols
+Relationships — IMPORTANT:
+  ALL edges live in a single relationship table named `CodeRelation`.
+  The logical edge kind is stored in its `rel_type` property.
+  There are NO relationship tables named CALLS, IMPORTS, MEMBER_OF, etc.
+
+  Correct:   MATCH (a)-[r:CodeRelation]->(b) WHERE r.rel_type = 'calls'
+  Incorrect: MATCH (a)-[:CALLS]->(b)          -- binder error
+
+  rel_type values:
+    'contains'        : Folder contains folder/file
+    'defines'         : File defines a symbol
+    'calls'           : Symbol calls another symbol (confidence 0.0-1.0)
+    'imports'         : File imports another file (symbols property)
+    'extends'         : Class extends another class
+    'implements'      : Class implements an interface
+    'mixes_in'        : Class/module mixes in a module
+                        (Ruby include/extend/prepend)
+    'member_of'       : Symbol belongs to a Community
+    'step_in_process' : Symbol is a step in a Process (step_number)
+    'uses_type'       : Symbol references a type (role property)
+    'coupled_with'    : Temporal coupling between Files (strength,
+                        co_changes). Stored in ONE direction — match
+                        undirected: (a)-[r:CodeRelation]-(b)
 
 Relationship Properties:
   rel_type, confidence, role, step_number, strength, co_changes, symbols
@@ -149,4 +161,15 @@ Relationship Properties:
 ID Format:
   {label}:{file_path}:{symbol_name}
   Example: function:src/auth.py:validate_user
+
+Example Queries:
+  // Who calls validate_user?
+  MATCH (caller)-[r:CodeRelation]->(callee:Function)
+  WHERE callee.name = 'validate_user' AND r.rel_type = 'calls'
+  RETURN caller.name, caller.file_path
+
+  // Files coupled with src/auth.py
+  MATCH (a:File)-[r:CodeRelation]-(b:File)
+  WHERE a.file_path = 'src/auth.py' AND r.rel_type = 'coupled_with'
+  RETURN b.file_path, r.strength
 """

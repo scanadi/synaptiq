@@ -47,6 +47,23 @@ _BUILTIN_TYPES: frozenset[str] = frozenset(
     }
 )
 
+# Wrapper nodes that can occupy the `function` field of a call_expression.
+# When explicit type arguments are present, the grammar resolves the
+# `await fn<T>(x)` vs `await fn < T > (x)` ambiguity by binding the unary
+# operator to the callee: call_expression(function: await_expression(fn),
+# type_arguments, arguments).  Unwrap these to reach the real callee —
+# otherwise generic awaited calls produce no CALLS edge and their targets
+# get false-flagged as dead code.
+_CALLEE_WRAPPERS: frozenset[str] = frozenset(
+    {
+        "await_expression",
+        "parenthesized_expression",
+        "non_null_expression",
+        "as_expression",
+        "satisfies_expression",
+    }
+)
+
 class TypeScriptParser(LanguageParser):
     """Parse TypeScript, TSX, or JavaScript files via tree-sitter.
 
@@ -72,23 +89,12 @@ class TypeScriptParser(LanguageParser):
         self._walk(tree.root_node, content, result)
         return result
 
-    def _walk(
-        self, node: Node, source: str, result: ParseResult, visited: set[int] | None = None
-    ) -> None:
+    def _walk(self, node: Node, source: str, result: ParseResult) -> None:
         """Walk the tree recursively, dispatching on node type.
 
-        Uses a *visited* set (keyed by node ``id``) to avoid processing
-        the same subtree twice — e.g. class bodies that are walked by both
-        ``_extract_class`` and the generic child recursion.
+        Each node is visited exactly once: the extractors never recurse
+        back into ``_walk``, only the single child loop below does.
         """
-        if visited is None:
-            visited = set()
-
-        node_key = node.id
-        if node_key in visited:
-            return
-        visited.add(node_key)
-
         ntype = node.type
 
         if ntype == "export_statement":
@@ -122,13 +128,15 @@ class TypeScriptParser(LanguageParser):
         elif ntype == "pair":
             self._extract_object_property_callback(node, source, result)
         elif ntype == "shorthand_property_identifier":
-            # { handleClick } is shorthand for { handleClick: handleClick }
+            # { handleClick } is shorthand for { handleClick: handleClick }.
+            # Plain data objects ({ id, name }) produce the same node type,
+            # so mark as weak — only high-confidence resolution links it.
             name = node.text.decode()
             line = node.start_point[0] + 1
-            result.calls.append(CallInfo(name=name, line=line))
+            result.calls.append(CallInfo(name=name, line=line, is_weak_ref=True))
 
         for child in node.children:
-            self._walk(child, source, result, visited)
+            self._walk(child, source, result)
 
     def _extract_export(
         self, node: Node, source: str, result: ParseResult
@@ -518,6 +526,11 @@ class TypeScriptParser(LanguageParser):
 
     def _extract_call(self, node: Node, source: str, result: ParseResult) -> None:
         func_node = node.child_by_field_name("function")
+        if func_node is None:
+            return
+
+        while func_node is not None and func_node.type in _CALLEE_WRAPPERS:
+            func_node = func_node.named_child(0)
         if func_node is None:
             return
 

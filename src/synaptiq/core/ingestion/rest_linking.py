@@ -306,8 +306,13 @@ def process_rest_linking(
 
     for hc, call_file in all_http_calls:
         for ep, ep_file in all_endpoints:
-            # Method must match (or be generic).
-            if hc.http_method != ep.http_method and hc.http_method not in ("get",):
+            # HTTP method must match. A "get" call is treated as ambiguous
+            # (fetch() defaults to GET even when options specify another
+            # method, which the regex does not capture) and may match any
+            # endpoint — but without the method bonus.
+            if hc.http_method != ep.http_method:
+                if hc.http_method != "get":
+                    continue
                 method_bonus = 0.0
             else:
                 method_bonus = 0.1
@@ -364,7 +369,7 @@ def _detect_language(file_path: str) -> str | None:
         return "python"
     if file_path.endswith((".ts", ".tsx")):
         return "typescript"
-    if file_path.endswith((".js", ".jsx")):
+    if file_path.endswith((".js", ".jsx", ".mjs", ".cjs")):
         return "javascript"
     if file_path.endswith((".rb", ".rake", ".ru", ".gemspec", ".rbi")):
         return "ruby"

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import json
 import logging
 import shutil
 import tempfile
@@ -59,8 +60,23 @@ _NODE_PROPERTIES = (
     "is_dead BOOL, "
     "is_entry_point BOOL, "
     "is_exported BOOL, "
+    "properties_json STRING, "
     "PRIMARY KEY (id)"
 )
+
+# Column order used by every node SELECT — must match _NODE_PROPERTIES.
+# Explicit column lists (instead of ``RETURN n.*``) keep row decoding
+# independent of Kuzu's internal property ordering.
+_NODE_COLUMN_NAMES: tuple[str, ...] = (
+    "id", "name", "file_path", "start_line", "end_line", "content",
+    "signature", "language", "class_name", "is_dead", "is_entry_point",
+    "is_exported", "properties_json",
+)
+
+
+def _node_columns(alias: str) -> str:
+    """Return the explicit node column list for *alias* (e.g. ``n.id, n.name, ...``)."""
+    return ", ".join(f"{alias}.{c}" for c in _NODE_COLUMN_NAMES)
 
 _REL_PROPERTIES = (
     "rel_type STRING, "
@@ -73,13 +89,12 @@ _REL_PROPERTIES = (
 )
 
 def _escape(value: str) -> str:
-    """Escape a string for safe inclusion in a Cypher literal."""
+    """Escape a string for inclusion in a Cypher literal.
+
+    Internal only — used for FTS/fuzzy search literals that Kuzu cannot
+    parameterize. Everything else must use parameterized queries.
+    """
     return value.replace("\\", "\\\\").replace("'", "\\'")
-
-
-def escape_cypher(value: str) -> str:
-    """Public alias for escaping strings in Cypher queries."""
-    return _escape(value)
 
 
 def _table_for_id(node_id: str) -> str | None:
@@ -87,10 +102,94 @@ def _table_for_id(node_id: str) -> str | None:
     prefix = node_id.split(":", 1)[0]
     return _LABEL_TO_TABLE.get(prefix)
 
-_EMBEDDING_PROPERTIES = "node_id STRING, vec DOUBLE[], PRIMARY KEY(node_id)"
+
+def _serialize_properties(properties: dict[str, Any] | None) -> str:
+    """Serialize a node's properties dict to JSON for storage ('' when empty)."""
+    if not properties:
+        return ""
+    try:
+        return json.dumps(properties, default=str)
+    except (TypeError, ValueError):
+        return ""
+
+
+def deserialize_properties(raw: Any) -> dict[str, Any]:
+    """Parse a stored ``properties_json`` value back into a dict.
+
+    Shared by row hydration here and by tool handlers that read the
+    column via raw Cypher — one parser for one format.
+    """
+    if not raw or not isinstance(raw, str):
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+# Embedding vectors use a fixed-dimension FLOAT column so Kuzu's HNSW
+# vector index can be built on them; 384 matches BAAI/bge-small-en-v1.5.
+# The bulk store path recreates the table from the actual embedding width,
+# so this constant only shapes the empty table created at schema time.
+EMBEDDING_DIM = 384
+
+_VECTOR_INDEX_NAME = "embedding_vec_idx"
+
+
+def _embedding_ddl(dim: int) -> str:
+    """Embedding table column DDL for *dim*-wide vectors.
+
+    ``text_sha`` records the hash of the text each vector was generated
+    from, so rebuilds can reuse vectors for unchanged symbols.
+    """
+    return f"node_id STRING, vec FLOAT[{dim}], text_sha STRING, PRIMARY KEY(node_id)"
 
 # Maximum number of read connections to keep in the pool.
 _MAX_POOL_SIZE = 8
+
+
+def open_with_recovery(
+    db_path: Path,
+    meta_path: Path | None = None,
+    *,
+    read_only: bool = False,
+) -> KuzuBackend:
+    """Open a KuzuBackend at *db_path*, rebuilding on corruption.
+
+    A corrupted database (e.g. duplicate primary key from a mid-write kill)
+    is deleted along with *meta_path* so the next index run rebuilds
+    cleanly.  In read-write mode the empty database is re-initialised; in
+    read-only mode a bare (uninitialised) backend is returned since there
+    is nothing left to open.
+
+    Non-corruption errors (e.g. the database is locked by another
+    process) propagate unchanged.
+    """
+    storage = KuzuBackend()
+    try:
+        storage.initialize(db_path, read_only=read_only)
+        return storage
+    except RuntimeError as exc:
+        msg = str(exc).lower()
+        if "primary key" not in msg and "corrupt" not in msg:
+            raise
+
+    logger.warning("Corrupted index detected, removing %s", db_path)
+    storage.close()
+    if db_path.is_dir():
+        shutil.rmtree(db_path, ignore_errors=True)
+    else:
+        db_path.unlink(missing_ok=True)
+        # Clean up WAL/shadow files left alongside a file-based DB.
+        for suffix in (".wal", ".shadow"):
+            db_path.with_suffix(suffix).unlink(missing_ok=True)
+    if meta_path is not None:
+        meta_path.unlink(missing_ok=True)
+
+    storage = KuzuBackend()
+    if not read_only:
+        storage.initialize(db_path)
+    return storage
 
 
 class KuzuBackend:
@@ -109,9 +208,26 @@ class KuzuBackend:
         self._db: kuzu.Database | None = None
         self._conn: kuzu.Connection | None = None
         self._db_path: Path | None = None
-        # Thread-safe pool of read connections.
-        self._read_pool: list[kuzu.Connection] = []
+        # Thread-safe pool of read connections, tagged with the database
+        # generation they were created against.  The generation increments
+        # on every (re)initialize so connections bound to a closed/deleted
+        # database are never handed out again.
+        self._read_pool: list[tuple[int, kuzu.Connection]] = []
         self._pool_lock = threading.Lock()
+        self._generation = 0
+        # In-flight read tracking so destructive operations (_reset_database)
+        # can drain readers that outlived their dispatch timeout.
+        self._reads_cv = threading.Condition()
+        self._active_reads = 0
+
+    @property
+    def generation(self) -> int:
+        """Monotonic counter bumped on every (re)initialize.
+
+        Cache key for data derived from the graph (e.g. the PageRank
+        projection): a bump means the underlying data may have changed.
+        """
+        return self._generation
 
     def initialize(self, path: Path, *, read_only: bool = False) -> None:
         """Open or create the KuzuDB database at *path* and set up the schema.
@@ -121,69 +237,193 @@ class KuzuBackend:
             read_only: If ``True``, open the database in read-only mode.
                 This allows multiple concurrent readers (e.g. MCP server
                 instances) without lock conflicts.  Schema creation is
-                skipped since the database must already exist.
+                skipped since the database must already exist — but the
+                schema is verified so a database created by an older
+                synaptiq fails loudly instead of silently returning
+                empty results for every query.
         """
+        from synaptiq.core.resources import current_limits
+
+        limits = current_limits()
         self._db_path = path
-        self._db = kuzu.Database(str(path), read_only=read_only)
+        # 0 for either cap means Kuzu's library default (all cores /
+        # default buffer pool) — the interactive profile resolves to that.
+        self._db = kuzu.Database(
+            str(path),
+            read_only=read_only,
+            max_num_threads=limits.kuzu_threads,
+            buffer_pool_size=limits.kuzu_buffer_bytes,
+        )
         self._conn = kuzu.Connection(self._db)
+        with self._pool_lock:
+            self._generation += 1
         if not read_only:
             self._create_schema()
+        else:
+            self._verify_schema()
+
+    def _table_columns(self, table: str) -> set[str] | None:
+        """Return the column names of *table*, or ``None`` if it doesn't exist."""
+        assert self._conn is not None
+        try:
+            rows = self._drain(self._conn.execute(f"CALL TABLE_INFO('{table}') RETURN *"))
+        except Exception:
+            return None
+        return {row[1] for row in rows}
+
+    def _migrate_schema(self) -> None:
+        """Add columns introduced after an existing database was created.
+
+        ``CREATE NODE TABLE IF NOT EXISTS`` is a no-op for pre-existing
+        tables, so without this step every node SELECT on an upgraded
+        index would binder-error on the missing column — and those errors
+        are swallowed at debug level, surfacing as 'symbol not found'.
+        """
+        assert self._conn is not None
+        for table in _NODE_TABLE_NAMES:
+            cols = self._table_columns(table)
+            if cols is None:
+                continue
+            for column, col_type in (("properties_json", "STRING"),):
+                if column not in cols:
+                    logger.info("Migrating table %s: adding column %s", table, column)
+                    try:
+                        self._conn.execute(f"ALTER TABLE {table} ADD {column} {col_type}")
+                    except Exception:
+                        logger.warning(
+                            "Schema migration failed for %s.%s", table, column, exc_info=True
+                        )
+
+    def _verify_schema(self) -> None:
+        """Raise a clear error when a read-only database has an old schema."""
+        cols = self._table_columns(_NODE_TABLE_NAMES[0])
+        if cols is not None and "properties_json" not in cols:
+            raise RuntimeError(
+                "This index was created by an older synaptiq version and "
+                "cannot be migrated in read-only mode. Run `synaptiq analyze` "
+                "to rebuild it."
+            )
+
+    @staticmethod
+    def _close_quietly(obj: object) -> None:
+        """Call ``close()`` on a Kuzu object, ignoring errors."""
+        try:
+            obj.close()  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
     def close(self) -> None:
         """Release all connections and the database handle.
 
-        Explicitly deletes connection and database objects to ensure
-        KuzuDB releases file locks and flushes data.
+        Uses the explicit ``close()`` methods on Kuzu connections and the
+        database so file locks are released and data is flushed
+        deterministically (not at GC time).
         """
-        # Close pooled read connections first.
         with self._pool_lock:
-            for conn in self._read_pool:
-                try:
-                    del conn
-                except Exception:
-                    pass
-            self._read_pool.clear()
+            pool = self._read_pool
+            self._read_pool = []
+            self._generation += 1
+        for _gen, conn in pool:
+            self._close_quietly(conn)
 
         if self._conn is not None:
-            try:
-                del self._conn
-            except Exception:
-                pass
+            self._close_quietly(self._conn)
             self._conn = None
         if self._db is not None:
-            try:
-                del self._db
-            except Exception:
-                pass
+            self._close_quietly(self._db)
             self._db = None
 
     # ------------------------------------------------------------------
     # Connection pool for concurrent reads
     # ------------------------------------------------------------------
 
-    def _acquire_read_conn(self) -> kuzu.Connection:
-        """Get a connection from the pool or create a new one (thread-safe)."""
-        with self._pool_lock:
-            if self._read_pool:
-                return self._read_pool.pop()
-        assert self._db is not None, "Backend not initialized"
-        return kuzu.Connection(self._db)
+    def _acquire_read_conn(self) -> tuple[int, kuzu.Connection]:
+        """Get a pooled connection or create a new one (thread-safe).
 
-    def _release_read_conn(self, conn: kuzu.Connection) -> None:
-        """Return a connection to the pool."""
+        Returns ``(generation, connection)``; the generation is passed back
+        on release so stale connections are closed instead of re-pooled.
+        """
         with self._pool_lock:
-            if len(self._read_pool) < _MAX_POOL_SIZE:
-                self._read_pool.append(conn)
-            # else: let it be GC'd
+            while self._read_pool:
+                gen, conn = self._read_pool.pop()
+                if gen == self._generation:
+                    return gen, conn
+                self._close_quietly(conn)
+            gen = self._generation
+            db = self._db
+        if db is None:
+            raise RuntimeError(
+                "No database open — the index is missing or was removed. "
+                "Run `synaptiq analyze` first."
+            )
+        return gen, kuzu.Connection(db)
+
+    def _release_read_conn(self, gen: int, conn: kuzu.Connection) -> None:
+        """Return a connection to the pool, or close it if stale."""
+        with self._pool_lock:
+            if gen == self._generation and len(self._read_pool) < _MAX_POOL_SIZE:
+                self._read_pool.append((gen, conn))
+                return
+        self._close_quietly(conn)
 
     @contextmanager
     def _read_conn(self) -> Iterator[kuzu.Connection]:
-        """Context manager for read connections from the pool."""
-        conn = self._acquire_read_conn()
+        """Context manager for read connections from the pool.
+
+        Tracks in-flight reads so :meth:`_reset_database` can wait for
+        stragglers before deleting database files out from under them.
+        The counter is incremented BEFORE acquiring the connection — a
+        reader inside connection creation must already be visible to
+        the drain, or the reset could delete files under it.
+        """
+        with self._reads_cv:
+            self._active_reads += 1
         try:
-            yield conn
+            gen, conn = self._acquire_read_conn()
+            try:
+                yield conn
+            finally:
+                self._release_read_conn(gen, conn)
         finally:
-            self._release_read_conn(conn)
+            with self._reads_cv:
+                self._active_reads -= 1
+                self._reads_cv.notify_all()
+
+    def _wait_for_readers(self, timeout: float = 30.0) -> bool:
+        """Block until no reads are in flight, or *timeout* elapses.
+
+        Returns ``True`` when the read count reached zero.  Used before
+        destructive operations: a read whose ``asyncio.wait_for`` dispatch
+        timed out keeps running in its thread even after the caller released
+        the RW lock, so the lock alone does not guarantee quiescence.
+        """
+        with self._reads_cv:
+            ok = self._reads_cv.wait_for(lambda: self._active_reads == 0, timeout=timeout)
+        if not ok:
+            logger.warning(
+                "Proceeding with database reset while %d read(s) still in flight",
+                self._active_reads,
+            )
+        return ok
+
+    @staticmethod
+    def _drain(result: Any) -> list[list[Any]]:
+        """Materialize all rows from a QueryResult and close it.
+
+        QueryResults hold native resources tied to their connection; closing
+        them eagerly keeps pooled connections reusable and lets ``close()``
+        release the database deterministically.
+        """
+        rows: list[list[Any]] = []
+        try:
+            while result.has_next():
+                rows.append(result.get_next())
+        finally:
+            try:
+                result.close()
+            except Exception:
+                pass
+        return rows
 
     # ------------------------------------------------------------------
     # Write operations (use self._conn — must be externally serialized)
@@ -202,6 +442,9 @@ class KuzuBackend:
     def remove_nodes_by_file(self, file_path: str) -> int:
         """Delete all nodes whose ``file_path`` matches across every table.
 
+        Also removes embedding rows for the file's symbols so vector search
+        does not return ghost results pointing at deleted nodes.
+
         Returns:
             Always 0 — exact count is not tracked for performance.
         """
@@ -214,6 +457,16 @@ class KuzuBackend:
                 )
             except Exception:
                 logger.debug("Failed to remove nodes from table %s", table, exc_info=True)
+
+        # Embedding node_ids have the form ``label:file_path:symbol``; the
+        # path segment is delimited by colons and paths contain no colons.
+        try:
+            self._conn.execute(
+                "MATCH (e:Embedding) WHERE e.node_id CONTAINS $pat DELETE e",
+                parameters={"pat": f":{file_path}:"},
+            )
+        except Exception:
+            logger.debug("Failed to remove embeddings for %s", file_path, exc_info=True)
         return 0
 
     # ------------------------------------------------------------------
@@ -226,13 +479,12 @@ class KuzuBackend:
         if table is None:
             return None
 
-        query = f"MATCH (n:{table}) WHERE n.id = $nid RETURN n.*"
+        query = f"MATCH (n:{table}) WHERE n.id = $nid RETURN {_node_columns('n')}"
         with self._read_conn() as conn:
             try:
-                result = conn.execute(query, parameters={"nid": node_id})
-                if result.has_next():
-                    row = result.get_next()
-                    return self._row_to_node(row, node_id)
+                rows = self._drain(conn.execute(query, parameters={"nid": node_id}))
+                if rows:
+                    return self._row_to_node(rows[0], node_id)
             except Exception:
                 logger.debug("get_node failed for %s", node_id, exc_info=True)
         return None
@@ -246,7 +498,7 @@ class KuzuBackend:
         query = (
             f"MATCH (caller)-[r:CodeRelation]->(callee:{table}) "
             f"WHERE callee.id = $nid AND r.rel_type = 'calls' "
-            f"RETURN caller.*"
+            f"RETURN {_node_columns('caller')}"
         )
         return self._query_nodes(query, parameters={"nid": node_id})
 
@@ -259,7 +511,7 @@ class KuzuBackend:
         query = (
             f"MATCH (caller:{table})-[r:CodeRelation]->(callee) "
             f"WHERE caller.id = $nid AND r.rel_type = 'calls' "
-            f"RETURN callee.*"
+            f"RETURN {_node_columns('callee')}"
         )
         return self._query_nodes(query, parameters={"nid": node_id})
 
@@ -272,7 +524,7 @@ class KuzuBackend:
         query = (
             f"MATCH (src:{table})-[r:CodeRelation]->(tgt) "
             f"WHERE src.id = $nid AND r.rel_type = 'uses_type' "
-            f"RETURN tgt.*"
+            f"RETURN {_node_columns('tgt')}"
         )
         return self._query_nodes(query, parameters={"nid": node_id})
 
@@ -335,18 +587,16 @@ class KuzuBackend:
                 query = (
                     f"MATCH (caller)-[r:CodeRelation]->(callee:{table}) "
                     f"WHERE callee.id IN $ids AND r.rel_type = 'calls' "
-                    f"RETURN caller.*"
+                    f"RETURN {_node_columns('caller')}"
                 )
             else:
                 query = (
                     f"MATCH (caller:{table})-[r:CodeRelation]->(callee) "
                     f"WHERE caller.id IN $ids AND r.rel_type = 'calls' "
-                    f"RETURN callee.*"
+                    f"RETURN {_node_columns('callee')}"
                 )
             try:
-                result = conn.execute(query, parameters={"ids": ids})
-                while result.has_next():
-                    row = result.get_next()
+                for row in self._drain(conn.execute(query, parameters={"ids": ids})):
                     node = self._row_to_node(row)
                     if node is not None:
                         nodes.append(node)
@@ -396,18 +646,20 @@ class KuzuBackend:
                 query = (
                     f"MATCH (caller:{src_table})-[r:CodeRelation]->(callee:{table}) "
                     f"WHERE callee.id = $nid AND r.rel_type = 'calls' "
-                    f"RETURN caller.*, r.confidence"
+                    f"RETURN {_node_columns('caller')}, r.confidence"
                 )
                 try:
-                    result = conn.execute(query, parameters={"nid": node_id})
-                    while result.has_next():
-                        row = result.get_next()
+                    for row in self._drain(conn.execute(query, parameters={"nid": node_id})):
                         conf = float(row[-1]) if row[-1] is not None else 1.0
                         node = self._row_to_node(row[:-1])
                         if node is not None:
                             results.append((node, conf))
                 except Exception:
-                    pass
+                    logger.debug(
+                        "get_callers_with_confidence failed on table %s",
+                        src_table,
+                        exc_info=True,
+                    )
         return results
 
     def get_callees_with_confidence(self, node_id: str) -> list[tuple[GraphNode, float]]:
@@ -422,18 +674,20 @@ class KuzuBackend:
                 query = (
                     f"MATCH (caller:{table})-[r:CodeRelation]->(callee:{tgt_table}) "
                     f"WHERE caller.id = $nid AND r.rel_type = 'calls' "
-                    f"RETURN callee.*, r.confidence"
+                    f"RETURN {_node_columns('callee')}, r.confidence"
                 )
                 try:
-                    result = conn.execute(query, parameters={"nid": node_id})
-                    while result.has_next():
-                        row = result.get_next()
+                    for row in self._drain(conn.execute(query, parameters={"nid": node_id})):
                         conf = float(row[-1]) if row[-1] is not None else 1.0
                         node = self._row_to_node(row[:-1])
                         if node is not None:
                             results.append((node, conf))
                 except Exception:
-                    pass
+                    logger.debug(
+                        "get_callees_with_confidence failed on table %s",
+                        tgt_table,
+                        exc_info=True,
+                    )
         return results
 
     def get_process_memberships(self, node_ids: list[str]) -> dict[str, str]:
@@ -453,69 +707,71 @@ class KuzuBackend:
                     f"RETURN n.id, p.name"
                 )
                 try:
-                    result = conn.execute(query, parameters={"ids": ids})
-                    while result.has_next():
-                        row = result.get_next()
+                    for row in self._drain(conn.execute(query, parameters={"ids": ids})):
                         if row[0] and row[1]:
                             mapping[row[0]] = row[1]
                 except Exception:
-                    pass
+                    logger.debug(
+                        "get_process_memberships failed on table %s", table, exc_info=True
+                    )
         return mapping
 
     def load_graph(self) -> KnowledgeGraph:
         """Load the full graph into an in-memory KnowledgeGraph."""
+        from synaptiq.core.graph.model import RelType as RelTypeEnum
+
         graph = KnowledgeGraph()
         with self._read_conn() as conn:
             for table in _NODE_TABLE_NAMES:
                 try:
-                    result = conn.execute(f"MATCH (n:{table}) RETURN n.*")
-                    while result.has_next():
-                        row = result.get_next()
+                    rows = self._drain(
+                        conn.execute(f"MATCH (n:{table}) RETURN {_node_columns('n')}")
+                    )
+                    for row in rows:
                         node = self._row_to_node(row)
                         if node is not None:
                             graph.add_node(node)
                 except Exception:
                     logger.debug("load_graph: failed to load %s nodes", table, exc_info=True)
 
-            for src_table in _NODE_TABLE_NAMES:
-                for dst_table in _NODE_TABLE_NAMES:
-                    try:
-                        result = conn.execute(
-                            f"MATCH (a:{src_table})-[r:CodeRelation]->(b:{dst_table}) "
-                            f"RETURN a.id, b.id, r.rel_type, r.confidence, r.symbols, "
-                            f"r.strength, r.co_changes, r.step_number, r.role"
-                        )
-                        while result.has_next():
-                            row = result.get_next()
-                            from synaptiq.core.graph.model import RelType as RelTypeEnum
-                            rel_type_str = row[2] or "calls"
-                            try:
-                                rel_type = RelTypeEnum(rel_type_str)
-                            except ValueError:
-                                continue
-                            rel_id = f"{rel_type_str}:{row[0]}->{row[1]}"
-                            props: dict[str, Any] = {}
-                            if row[3] is not None:
-                                props["confidence"] = float(row[3])
-                            if row[4]:
-                                props["symbols"] = str(row[4])
-                            if row[5] is not None:
-                                props["strength"] = float(row[5])
-                            if row[6] is not None:
-                                props["co_changes"] = int(row[6])
-                            if row[7] is not None:
-                                props["step_number"] = int(row[7])
-                            if row[8]:
-                                props["role"] = str(row[8])
-                            graph.add_relationship(GraphRelationship(
-                                id=rel_id,
-                                type=rel_type,
-                                source=row[0],
-                                target=row[1],
-                                properties=props,
-                            ))
-                    except Exception:
-                        pass
+            # One label-less query covers every table pair in the rel group.
+            try:
+                rel_rows = self._drain(conn.execute(
+                    "MATCH (a)-[r:CodeRelation]->(b) "
+                    "RETURN a.id, b.id, r.rel_type, r.confidence, r.symbols, "
+                    "r.strength, r.co_changes, r.step_number, r.role"
+                ))
+            except Exception:
+                logger.debug("load_graph: relationship query failed", exc_info=True)
+                rel_rows = []
+
+            for row in rel_rows:
+                rel_type_str = row[2] or "calls"
+                try:
+                    rel_type = RelTypeEnum(rel_type_str)
+                except ValueError:
+                    continue
+                rel_id = f"{rel_type_str}:{row[0]}->{row[1]}"
+                props: dict[str, Any] = {}
+                if row[3] is not None:
+                    props["confidence"] = float(row[3])
+                if row[4]:
+                    props["symbols"] = str(row[4])
+                if row[5] is not None:
+                    props["strength"] = float(row[5])
+                if row[6] is not None:
+                    props["co_changes"] = int(row[6])
+                if row[7] is not None:
+                    props["step_number"] = int(row[7])
+                if row[8]:
+                    props["role"] = str(row[8])
+                graph.add_relationship(GraphRelationship(
+                    id=rel_id,
+                    type=rel_type,
+                    source=row[0],
+                    target=row[1],
+                    properties=props,
+                ))
         return graph
 
     def execute_raw(
@@ -529,11 +785,7 @@ class KuzuBackend:
             parameters: Optional parameter dict for parameterized queries.
         """
         with self._read_conn() as conn:
-            result = conn.execute(query, parameters=parameters or {})
-            rows: list[list[Any]] = []
-            while result.has_next():
-                rows.append(result.get_next())
-            return rows
+            return self._drain(conn.execute(query, parameters=parameters or {}))
 
     def exact_name_search(self, name: str, limit: int = 5) -> list[SearchResult]:
         """Search for nodes with an exact name match across all searchable tables.
@@ -541,6 +793,7 @@ class KuzuBackend:
         Returns results sorted by label priority (functions/methods first),
         preferring source files over test files.
         """
+        limit = max(1, int(limit))
         candidates: list[SearchResult] = []
 
         with self._read_conn() as conn:
@@ -551,9 +804,7 @@ class KuzuBackend:
                     f"LIMIT {limit}"
                 )
                 try:
-                    result = conn.execute(cypher, parameters={"name": name})
-                    while result.has_next():
-                        row = result.get_next()
+                    for row in self._drain(conn.execute(cypher, parameters={"name": name})):
                         node_id = row[0] or ""
                         node_name = row[1] or ""
                         file_path = row[2] or ""
@@ -587,6 +838,7 @@ class KuzuBackend:
 
         Returns the top *limit* results sorted by score descending.
         """
+        limit = max(1, int(limit))
         escaped_q = _escape(query)
         candidates: list[SearchResult] = []
 
@@ -600,9 +852,7 @@ class KuzuBackend:
                     f"ORDER BY score DESC LIMIT {limit}"
                 )
                 try:
-                    result = conn.execute(cypher)
-                    while result.has_next():
-                        row = result.get_next()
+                    for row in self._drain(conn.execute(cypher)):
                         node_id = row[0] or ""
                         name = row[1] or ""
                         file_path = row[2] or ""
@@ -647,6 +897,8 @@ class KuzuBackend:
         *max_distance* edits of *query*.  Converts edit distance to a
         score (0 edits = 1.0, *max_distance* edits = 0.3).
         """
+        limit = max(1, int(limit))
+        max_distance = int(max_distance)
         escaped_q = _escape(query.lower())
         candidates: list[SearchResult] = []
 
@@ -660,9 +912,7 @@ class KuzuBackend:
                     f"ORDER BY dist LIMIT {limit}"
                 )
                 try:
-                    result = conn.execute(cypher)
-                    while result.has_next():
-                        row = result.get_next()
+                    for row in self._drain(conn.execute(cypher)):
                         node_id = row[0] or ""
                         name = row[1] or ""
                         file_path = row[2] or ""
@@ -689,7 +939,7 @@ class KuzuBackend:
         return candidates[:limit]
 
     def store_embeddings(self, embeddings: list[NodeEmbedding]) -> None:
-        """Persist embedding vectors into the Embedding node table.
+        """Persist embedding vectors and build the HNSW vector index.
 
         Attempts batch CSV COPY FROM first, falls back to individual MERGE.
         """
@@ -697,48 +947,105 @@ class KuzuBackend:
         if not embeddings:
             return
 
-        if self._bulk_store_embeddings_csv(embeddings):
-            return
+        # The HNSW index pins the table: DROP TABLE (bulk path) and SET on
+        # the indexed column (fallback path) both fail while it exists.
+        self._drop_vector_index()
 
-        for emb in embeddings:
-            try:
-                self._conn.execute(
-                    "MERGE (e:Embedding {node_id: $nid}) SET e.vec = $vec",
-                    parameters={"nid": emb.node_id, "vec": emb.embedding},
-                )
-            except Exception:
-                logger.debug(
-                    "store_embeddings failed for node %s", emb.node_id, exc_info=True
-                )
+        if not self._bulk_store_embeddings_csv(embeddings):
+            dim = len(embeddings[0].embedding)
+            for emb in embeddings:
+                try:
+                    self._conn.execute(
+                        "MERGE (e:Embedding {node_id: $nid}) "
+                        f"SET e.vec = CAST($vec AS FLOAT[{dim}]), e.text_sha = $sha",
+                        parameters={
+                            "nid": emb.node_id,
+                            "vec": emb.embedding,
+                            "sha": emb.text_sha,
+                        },
+                    )
+                except Exception:
+                    logger.debug(
+                        "store_embeddings failed for node %s", emb.node_id, exc_info=True
+                    )
 
-    def vector_search(self, vector: list[float], limit: int) -> list[SearchResult]:
-        """Find the closest nodes to *vector* using native ``array_cosine_similarity``.
+        self._create_vector_index()
 
-        Computes cosine similarity directly in KuzuDB's Cypher engine —
-        no Python-side computation or full-table load required.  Joins with
-        node tables to fetch metadata in a single query.
+    def _create_vector_index(self) -> None:
+        """(Re)build the HNSW index over Embedding.vec.
+
+        Failure is non-fatal — :meth:`vector_search` falls back to a full
+        cosine-similarity scan when the index is missing.
         """
-        # Vector literals must be inlined — KuzuDB parameterized queries
-        # cannot distinguish DOUBLE[] from LIST for array_cosine_similarity.
-        vec_literal = "[" + ", ".join(str(v) for v in vector) + "]"
+        assert self._conn is not None
+        try:
+            self._conn.execute("LOAD EXTENSION vector")
+        except Exception:
+            pass  # statically linked or already loaded
+        self._drop_vector_index()
+        try:
+            self._conn.execute(
+                f"CALL CREATE_VECTOR_INDEX('Embedding', '{_VECTOR_INDEX_NAME}', "
+                f"'vec', metric := 'cosine')"
+            )
+        except Exception:
+            logger.warning(
+                "Vector index creation failed — semantic search will use a full scan",
+                exc_info=True,
+            )
 
+    def _drop_vector_index(self) -> None:
+        """Drop the HNSW index if present (no-op when absent)."""
+        assert self._conn is not None
+        try:
+            self._conn.execute(
+                f"CALL DROP_VECTOR_INDEX('Embedding', '{_VECTOR_INDEX_NAME}')"
+            )
+        except Exception:
+            pass
+
+    def load_embeddings(self) -> dict[str, tuple[str, list[float]]]:
+        """Return ``{node_id: (text_sha, vector)}`` for all stored embeddings.
+
+        Snapshot taken before a full rebuild so vectors for unchanged
+        symbols are carried across instead of re-encoded.  Returns ``{}``
+        for pre-``text_sha`` schemas — the next store recreates the table
+        with the column, so the cost is one full re-encode after upgrade.
+        """
+        mapping: dict[str, tuple[str, list[float]]] = {}
         with self._read_conn() as conn:
             try:
-                result = conn.execute(
-                    f"MATCH (e:Embedding) "
-                    f"RETURN e.node_id, "
-                    f"array_cosine_similarity(e.vec, {vec_literal}) AS sim "
-                    f"ORDER BY sim DESC LIMIT {limit}"
-                )
+                rows = self._drain(conn.execute(
+                    "MATCH (e:Embedding) RETURN e.node_id, e.text_sha, e.vec"
+                ))
             except Exception:
-                logger.debug("vector_search failed", exc_info=True)
-                return []
+                logger.debug(
+                    "load_embeddings failed (pre-text_sha schema?)", exc_info=True
+                )
+                return {}
+        for row in rows:
+            if row[0] and row[1] and row[2]:
+                mapping[row[0]] = (row[1], [float(v) for v in row[2]])
+        return mapping
 
-            emb_rows: list[tuple[str, float]] = []
-            while result.has_next():
-                row = result.get_next()
-                emb_rows.append((row[0] or "", float(row[1]) if row[1] is not None else 0.0))
+    def vector_search(self, vector: list[float], limit: int) -> list[SearchResult]:
+        """Find the closest nodes to *vector* via the HNSW vector index.
 
+        Falls back to a full ``array_cosine_similarity`` scan when the index
+        is unavailable (pre-index database or failed index build).  Joins
+        with node tables to fetch metadata in a single query.
+        """
+        limit = max(1, int(limit))
+        # Vector literals must be inlined — KuzuDB cannot bind a parameter
+        # in the index-function argument position, nor distinguish DOUBLE[]
+        # from LIST for array_cosine_similarity.
+        vec_literal = "[" + ", ".join(str(float(v)) for v in vector) + "]"
+        dim = len(vector)
+
+        with self._read_conn() as conn:
+            emb_rows = self._vector_index_query(conn, vec_literal, dim, limit)
+            if emb_rows is None:
+                emb_rows = self._vector_scan_query(conn, vec_literal, dim, limit)
             if not emb_rows:
                 return []
 
@@ -752,10 +1059,8 @@ class KuzuBackend:
 
             for table, ids in ids_by_table.items():
                 try:
-                    q = f"MATCH (n:{table}) WHERE n.id IN $ids RETURN n.*"
-                    res = conn.execute(q, parameters={"ids": ids})
-                    while res.has_next():
-                        row = res.get_next()
+                    q = f"MATCH (n:{table}) WHERE n.id IN $ids RETURN {_node_columns('n')}"
+                    for row in self._drain(conn.execute(q, parameters={"ids": ids})):
                         node = self._row_to_node(row)
                         if node:
                             node_cache[node.id] = node
@@ -765,29 +1070,84 @@ class KuzuBackend:
         results: list[SearchResult] = []
         for node_id, sim in emb_rows:
             node = node_cache.get(node_id)
+            if node is None:
+                # Orphaned embedding — its node was deleted. Skip rather than
+                # returning a ghost result with empty metadata.
+                continue
             label_prefix = node_id.split(":", 1)[0] if node_id else ""
             results.append(
                 SearchResult(
                     node_id=node_id,
                     score=sim,
-                    node_name=node.name if node else "",
-                    file_path=node.file_path if node else "",
+                    node_name=node.name,
+                    file_path=node.file_path,
                     label=label_prefix,
-                    snippet=(node.content[:200] if node and node.content else ""),
+                    snippet=(node.content[:200] if node.content else ""),
                 )
             )
         return results
+
+    @classmethod
+    def _vector_index_query(
+        cls, conn: kuzu.Connection, vec_literal: str, dim: int, limit: int
+    ) -> list[tuple[str, float]] | None:
+        """K-nearest via the HNSW index; ``None`` when the index is unavailable.
+
+        Cosine *distance* from the index is converted to similarity
+        (``1 - distance``) so scores match the full-scan fallback.
+        """
+        query = (
+            f"CALL QUERY_VECTOR_INDEX('Embedding', '{_VECTOR_INDEX_NAME}', "
+            f"CAST({vec_literal} AS FLOAT[{dim}]), {limit}) "
+            f"RETURN node.node_id, distance ORDER BY distance"
+        )
+        try:
+            rows = cls._drain(conn.execute(query))
+        except Exception:
+            logger.debug("Vector index unavailable, falling back to scan", exc_info=True)
+            return None
+        return [
+            (row[0] or "", 1.0 - float(row[1]) if row[1] is not None else 0.0)
+            for row in rows
+        ]
+
+    @classmethod
+    def _vector_scan_query(
+        cls, conn: kuzu.Connection, vec_literal: str, dim: int, limit: int
+    ) -> list[tuple[str, float]]:
+        """Full-scan cosine similarity over all embeddings.
+
+        Tries the plain literal first (matches the legacy ``DOUBLE[]``
+        column), then a ``FLOAT[dim]`` cast (new column type without an
+        index, e.g. after a failed index build).
+        """
+        for vec_expr in (vec_literal, f"CAST({vec_literal} AS FLOAT[{dim}])"):
+            query = (
+                f"MATCH (e:Embedding) "
+                f"RETURN e.node_id, "
+                f"array_cosine_similarity(e.vec, {vec_expr}) AS sim "
+                f"ORDER BY sim DESC LIMIT {limit}"
+            )
+            try:
+                rows = cls._drain(conn.execute(query))
+            except Exception:
+                logger.debug("vector scan failed for %s", vec_expr[:40], exc_info=True)
+                continue
+            return [
+                (row[0] or "", float(row[1]) if row[1] is not None else 0.0)
+                for row in rows
+            ]
+        return []
 
     def get_indexed_files(self) -> dict[str, str]:
         """Return ``{file_path: sha256(content)}`` for all File nodes."""
         mapping: dict[str, str] = {}
         with self._read_conn() as conn:
             try:
-                result = conn.execute(
+                rows = self._drain(conn.execute(
                     "MATCH (n:File) RETURN n.file_path, n.content"
-                )
-                while result.has_next():
-                    row = result.get_next()
+                ))
+                for row in rows:
                     fp = row[0] or ""
                     content = row[1] or ""
                     mapping[fp] = hashlib.sha256(content.encode()).hexdigest()
@@ -800,9 +1160,15 @@ class KuzuBackend:
 
         This avoids ``MATCH (n) DETACH DELETE n`` which triggers a segfault
         in Kuzu's native layer on large datasets (2000+ files).
+
+        Waits for in-flight reads to drain first: a read whose dispatch
+        timed out keeps running in its thread after the RW lock is released,
+        and deleting the database files under a live native query risks a
+        crash in Kuzu's native layer.
         """
         assert self._db_path is not None
         db_path = self._db_path
+        self._wait_for_readers()
         self.close()
         if db_path.exists():
             if db_path.is_dir():
@@ -901,7 +1267,7 @@ class KuzuBackend:
                     [node.id, node.name, node.file_path, node.start_line,
                      node.end_line, node.content, node.signature, node.language,
                      node.class_name, node.is_dead, node.is_entry_point,
-                     node.is_exported]
+                     node.is_exported, _serialize_properties(node.properties)]
                     for node in nodes
                 ])
             return True
@@ -921,11 +1287,21 @@ class KuzuBackend:
             if src_table and dst_table:
                 by_pair.setdefault((src_table, dst_table), []).append(rel)
 
-        # Deduplicate by (source, target, rel_type), keeping the last occurrence.
+        # Deduplicate by full edge identity — including role and step_number,
+        # so e.g. USES_TYPE edges with different roles between the same pair
+        # survive (mirrors the in-memory relationship ID semantics).
         for pair_key, rels in by_pair.items():
-            seen: dict[tuple[str, str, str], int] = {}
+            seen: dict[tuple[str, str, str, str, int], int] = {}
             for i, rel in enumerate(rels):
-                seen[(rel.source, rel.target, rel.type.value)] = i
+                props = rel.properties or {}
+                key = (
+                    rel.source,
+                    rel.target,
+                    rel.type.value,
+                    str(props.get("role", "")),
+                    int(props.get("step_number", 0)),
+                )
+                seen[key] = i
             if len(seen) < len(rels):
                 logger.debug(
                     "Deduplicated %d duplicate rel(s) in %s->%s",
@@ -963,13 +1339,18 @@ class KuzuBackend:
                 self._conn.execute("DROP TABLE Embedding")
             except Exception:
                 pass
+            # Recreate at the actual vector width so the FLOAT[dim] column
+            # (required by the HNSW index) matches whatever model produced
+            # these embeddings.
             self._conn.execute(
-                f"CREATE NODE TABLE IF NOT EXISTS Embedding({_EMBEDDING_PROPERTIES})"
+                "CREATE NODE TABLE IF NOT EXISTS "
+                f"Embedding({_embedding_ddl(len(embeddings[0].embedding))})"
             )
 
             self._csv_copy("Embedding", [
                 [emb.node_id,
-                 "[" + ",".join(str(v) for v in emb.embedding) + "]"]
+                 "[" + ",".join(str(v) for v in emb.embedding) + "]",
+                 emb.text_sha]
                 for emb in embeddings
             ])
             return True
@@ -987,12 +1368,22 @@ class KuzuBackend:
         except Exception:
             logger.debug("FTS extension load skipped (may already be loaded)", exc_info=True)
 
+        try:
+            self._conn.execute("INSTALL vector")
+            self._conn.execute("LOAD EXTENSION vector")
+        except Exception:
+            logger.debug("Vector extension load skipped (may already be loaded)", exc_info=True)
+
         for table in _NODE_TABLE_NAMES:
             stmt = f"CREATE NODE TABLE IF NOT EXISTS {table}({_NODE_PROPERTIES})"
             self._conn.execute(stmt)
 
+        # Bring pre-existing tables (no-ops for CREATE IF NOT EXISTS) up to
+        # the current schema.
+        self._migrate_schema()
+
         self._conn.execute(
-            f"CREATE NODE TABLE IF NOT EXISTS Embedding({_EMBEDDING_PROPERTIES})"
+            f"CREATE NODE TABLE IF NOT EXISTS Embedding({_embedding_ddl(EMBEDDING_DIM)})"
         )
 
         # Build the REL TABLE GROUP covering all table-to-table combinations.
@@ -1042,7 +1433,7 @@ class KuzuBackend:
             f"content: $content, signature: $signature, "
             f"language: $language, class_name: $class_name, "
             f"is_dead: $is_dead, is_entry_point: $is_entry_point, "
-            f"is_exported: $is_exported"
+            f"is_exported: $is_exported, properties_json: $properties_json"
             f"}})"
         )
         params = {
@@ -1058,6 +1449,7 @@ class KuzuBackend:
             "is_dead": node.is_dead,
             "is_entry_point": node.is_entry_point,
             "is_exported": node.is_exported,
+            "properties_json": _serialize_properties(node.properties),
         }
         try:
             self._conn.execute(query, parameters=params)
@@ -1113,13 +1505,11 @@ class KuzuBackend:
     def _query_nodes(
         self, query: str, parameters: dict[str, Any] | None = None
     ) -> list[GraphNode]:
-        """Execute a query returning ``n.*`` columns and convert to GraphNode list."""
+        """Execute a query returning the node column list and convert to GraphNodes."""
         nodes: list[GraphNode] = []
         with self._read_conn() as conn:
             try:
-                result = conn.execute(query, parameters=parameters or {})
-                while result.has_next():
-                    row = result.get_next()
+                for row in self._drain(conn.execute(query, parameters=parameters or {})):
                     node = self._row_to_node(row)
                     if node is not None:
                         nodes.append(node)
@@ -1129,12 +1519,12 @@ class KuzuBackend:
 
     @staticmethod
     def _row_to_node(row: list[Any], node_id: str | None = None) -> GraphNode | None:
-        """Convert a result row from ``RETURN n.*`` into a GraphNode.
+        """Convert a result row (in ``_NODE_COLUMN_NAMES`` order) into a GraphNode.
 
-        Column order matches the property definition:
+        Column order:
         0=id, 1=name, 2=file_path, 3=start_line, 4=end_line,
         5=content, 6=signature, 7=language, 8=class_name,
-        9=is_dead, 10=is_entry_point, 11=is_exported
+        9=is_dead, 10=is_entry_point, 11=is_exported, 12=properties_json
         """
         try:
             nid = node_id or row[0]
@@ -1155,6 +1545,7 @@ class KuzuBackend:
                 is_dead=bool(row[9]),
                 is_entry_point=bool(row[10]),
                 is_exported=bool(row[11]),
+                properties=deserialize_properties(row[12]) if len(row) > 12 else {},
             )
         except (IndexError, KeyError):
             logger.debug("Failed to convert row to GraphNode: %s", row, exc_info=True)

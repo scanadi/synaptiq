@@ -281,8 +281,8 @@ def generate_process_label(steps: list[GraphNode]) -> str:
 def deduplicate_flows(flows: list[list[GraphNode]]) -> list[list[GraphNode]]:
     """Remove flows that are too similar to longer ones.
 
-    Two flows are "similar" if they share > 70% of their nodes (by ID).
-    When a pair is similar, the shorter flow is discarded.
+    Two flows are "similar" if they share > 50% of the smaller flow's
+    nodes (by ID).  When a pair is similar, the shorter flow is discarded.
 
     Args:
         flows: List of flows (each flow is a list of nodes).

@@ -21,7 +21,7 @@ from synaptiq.core.graph.model import (
     RelType,
     generate_id,
 )
-from synaptiq.core.ingestion.parser_phase import FileParseData
+from synaptiq.core.ingestion.parser_phase import FileParseData, assign_symbol_ids
 from synaptiq.core.ingestion.symbol_lookup import (
     build_file_symbol_index,
     build_name_index,
@@ -37,11 +37,11 @@ _CALLABLE_LABELS: tuple[NodeLabel, ...] = (
     NodeLabel.CLASS,
 )
 
-_KIND_TO_LABEL: dict[str, NodeLabel] = {
-    "function": NodeLabel.FUNCTION,
-    "method": NodeLabel.METHOD,
-    "class": NodeLabel.CLASS,
-}
+# Confidence assigned to weak references (object-literal shorthand) that
+# only resolve via global fuzzy matching.  Low enough to read as "uncertain"
+# in every consumer, but the edge still exists — dropping it entirely made
+# dead-code detection flag symbols whose only reference was the shorthand.
+_WEAK_REF_CONFIDENCE = 0.3
 
 # Names that should never produce CALLS edges.  These are language builtins,
 # stdlib utilities, framework hooks, and common JS/TS globals whose definitions
@@ -409,9 +409,12 @@ def process_calls(
         )
 
         for call in fpd.parse_result.calls:
-            # Skip builtins/stdlib names unless it's a self/this method call.
-            if call.name in blocklist and call.receiver not in ("self", "this"):
-                continue
+            # Builtin/stdlib names never resolve as call targets, but their
+            # callback arguments are real references — `rows.map(formatRow)`
+            # must still link formatRow or dead-code false-flags it.
+            blocklisted = (
+                call.name in blocklist and call.receiver not in ("self", "this")
+            )
 
             source_id = find_containing_symbol(
                 call.line, fpd.file_path, file_sym_index
@@ -422,20 +425,27 @@ def process_calls(
                 # CALLS edge (prevents false-positive dead-code flags).
                 source_id = generate_id(NodeLabel.FILE, fpd.file_path)
 
-            # Determine caller class for self/this resolution.
-            caller_class_name: str | None = None
-            if call.receiver in ("self", "this"):
-                source_node = graph.get_node(source_id)
-                if source_node is not None:
-                    caller_class_name = source_node.class_name
+            if not blocklisted:
+                # Determine caller class for self/this resolution.
+                caller_class_name: str | None = None
+                if call.receiver in ("self", "this"):
+                    source_node = graph.get_node(source_id)
+                    if source_node is not None:
+                        caller_class_name = source_node.class_name
 
-            target_id, confidence = resolve_call(
-                call, fpd.file_path, call_index, graph,
-                caller_class_name=caller_class_name,
-                import_cache=import_cache,
-            )
-            if target_id is not None:
-                _add_calls_edge(source_id, target_id, confidence, graph, seen)
+                target_id, confidence = resolve_call(
+                    call, fpd.file_path, call_index, graph,
+                    caller_class_name=caller_class_name,
+                    import_cache=import_cache,
+                )
+                if target_id is not None:
+                    # Weak references (object-literal shorthand) resolved only
+                    # by global fuzzy matching keep their edge — removing it
+                    # would let dead-code flag genuinely-referenced symbols —
+                    # but at a confidence that marks them clearly uncertain.
+                    if call.is_weak_ref and confidence < 0.8:
+                        confidence = _WEAK_REF_CONFIDENCE
+                    _add_calls_edge(source_id, target_id, confidence, graph, seen)
 
             # Callback arguments: bare identifiers passed as arguments
             # (e.g. map(transform, items), Depends(get_db)).
@@ -452,6 +462,8 @@ def process_calls(
 
             # Receiver: link to the class and resolve the method on it.
             receiver = call.receiver
+            if blocklisted:
+                continue
             if receiver and receiver not in ("self", "this"):
                 receiver_call = CallInfo(name=receiver, line=call.line)
                 recv_id, recv_conf = resolve_call(
@@ -473,20 +485,13 @@ def process_calls(
 
         # Decorators are implicit calls — @cost_decorator on a function is
         # equivalent to calling cost_decorator(func).  Create CALLS edges
-        # from the decorated symbol to the decorator definition.
-        for symbol in fpd.parse_result.symbols:
-            if not symbol.decorators:
+        # from the decorated symbol to the decorator definition.  IDs come
+        # from the same assignment logic as the parser phase so collision
+        # suffixes (#L) attach the edge to the right duplicate.
+        symbol_ids = assign_symbol_ids(fpd.parse_result.symbols, fpd.file_path)
+        for symbol, source_id in zip(fpd.parse_result.symbols, symbol_ids):
+            if not symbol.decorators or source_id is None:
                 continue
-
-            symbol_name = (
-                f"{symbol.class_name}.{symbol.name}"
-                if symbol.kind == "method" and symbol.class_name
-                else symbol.name
-            )
-            label = _KIND_TO_LABEL.get(symbol.kind)
-            if label is None:
-                continue
-            source_id = generate_id(label, fpd.file_path, symbol_name)
 
             for dec_name in symbol.decorators:
                 # Strip the base name for dotted decorators (e.g. "app.route" → "route")

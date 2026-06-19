@@ -28,10 +28,16 @@ class SearchResult:
 
 @dataclass
 class NodeEmbedding:
-    """An embedding vector associated with a graph node."""
+    """An embedding vector associated with a graph node.
+
+    ``text_sha`` is the SHA-256 of the natural-language text the vector
+    was generated from — the reuse key that lets full rebuilds skip
+    re-encoding symbols whose text did not change.
+    """
 
     node_id: str
     embedding: list[float] = field(default_factory=list)
+    text_sha: str = ""
 
 @runtime_checkable
 class StorageBackend(Protocol):

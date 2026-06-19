@@ -24,7 +24,7 @@ from synaptiq.core.parsers.base import ImportInfo
 
 logger = logging.getLogger(__name__)
 
-_JS_TS_EXTENSIONS = (".ts", ".js", ".tsx", ".jsx")
+_JS_TS_EXTENSIONS = (".ts", ".js", ".tsx", ".jsx", ".mjs", ".cjs")
 _RUBY_EXTENSIONS = (".rb", ".rake", ".ru", ".gemspec", ".rbi")
 
 def build_file_index(graph: KnowledgeGraph) -> dict[str, str]:
@@ -145,7 +145,7 @@ def _detect_language(file_path: str) -> str:
         return "python"
     if suffix in (".ts", ".tsx"):
         return "typescript"
-    if suffix in (".js", ".jsx"):
+    if suffix in (".js", ".jsx", ".mjs", ".cjs"):
         return "javascript"
     if suffix in _RUBY_EXTENSIONS:
         return "ruby"
@@ -268,9 +268,9 @@ def _resolve_js_ts(
         return None
 
     base = PurePosixPath(importing_file).parent
-    resolved = base / module
-
-    resolved_str = str(PurePosixPath(*resolved.parts))
+    # posixpath.normpath collapses './' and '../' segments — PurePosixPath
+    # keeps '..' literal, which would never match the file index.
+    resolved_str = posixpath.normpath(str(base / module))
 
     return _try_js_ts_paths(resolved_str, file_index)
 

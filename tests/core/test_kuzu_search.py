@@ -217,6 +217,78 @@ class TestEmbeddingsAndVectorSearch:
         assert results[0].node_id == n1.id
         assert results[0].score > results[1].score
 
+    def test_vector_index_built_after_store(self, backend: KuzuBackend) -> None:
+        """store_embeddings leaves a queryable HNSW index behind."""
+        node = _make_node(name="idx_func", file_path="src/idx.py")
+        backend.add_nodes([node])
+        backend.store_embeddings(
+            [NodeEmbedding(node_id=node.id, embedding=[1.0, 0.0, 0.0])]
+        )
+
+        # Query the index directly via a pooled read connection — proves
+        # both that the index exists and that it is visible beyond the
+        # write connection that built it.
+        rows = backend.execute_raw(
+            "CALL QUERY_VECTOR_INDEX('Embedding', 'embedding_vec_idx', "
+            "CAST([1.0, 0.0, 0.0] AS FLOAT[3]), 1) RETURN node.node_id, distance"
+        )
+        assert rows and rows[0][0] == node.id
+
+    def test_load_embeddings_round_trip(self, backend: KuzuBackend) -> None:
+        """load_embeddings returns the stored (text_sha, vector) per node."""
+        node = _make_node(name="rt_func", file_path="src/rt.py")
+        backend.add_nodes([node])
+        backend.store_embeddings(
+            [NodeEmbedding(node_id=node.id, embedding=[1.0, 0.0, 0.5], text_sha="abc123")]
+        )
+
+        loaded = backend.load_embeddings()
+        assert node.id in loaded
+        sha, vec = loaded[node.id]
+        assert sha == "abc123"
+        assert vec == pytest.approx([1.0, 0.0, 0.5], abs=1e-6)
+
+    def test_load_embeddings_empty_on_legacy_schema(
+        self, backend: KuzuBackend
+    ) -> None:
+        """Pre-text_sha schemas yield {} so callers fall back to a full encode."""
+        assert backend._conn is not None
+        backend._conn.execute("DROP TABLE Embedding")
+        backend._conn.execute(
+            "CREATE NODE TABLE Embedding(node_id STRING, vec DOUBLE[], "
+            "PRIMARY KEY(node_id))"
+        )
+        backend._conn.execute(
+            "MERGE (e:Embedding {node_id: $nid}) SET e.vec = $vec",
+            parameters={"nid": "function:src/x.py:f", "vec": [1.0, 0.0]},
+        )
+
+        assert backend.load_embeddings() == {}
+
+    def test_vector_search_falls_back_on_legacy_schema(
+        self, backend: KuzuBackend
+    ) -> None:
+        """Pre-index databases (DOUBLE[] column, no HNSW index) still search."""
+        node = _make_node(name="legacy_func", file_path="src/legacy.py")
+        backend.add_nodes([node])
+        # Recreate the table exactly as pre-1.3 synaptiq did: variable-length
+        # DOUBLE[] and no vector index.
+        assert backend._conn is not None
+        backend._conn.execute("DROP TABLE Embedding")
+        backend._conn.execute(
+            "CREATE NODE TABLE Embedding(node_id STRING, vec DOUBLE[], "
+            "PRIMARY KEY(node_id))"
+        )
+        backend._conn.execute(
+            "MERGE (e:Embedding {node_id: $nid}) SET e.vec = $vec",
+            parameters={"nid": node.id, "vec": [1.0, 0.0, 0.0]},
+        )
+
+        results = backend.vector_search([1.0, 0.0, 0.0], limit=5)
+        assert len(results) == 1
+        assert results[0].node_id == node.id
+        assert results[0].score == pytest.approx(1.0, abs=1e-6)
+
     def test_vector_search_limit(self, backend: KuzuBackend) -> None:
         """Only *limit* results should be returned from vector_search."""
         nodes = []

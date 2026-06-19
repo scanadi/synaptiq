@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
-from synaptiq.core.daemon.socket_client import SocketClient
+from synaptiq.core.daemon.lock import LockInfo
+from synaptiq.core.daemon.socket_client import PrimaryPromotedError, SocketClient
 from synaptiq.core.daemon.socket_server import SocketServer
 
 # ======================================================================
@@ -92,3 +96,112 @@ class TestSocketClient:
         r2 = await client.read_resource("uri://a")
         assert r2 == "resource: uri://a"
         assert await client.ping() is True
+
+
+def _alive_lock_info(socket: Path) -> LockInfo:
+    return LockInfo(
+        pid=os.getpid(),
+        socket=str(socket),
+        started_at=datetime.now(tz=timezone.utc).isoformat(),
+    )
+
+
+def _dead_lock_info(socket: Path) -> LockInfo:
+    proc = subprocess.Popen(["true"])
+    proc.wait()
+    return LockInfo(
+        pid=proc.pid,
+        socket=str(socket),
+        started_at=datetime.now(tz=timezone.utc).isoformat(),
+    )
+
+
+class TestLockAwareRecovery:
+    """Reconnect recovery via the lock file after the primary moves or dies."""
+
+    async def test_follows_moved_primary(
+        self, socket_path: Path, server: SocketServer
+    ) -> None:
+        """Dead cached socket + healthy lock at a new path → follow the lock."""
+        dead_path = socket_path.parent / "dead.sock"
+        cli = SocketClient(
+            dead_path,
+            lock_reader=lambda: _alive_lock_info(socket_path),
+        )
+        try:
+            assert await cli.ping() is True
+        finally:
+            await cli.close()
+
+    async def test_promotes_when_lock_is_stale(self, socket_path: Path) -> None:
+        """Stale lock (dead PID) + winning takeover → PrimaryPromotedError."""
+        dead_path = socket_path.parent / "dead.sock"
+        promoted: list[bool] = []
+
+        async def _on_primary_lost() -> bool:
+            promoted.append(True)
+            return True
+
+        cli = SocketClient(
+            dead_path,
+            lock_reader=lambda: _dead_lock_info(dead_path),
+            on_primary_lost=_on_primary_lost,
+        )
+        with pytest.raises(PrimaryPromotedError):
+            await cli.ping()
+        assert promoted == [True]
+
+    async def test_promotes_when_lock_is_missing(self, socket_path: Path) -> None:
+        """Missing lock file behaves like a stale one — takeover is attempted."""
+        dead_path = socket_path.parent / "dead.sock"
+
+        async def _on_primary_lost() -> bool:
+            return True
+
+        cli = SocketClient(
+            dead_path,
+            lock_reader=lambda: None,
+            on_primary_lost=_on_primary_lost,
+        )
+        with pytest.raises(PrimaryPromotedError):
+            await cli.ping()
+
+    async def test_lost_takeover_race_surfaces_connection_error(
+        self, socket_path: Path
+    ) -> None:
+        """Callback returning False (lost the race) → plain ConnectionError."""
+        dead_path = socket_path.parent / "dead.sock"
+
+        async def _on_primary_lost() -> bool:
+            return False
+
+        cli = SocketClient(
+            dead_path,
+            lock_reader=lambda: None,
+            on_primary_lost=_on_primary_lost,
+        )
+        with pytest.raises(ConnectionError) as excinfo:
+            await cli.ping()
+        assert not isinstance(excinfo.value, PrimaryPromotedError)
+
+
+class TestLargeResponses:
+    """Responses must survive asyncio's default 64KB StreamReader limit."""
+
+    async def test_large_response_round_trips(self, socket_path: Path) -> None:
+        """A response well past 64KB arrives intact instead of killing the connection."""
+        payload = "x" * (256 * 1024)
+
+        def fat_dispatch(method: str, params: dict) -> str:
+            return payload
+
+        srv = SocketServer(socket_path, fat_dispatch)
+        await srv.start()
+        cli = SocketClient(socket_path)
+        await cli.connect()
+        try:
+            result = await cli.call_tool("anything", {})
+            assert result == payload
+        finally:
+            await cli.close()
+            await srv.stop()

@@ -76,3 +76,29 @@ class TestSymbolExtraction:
         assert any(
             s.arguments.get("symbol") == "validate_user_input" for s in suggestions
         )
+
+    def test_what_breaks_with_lower_camel_case(self):
+        """The flagship workflow phrasing must route to impact, not query."""
+        suggestions = suggest_tools("what breaks if I change enqueueBillingCountSync")
+        assert suggestions[0].tool_name == "synaptiq_impact"
+        assert suggestions[0].arguments.get("symbol") == "enqueueBillingCountSync"
+
+    def test_impact_without_symbol_still_recommends_impact(self):
+        suggestions = suggest_tools("what breaks if I change this?")
+        tool_names = [s.tool_name for s in suggestions]
+        assert "synaptiq_impact" in tool_names
+
+    def test_extracts_pascal_case_with_acronym_and_digits(self):
+        suggestions = suggest_tools("what is the impact of changing KPIData?")
+        assert suggestions[0].tool_name == "synaptiq_impact"
+        assert suggestions[0].arguments.get("symbol") == "KPIData"
+
+        suggestions = suggest_tools("impact of Base64Encoder")
+        assert suggestions[0].arguments.get("symbol") == "Base64Encoder"
+
+    def test_pure_acronym_not_extracted_unless_quoted(self):
+        suggestions = suggest_tools("what is the impact of USA on the economy?")
+        assert all(s.arguments.get("symbol") != "USA" for s in suggestions)
+
+        suggestions = suggest_tools("what is the impact of `USA`?")
+        assert suggestions[0].arguments.get("symbol") == "USA"

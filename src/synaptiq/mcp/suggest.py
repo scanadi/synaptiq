@@ -7,6 +7,7 @@ tool calls so agents avoid trial-and-error discovery.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from synaptiq.core.storage.base import StorageBackend
@@ -56,11 +57,16 @@ _RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\b(?:review|risk|pr\s+risk)\b", re.I), "review_risk"),
 ]
 
-# Patterns for extracting symbol names from questions.
-_SYMBOL_PATTERNS = [
-    re.compile(r"[`'\"]([A-Za-z_]\w*(?:\.\w+)*)[`'\"]"),  # Quoted symbols
-    re.compile(r"\b([A-Z][a-z]+(?:[A-Z][a-z]+)+)\b"),  # CamelCase
-    re.compile(r"\b([a-z_][a-z0-9]*(?:_[a-z0-9]+)+)\b"),  # snake_case
+# Patterns for extracting symbol names from questions, paired with an
+# optional per-pattern filter.  PascalCase requires two uppercase humps so
+# capitalized English words don't match; digits and acronym runs are allowed
+# (KPIData, Base64Encoder) but pure acronyms (USA) are filtered — unless the
+# user quoted them explicitly.
+_SYMBOL_PATTERNS: list[tuple[re.Pattern[str], Callable[[str], bool] | None]] = [
+    (re.compile(r"[`'\"]([A-Za-z_]\w*(?:\.\w+)*)[`'\"]"), None),  # Quoted
+    (re.compile(r"\b([A-Z][a-z0-9]*(?:[A-Z][a-z0-9]*)+)\b"), str.isupper),  # PascalCase
+    (re.compile(r"\b([a-z]+(?:[A-Z][a-z0-9]*)+)\b"), None),  # lowerCamelCase
+    (re.compile(r"\b([a-z_][a-z0-9]*(?:_[a-z0-9]+)+)\b"), None),  # snake_case
 ]
 
 # Pattern for extracting file paths.
@@ -99,8 +105,10 @@ def _classify(question: str) -> str:
 def _extract_symbols(question: str, storage: StorageBackend | None) -> list[str]:
     """Extract potential symbol names from the question text."""
     candidates: list[str] = []
-    for pattern in _SYMBOL_PATTERNS:
-        candidates.extend(pattern.findall(question))
+    for pattern, reject in _SYMBOL_PATTERNS:
+        candidates.extend(
+            m for m in pattern.findall(question) if reject is None or not reject(m)
+        )
 
     if not candidates or storage is None:
         return candidates[:3]
@@ -134,9 +142,22 @@ def _build_suggestions(
     if category == "dead_code":
         return [ToolSuggestion("synaptiq_dead_code", {}, "List all dead code symbols.")]
 
-    if category == "impact" and sym:
+    if category == "impact":
+        if sym:
+            return [
+                ToolSuggestion("synaptiq_impact", {"symbol": sym}, f"Blast radius for '{sym}'."),
+            ]
         return [
-            ToolSuggestion("synaptiq_impact", {"symbol": sym}, f"Blast radius for '{sym}'."),
+            ToolSuggestion(
+                "synaptiq_query",
+                {"query": question[:100]},
+                "Find the symbol in question.",
+            ),
+            ToolSuggestion(
+                "synaptiq_impact",
+                {"symbol": "<symbol from query results>"},
+                "Then get its blast radius.",
+            ),
         ]
 
     if category == "call_path" and len(symbols) >= 2:

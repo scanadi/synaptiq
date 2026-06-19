@@ -1,8 +1,17 @@
 """Branch comparison for Synaptiq.
 
 Compares two code graphs structurally to find added, removed, and modified
-nodes and relationships.  Uses git worktrees to avoid stashing or branch
-switching in the user's working tree.
+nodes and relationships.
+
+The default (scoped) mode parses ONLY the files that changed between the
+two refs — content is read via ``git show``, no worktrees, no full pipeline
+— so cost scales with the diff, not the repository.  Node changes are exact;
+relationship changes are scoped to edges originating in changed files and
+resolved within the changed-file symbol set.
+
+``full=True`` keeps the legacy behaviour: build the complete graph for both
+sides in temporary worktrees.  Exhaustive (cross-file edges everywhere) but
+cost scales with repository size — unusable on large monorepos.
 """
 
 from __future__ import annotations
@@ -17,8 +26,15 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from synaptiq.core.graph.graph import KnowledgeGraph
+    from synaptiq.core.ingestion.parser_phase import FileParseData
 
-from synaptiq.core.graph.model import GraphNode, GraphRelationship
+from synaptiq.core.graph.model import (
+    GraphNode,
+    GraphRelationship,
+    NodeLabel,
+    RelType,
+    generate_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,33 +110,46 @@ def _node_changed(base: GraphNode, current: GraphNode) -> bool:
 def diff_branches(
     repo_path: Path,
     branch_range: str,
+    *,
+    full: bool = False,
 ) -> StructuralDiff:
-    """Compare two branches structurally using git worktrees.
+    """Compare two refs structurally.
 
     *branch_range* should be ``"base..current"`` (e.g. ``"main..feature"``).
-    If only one branch is given (no ``..``), it is treated as the base and
-    the current working tree is used as the current branch.
+    If only one ref is given (no ``..``), it is treated as the base and the
+    current working tree is used as the current side.
 
-    Steps:
-        1. Parse branch range into base/current references.
-        2. Create a temporary worktree for the base branch.
-        3. Run the pipeline on both branches to build in-memory graphs.
-        4. Diff the two graphs.
-        5. Clean up the worktree.
+    Default (scoped) mode: only files changed between the refs are parsed
+    (contents via ``git show``; working-tree side read from disk).  Symbol
+    additions/removals/modifications are exact.  Relationship changes cover
+    import statements and calls originating in changed files, resolved
+    against the changed-file symbol set — edges into unchanged files are out
+    of scope.  When diffing against the working tree, untracked (but not
+    ignored) files count as added.
+
+    ``full=True``: legacy mode — build the complete graph for both sides in
+    temporary worktrees.  Cost scales with repository size.
 
     Args:
         repo_path: Root of the git repository.
         branch_range: Branch range string (e.g. ``"main..feature"``).
+        full: Use the exhaustive dual-graph build instead of the scoped diff.
 
     Returns:
-        A :class:`StructuralDiff` comparing the two branches.
+        A :class:`StructuralDiff` comparing the two refs.
 
     Raises:
         ValueError: If the branch range format is invalid.
         RuntimeError: If git operations fail.
     """
-    from synaptiq.core.ingestion.pipeline import build_graph
+    base_ref, current_ref = _parse_range(branch_range)
 
+    if full:
+        return _full_diff(repo_path, base_ref, current_ref)
+    return _scoped_diff(repo_path, base_ref, current_ref)
+
+def _parse_range(branch_range: str) -> tuple[str, str | None]:
+    """Split ``"base..current"`` into refs; ``None`` current = working tree."""
     if ".." in branch_range:
         parts = branch_range.split("..", 1)
         base_ref = parts[0].strip()
@@ -131,6 +160,231 @@ def diff_branches(
 
     if not base_ref:
         raise ValueError(f"Invalid branch range: {branch_range!r}")
+    return base_ref, current_ref
+
+# ----------------------------------------------------------------------
+# Scoped diff (default): parse only changed files
+# ----------------------------------------------------------------------
+
+def _scoped_diff(
+    repo_path: Path,
+    base_ref: str,
+    current_ref: str | None,
+) -> StructuralDiff:
+    """Diff only the files that changed between the refs."""
+    from synaptiq.config.languages import get_language, is_supported
+    from synaptiq.core.ingestion.parser_phase import parse_file
+
+    changed = [
+        (status, path)
+        for status, path in _changed_files(repo_path, base_ref, current_ref)
+        if is_supported(path)
+    ]
+    if not changed:
+        return StructuralDiff()
+
+    base_side = _SideGraph()
+    current_side = _SideGraph()
+
+    for _status, path in changed:
+        language = get_language(path)
+        if language is None:
+            continue
+
+        base_content = _file_content(repo_path, base_ref, path)
+        if base_content is not None:
+            base_side.add_file(parse_file(path, base_content, language))
+
+        current_content = _file_content(repo_path, current_ref, path)
+        if current_content is not None:
+            current_side.add_file(parse_file(path, current_content, language))
+
+    base_side.finalise()
+    current_side.finalise()
+
+    return diff_graphs(
+        base_side.nodes, current_side.nodes, base_side.rels, current_side.rels
+    )
+
+def _changed_files(
+    repo_path: Path,
+    base_ref: str,
+    current_ref: str | None,
+) -> list[tuple[str, str]]:
+    """Return ``(status, path)`` pairs for files changed between the refs."""
+    target = f"{base_ref}..{current_ref}" if current_ref else base_ref
+    proc = subprocess.run(
+        ["git", "diff", "--name-status", "--no-renames", target],
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"git diff failed for '{target}': {proc.stderr.strip()}")
+
+    changed: list[tuple[str, str]] = []
+    for line in proc.stdout.splitlines():
+        status, _, path = line.partition("\t")
+        status = status.strip()
+        path = path.strip()
+        if status and path:
+            changed.append((status, path))
+
+    if current_ref is None:
+        untracked = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+        )
+        if untracked.returncode == 0:
+            changed.extend(
+                ("A", path) for path in untracked.stdout.splitlines() if path.strip()
+            )
+    return changed
+
+def _file_content(repo_path: Path, ref: str | None, path: str) -> str | None:
+    """Read *path* at *ref* (``None`` = working tree); ``None`` when absent."""
+    if ref is None:
+        try:
+            return (repo_path / path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+
+    proc = subprocess.run(
+        ["git", "show", f"{ref}:{path}"],
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+    )
+    return proc.stdout if proc.returncode == 0 else None
+
+class _SideGraph:
+    """Nodes and relationships built from one side's changed files."""
+
+    def __init__(self) -> None:
+        self._files: list["FileParseData"] = []
+        self.nodes: dict[str, GraphNode] = {}
+        self.rels: dict[str, GraphRelationship] = {}
+
+    def add_file(self, parse_data: "FileParseData") -> None:
+        self._files.append(parse_data)
+
+    def finalise(self) -> None:
+        """Materialise nodes and changed-file-scoped relationships."""
+        from synaptiq.core.ingestion.calls import _CALL_BLOCKLIST
+        from synaptiq.core.ingestion.parser_phase import (
+            _KIND_TO_LABEL,
+            assign_symbol_ids,
+        )
+
+        name_index: dict[str, list[str]] = {}
+        spans: dict[str, list[tuple[int, int, str]]] = {}
+
+        for fpd in self._files:
+            exported = set(fpd.parse_result.exports)
+            symbol_ids = assign_symbol_ids(fpd.parse_result.symbols, fpd.file_path)
+            for symbol, symbol_id in zip(fpd.parse_result.symbols, symbol_ids):
+                if symbol_id is None:
+                    continue
+                self.nodes[symbol_id] = GraphNode(
+                    id=symbol_id,
+                    label=_KIND_TO_LABEL[symbol.kind],
+                    name=symbol.name,
+                    file_path=fpd.file_path,
+                    start_line=symbol.start_line,
+                    end_line=symbol.end_line,
+                    content=symbol.content,
+                    signature=symbol.signature,
+                    class_name=symbol.class_name,
+                    language=fpd.language,
+                    is_exported=symbol.name in exported,
+                )
+                name_index.setdefault(symbol.name, []).append(symbol_id)
+                spans.setdefault(fpd.file_path, []).append(
+                    (symbol.start_line, symbol.end_line, symbol_id)
+                )
+
+        for fpd in self._files:
+            file_id = generate_id(NodeLabel.FILE, fpd.file_path)
+
+            # Import statements as pseudo-edges keyed by module + names, so
+            # both new modules and changed imported-name lists surface.
+            for imp in fpd.parse_result.imports:
+                names = ",".join(sorted(imp.names))
+                rel_id = f"imports:{file_id}->{imp.module}:{names}"
+                self.rels[rel_id] = GraphRelationship(
+                    id=rel_id,
+                    type=RelType.IMPORTS,
+                    source=file_id,
+                    target=imp.module,
+                    properties={"symbols": names},
+                )
+
+            for call in fpd.parse_result.calls:
+                source_id = self._containing_symbol(
+                    spans.get(fpd.file_path, []), call.line
+                ) or file_id
+
+                names = [] if call.name in _CALL_BLOCKLIST else [call.name]
+                names.extend(a for a in call.arguments if a not in _CALL_BLOCKLIST)
+                for name in names:
+                    target_id = self._resolve(name_index, name, fpd.file_path)
+                    if target_id is None or target_id == source_id:
+                        continue
+                    rel_id = f"calls:{source_id}->{target_id}"
+                    self.rels[rel_id] = GraphRelationship(
+                        id=rel_id,
+                        type=RelType.CALLS,
+                        source=source_id,
+                        target=target_id,
+                    )
+
+    @staticmethod
+    def _containing_symbol(
+        file_spans: list[tuple[int, int, str]], line: int
+    ) -> str | None:
+        """Innermost symbol whose span contains *line*."""
+        best: tuple[int, str] | None = None
+        for start, end, symbol_id in file_spans:
+            if start <= line <= end:
+                size = end - start
+                if best is None or size < best[0]:
+                    best = (size, symbol_id)
+        return best[1] if best else None
+
+    def _resolve(
+        self,
+        name_index: dict[str, list[str]],
+        name: str,
+        caller_file: str,
+    ) -> str | None:
+        """Resolve *name* within the changed-file symbol set.
+
+        Same-file match wins; a unique cross-file match is accepted;
+        ambiguous cross-file names are skipped to avoid noise.
+        """
+        candidates = name_index.get(name, [])
+        if not candidates:
+            return None
+        same_file = [c for c in candidates if self.nodes[c].file_path == caller_file]
+        if same_file:
+            return same_file[0]
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
+
+# ----------------------------------------------------------------------
+# Full diff (legacy): build complete graphs for both sides
+# ----------------------------------------------------------------------
+
+def _full_diff(
+    repo_path: Path,
+    base_ref: str,
+    current_ref: str | None,
+) -> StructuralDiff:
+    """Exhaustive comparison via two full pipeline builds (legacy)."""
+    from synaptiq.core.ingestion.pipeline import build_graph
 
     # Build both graphs (in parallel when both need worktrees).
     if current_ref:

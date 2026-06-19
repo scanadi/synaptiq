@@ -14,12 +14,12 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
-from synaptiq.core.cypher_guard import WRITE_KEYWORDS, sanitize_cypher
+from synaptiq.core.cypher_guard import check_read_only
 from synaptiq.core.ingestion.dead_code import _is_test_file
 from synaptiq.core.memory import MemoryStore
 from synaptiq.core.search.hybrid import hybrid_search
 from synaptiq.core.storage.base import StorageBackend
-from synaptiq.core.storage.kuzu_backend import escape_cypher as _escape_cypher
+from synaptiq.core.storage.kuzu_backend import deserialize_properties
 
 logger = logging.getLogger(__name__)
 
@@ -35,19 +35,49 @@ def _get_query_embedding(query: str) -> list[float] | None:
         if _query_model is None:
             from fastembed import TextEmbedding
 
-            _query_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
+            from synaptiq.core.resources import current_limits
+
+            threads = current_limits().embed_threads
+            _query_model = TextEmbedding(
+                model_name="BAAI/bge-small-en-v1.5", threads=threads or None
+            )
         return next(iter(_query_model.embed([query]))).tolist()
     except Exception:
         logger.debug("Query embedding generation failed", exc_info=True)
         return None
 
 
-_SAFE_PATH = re.compile(r"^[a-zA-Z0-9._/\-\s]+$")
-
 _DEPTH_LABELS: dict[int, str] = {
     1: "Direct callers (will break)",
     2: "Indirect (may break)",
 }
+
+
+def _heritage_rows(storage: StorageBackend, node_id: str) -> list:
+    """EXTENDS/IMPLEMENTS parents of *node_id* as (name, file_path, rel_type) rows."""
+    return (
+        storage.execute_raw(
+            "MATCH (n)-[r:CodeRelation]->(parent) "
+            "WHERE n.id = $nid "
+            "AND r.rel_type IN ['extends', 'implements'] "
+            "RETURN parent.name, parent.file_path, r.rel_type",
+            parameters={"nid": node_id},
+        )
+        or []
+    )
+
+
+def _community_names(storage: StorageBackend, node_id: str) -> list[str]:
+    """Names of communities *node_id* belongs to."""
+    rows = (
+        storage.execute_raw(
+            "MATCH (n)-[r:CodeRelation]->(c:Community) "
+            "WHERE n.id = $nid AND r.rel_type = 'member_of' RETURN c.name",
+            parameters={"nid": node_id},
+        )
+        or []
+    )
+    return [row[0] for row in rows if row and row[0]]
 
 
 def _confidence_tag(confidence: float) -> str:
@@ -304,16 +334,7 @@ def handle_context(
         for t in type_refs:
             lines.append(f"  -> {t.name}  {t.file_path}")
 
-    escaped_id = _escape_cypher(node.id)
-    heritage_rows = (
-        storage.execute_raw(
-            f"MATCH (n)-[r:CodeRelation]->(parent) "
-            f"WHERE n.id = '{escaped_id}' "
-            f"AND r.rel_type IN ['extends', 'implements'] "
-            f"RETURN parent.name, parent.file_path, r.rel_type"
-        )
-        or []
-    )
+    heritage_rows = _heritage_rows(storage, node.id)
     if heritage_rows:
         lines.append(f"\nHeritage ({len(heritage_rows)}):")
         for row in heritage_rows:
@@ -323,13 +344,13 @@ def handle_context(
             lines.append(f"  -> {rel}: {parent_name}  {parent_file}")
 
     if node.file_path:
-        escaped_fp = _escape_cypher(node.file_path)
         import_rows = (
             storage.execute_raw(
-                f"MATCH (a:File)-[r:CodeRelation]->(b:File) "
-                f"WHERE b.file_path = '{escaped_fp}' "
-                f"AND r.rel_type = 'imports' "
-                f"RETURN a.file_path ORDER BY a.file_path"
+                "MATCH (a:File)-[r:CodeRelation]->(b:File) "
+                "WHERE b.file_path = $fp "
+                "AND r.rel_type = 'imports' "
+                "RETURN a.file_path ORDER BY a.file_path",
+                parameters={"fp": node.file_path},
             )
             or []
         )
@@ -476,19 +497,12 @@ def handle_detect_changes(storage: StorageBackend, diff: str) -> str:
 
     for file_path, ranges in changed_files.items():
         affected_symbols = []
-        if not _SAFE_PATH.match(file_path):
-            logger.warning("Skipping unsafe file path in diff: %r", file_path)
-            lines.append(f"  {file_path}:")
-            lines.append("    (skipped: path contains unsafe characters)")
-            lines.append("")
-            continue
-
-        escaped = _escape_cypher(file_path)
         rows = (
             storage.execute_raw(
-                f"MATCH (n) WHERE n.file_path = '{escaped}' "
-                f"AND n.start_line > 0 "
-                f"RETURN n.id, n.name, n.file_path, n.start_line, n.end_line"
+                "MATCH (n) WHERE n.file_path = $fp "
+                "AND n.start_line > 0 "
+                "RETURN n.id, n.name, n.file_path, n.start_line, n.end_line",
+                parameters={"fp": file_path},
             )
             or []
         )
@@ -532,12 +546,9 @@ def handle_cypher(storage: StorageBackend, query: str) -> str:
     Returns:
         Formatted query results, or an error message if execution fails.
     """
-    cleaned = sanitize_cypher(query)
-    if WRITE_KEYWORDS.search(cleaned):
-        return (
-            "Query rejected: only read-only queries (MATCH/RETURN) are allowed. "
-            "Write operations (DELETE, DROP, CREATE, SET, MERGE) are not permitted."
-        )
+    rejection = check_read_only(query)
+    if rejection is not None:
+        return rejection
 
     try:
         rows = storage.execute_raw(query)
@@ -562,16 +573,16 @@ def handle_coupling(storage: StorageBackend, file_path: str, min_strength: float
         return "Error: 'file_path' parameter is required and cannot be empty."
 
     file_path = file_path.strip()
-    if not _SAFE_PATH.match(file_path):
-        return "Error: file path contains unsafe characters."
 
-    escaped = _escape_cypher(file_path)
+    # COUPLED_WITH edges are stored in one direction (sorted pair), so the
+    # undirected pattern is required to find coupling from either side.
     rows = (
         storage.execute_raw(
-            f"MATCH (a:File)-[r:COUPLED_WITH]-(b:File) "
-            f"WHERE a.file_path = '{escaped}' "
-            f"RETURN b.file_path, r.strength, r.co_changes "
-            f"ORDER BY r.strength DESC"
+            "MATCH (a:File)-[r:CodeRelation]-(b:File) "
+            "WHERE a.file_path = $fp AND r.rel_type = 'coupled_with' "
+            "RETURN b.file_path, r.strength, r.co_changes "
+            "ORDER BY r.strength DESC",
+            parameters={"fp": file_path},
         )
         or []
     )
@@ -583,9 +594,10 @@ def handle_coupling(storage: StorageBackend, file_path: str, min_strength: float
 
     import_rows = (
         storage.execute_raw(
-            f"MATCH (a:File)-[r:CodeRelation]->(b:File) "
-            f"WHERE a.file_path = '{escaped}' AND r.rel_type = 'imports' "
-            f"RETURN b.file_path"
+            "MATCH (a:File)-[r:CodeRelation]->(b:File) "
+            "WHERE a.file_path = $fp AND r.rel_type = 'imports' "
+            "RETURN b.file_path",
+            parameters={"fp": file_path},
         )
         or []
     )
@@ -703,14 +715,14 @@ def handle_call_path(
 def handle_communities(storage: StorageBackend, community: str | None = None) -> str:
     """List communities or drill into a specific one."""
     if community:
-        escaped = _escape_cypher(community)
         rows = (
             storage.execute_raw(
-                f"MATCH (n)-[:MEMBER_OF]->(c:Community) "
-                f"WHERE c.name = '{escaped}' "
-                f"RETURN n.name, label(n), n.file_path, n.start_line, "
-                f"n.is_entry_point, n.is_exported "
-                f"ORDER BY n.file_path, n.start_line"
+                "MATCH (n)-[r:CodeRelation]->(c:Community) "
+                "WHERE c.name = $cn AND r.rel_type = 'member_of' "
+                "RETURN n.name, label(n), n.file_path, n.start_line, "
+                "n.is_entry_point, n.is_exported "
+                "ORDER BY n.file_path, n.start_line",
+                parameters={"cn": community},
             )
             or []
         )
@@ -740,9 +752,7 @@ def handle_communities(storage: StorageBackend, community: str | None = None) ->
 
     rows = (
         storage.execute_raw(
-            "MATCH (c:Community) "
-            "RETURN c.name, c.cohesion, c.properties_json "
-            "ORDER BY c.cohesion DESC"
+            "MATCH (c:Community) RETURN c.name, c.properties_json"
         )
         or []
     )
@@ -750,22 +760,28 @@ def handle_communities(storage: StorageBackend, community: str | None = None) ->
     if not rows:
         return "No communities detected. Run indexing with community detection enabled."
 
-    lines = [f"Communities ({len(rows)} detected):"]
-    lines.append("")
-    for i, row in enumerate(rows, 1):
+    # Cohesion and symbol_count live in the properties_json column;
+    # parse and sort in Python.
+    communities_parsed: list[tuple[str, float, Any]] = []
+    for row in rows:
         name = row[0] or "?"
-        cohesion = row[1] or 0.0
-        props_raw = row[2] or "{}"
-        try:
-            props = json.loads(props_raw) if isinstance(props_raw, str) else props_raw
-        except (json.JSONDecodeError, TypeError):
-            props = {}
+        props = deserialize_properties(row[1])
+        cohesion = float(props.get("cohesion", 0.0) or 0.0)
         symbol_count = props.get("symbol_count", "?")
+        communities_parsed.append((name, cohesion, symbol_count))
+
+    communities_parsed.sort(key=lambda t: t[1], reverse=True)
+
+    lines = [f"Communities ({len(communities_parsed)} detected):"]
+    lines.append("")
+    for i, (name, cohesion, symbol_count) in enumerate(communities_parsed, 1):
         lines.append(f"  {i}. {name}  (cohesion: {cohesion:.2f}, {symbol_count} symbols)")
 
     cross_procs = (
         storage.execute_raw(
-            "MATCH (n)-[:STEP_IN_PROCESS]->(p:Process), (n)-[:MEMBER_OF]->(c:Community) "
+            "MATCH (n)-[r1:CodeRelation]->(p:Process), "
+            "(n)-[r2:CodeRelation]->(c:Community) "
+            "WHERE r1.rel_type = 'step_in_process' AND r2.rel_type = 'member_of' "
             "WITH p.name AS proc, collect(DISTINCT c.name) AS comms "
             "WHERE size(comms) > 1 "
             "RETURN proc, comms"
@@ -818,16 +834,9 @@ def handle_explain(storage: StorageBackend, symbol: str) -> str:
     if node.signature:
         lines.append(f"Signature: {node.signature}")
 
-    escaped_id = _escape_cypher(node.id)
-    comm_rows = (
-        storage.execute_raw(
-            f"MATCH (n)-[:MEMBER_OF]->(c:Community) WHERE n.id = '{escaped_id}' RETURN c.name"
-        )
-        or []
-    )
-    if comm_rows:
-        comm_name = comm_rows[0][0] or "?"
-        lines.append(f"Community: {comm_name}")
+    communities = _community_names(storage, node.id)
+    if communities:
+        lines.append(f"Community: {communities[0]}")
 
     lines.append("")
 
@@ -857,7 +866,9 @@ def handle_explain(storage: StorageBackend, symbol: str) -> str:
 
     proc_rows = (
         storage.execute_raw(
-            f"MATCH (n)-[:STEP_IN_PROCESS]->(p:Process) WHERE n.id = '{escaped_id}' RETURN p.name"
+            "MATCH (n)-[r:CodeRelation]->(p:Process) "
+            "WHERE n.id = $nid AND r.rel_type = 'step_in_process' RETURN p.name",
+            parameters={"nid": node.id},
         )
         or []
     )
@@ -881,19 +892,21 @@ def handle_review_risk(storage: StorageBackend, diff: str) -> str:
         return "Could not parse any changed files from the diff."
 
     changed_file_set = set(changed_files.keys())
-    all_affected_symbols: list[tuple[str, str, str, int]] = []
+    # (node_id, name, label, file_path, dep_count) — the real node id is
+    # carried through so later lookups never have to reconstruct it from
+    # the bare name (method ids are ClassName-qualified, duplicates carry
+    # a #L suffix; reconstruction misses both).
+    all_affected_symbols: list[tuple[str, str, str, str, int]] = []
     entry_points_hit = 0
     total_dependents = 0
 
     for file_path, ranges in changed_files.items():
-        if not _SAFE_PATH.match(file_path):
-            continue
-        escaped = _escape_cypher(file_path)
         rows = (
             storage.execute_raw(
-                f"MATCH (n) WHERE n.file_path = '{escaped}' "
-                f"AND n.start_line > 0 "
-                f"RETURN n.id, n.name, n.file_path, n.start_line, n.end_line"
+                "MATCH (n) WHERE n.file_path = $fp "
+                "AND n.start_line > 0 "
+                "RETURN n.id, n.name, n.file_path, n.start_line, n.end_line",
+                parameters={"fp": file_path},
             )
             or []
         )
@@ -918,18 +931,17 @@ def handle_review_risk(storage: StorageBackend, diff: str) -> str:
                     entry_points_hit += 1
 
             total_dependents += dep_count
-            all_affected_symbols.append((name, label_prefix, file_path, dep_count))
+            all_affected_symbols.append((node_id, name, label_prefix, file_path, dep_count))
 
     missing_cochange: list[tuple[str, str, float]] = []
     for file_path in changed_files:
-        if not _SAFE_PATH.match(file_path):
-            continue
-        escaped = _escape_cypher(file_path)
         coupling_rows = (
             storage.execute_raw(
-                f"MATCH (a:File)-[r:COUPLED_WITH]-(b:File) "
-                f"WHERE a.file_path = '{escaped}' AND r.strength >= 0.5 "
-                f"RETURN b.file_path, r.strength"
+                "MATCH (a:File)-[r:CodeRelation]-(b:File) "
+                "WHERE a.file_path = $fp AND r.rel_type = 'coupled_with' "
+                "AND r.strength >= 0.5 "
+                "RETURN b.file_path, r.strength",
+                parameters={"fp": file_path},
             )
             or []
         )
@@ -940,17 +952,8 @@ def handle_review_risk(storage: StorageBackend, diff: str) -> str:
                 missing_cochange.append((coupled_file, file_path, strength))
 
     communities_touched: set[str] = set()
-    for name, label, file_path, _ in all_affected_symbols:
-        escaped = _escape_cypher(f"{label.lower()}:{file_path}:{name}")
-        comm_rows = (
-            storage.execute_raw(
-                f"MATCH (n)-[:MEMBER_OF]->(c:Community) WHERE n.id = '{escaped}' RETURN c.name"
-            )
-            or []
-        )
-        for row in comm_rows:
-            if row[0]:
-                communities_touched.add(row[0])
+    for node_id, _name, _label, _file_path, _deps in all_affected_symbols:
+        communities_touched.update(_community_names(storage, node_id))
 
     score = entry_points_hit + len(missing_cochange) + total_dependents // 10
     if len(communities_touched) > 1:
@@ -971,7 +974,7 @@ def handle_review_risk(storage: StorageBackend, diff: str) -> str:
 
     if all_affected_symbols:
         lines.append(f"Changed symbols ({len(all_affected_symbols)}):")
-        for name, label, fp, deps in all_affected_symbols:
+        for _node_id, name, label, fp, deps in all_affected_symbols:
             tags = []
             if deps > 0:
                 tags.append(f"{deps} downstream dependents")
@@ -1000,61 +1003,64 @@ def handle_file_context(storage: StorageBackend, file_path: str) -> str:
         return "Error: 'file_path' parameter is required and cannot be empty."
 
     file_path = file_path.strip()
-    if not _SAFE_PATH.match(file_path):
-        return "Error: file path contains unsafe characters."
-
-    escaped = _escape_cypher(file_path)
+    params = {"fp": file_path}
 
     sym_rows = (
         storage.execute_raw(
-            f"MATCH (n) WHERE n.file_path = '{escaped}' AND n.start_line > 0 "
-            f"RETURN n.name, label(n), n.start_line, n.is_dead, n.is_entry_point, n.is_exported "
-            f"ORDER BY n.start_line"
+            "MATCH (n) WHERE n.file_path = $fp AND n.start_line > 0 "
+            "RETURN n.name, label(n), n.start_line, n.is_dead, n.is_entry_point, n.is_exported "
+            "ORDER BY n.start_line",
+            parameters=params,
         )
         or []
     )
 
     imports_out = (
         storage.execute_raw(
-            f"MATCH (a:File)-[r:CodeRelation]->(b:File) "
-            f"WHERE a.file_path = '{escaped}' AND r.rel_type = 'imports' "
-            f"RETURN b.file_path ORDER BY b.file_path"
+            "MATCH (a:File)-[r:CodeRelation]->(b:File) "
+            "WHERE a.file_path = $fp AND r.rel_type = 'imports' "
+            "RETURN b.file_path ORDER BY b.file_path",
+            parameters=params,
         )
         or []
     )
 
     imports_in = (
         storage.execute_raw(
-            f"MATCH (a:File)-[r:CodeRelation]->(b:File) "
-            f"WHERE b.file_path = '{escaped}' AND r.rel_type = 'imports' "
-            f"RETURN a.file_path ORDER BY a.file_path"
+            "MATCH (a:File)-[r:CodeRelation]->(b:File) "
+            "WHERE b.file_path = $fp AND r.rel_type = 'imports' "
+            "RETURN a.file_path ORDER BY a.file_path",
+            parameters=params,
         )
         or []
     )
 
     coupling_rows = (
         storage.execute_raw(
-            f"MATCH (a:File)-[r:COUPLED_WITH]-(b:File) "
-            f"WHERE a.file_path = '{escaped}' "
-            f"RETURN b.file_path, r.strength, r.co_changes "
-            f"ORDER BY r.strength DESC LIMIT 5"
+            "MATCH (a:File)-[r:CodeRelation]-(b:File) "
+            "WHERE a.file_path = $fp AND r.rel_type = 'coupled_with' "
+            "RETURN b.file_path, r.strength, r.co_changes "
+            "ORDER BY r.strength DESC LIMIT 5",
+            parameters=params,
         )
         or []
     )
 
     dead_rows = (
         storage.execute_raw(
-            f"MATCH (n) WHERE n.is_dead = true AND n.file_path = '{escaped}' "
-            f"RETURN n.name, n.start_line, label(n)"
+            "MATCH (n) WHERE n.is_dead = true AND n.file_path = $fp "
+            "RETURN n.name, n.start_line, label(n)",
+            parameters=params,
         )
         or []
     )
 
     comm_rows = (
         storage.execute_raw(
-            f"MATCH (n)-[r:CodeRelation]->(c:Community) "
-            f"WHERE n.file_path = '{escaped}' AND r.rel_type = 'member_of' "
-            f"RETURN c.name, count(n) ORDER BY count(n) DESC"
+            "MATCH (n)-[r:CodeRelation]->(c:Community) "
+            "WHERE n.file_path = $fp AND r.rel_type = 'member_of' "
+            "RETURN c.name, count(n) ORDER BY count(n) DESC",
+            parameters=params,
         )
         or []
     )
@@ -1174,14 +1180,12 @@ def handle_test_impact(
     if diff and diff.strip():
         changed_files = _parse_diff_files(diff)
         for file_path, ranges in changed_files.items():
-            if not _SAFE_PATH.match(file_path):
-                continue
-            escaped = _escape_cypher(file_path)
             rows = (
                 storage.execute_raw(
-                    f"MATCH (n) WHERE n.file_path = '{escaped}' "
-                    f"AND n.start_line > 0 "
-                    f"RETURN n.id, n.name, n.start_line, n.end_line"
+                    "MATCH (n) WHERE n.file_path = $fp "
+                    "AND n.start_line > 0 "
+                    "RETURN n.id, n.name, n.start_line, n.end_line",
+                    parameters={"fp": file_path},
                 )
                 or []
             )
@@ -1434,16 +1438,7 @@ def handle_export(
         sections.append("\n".join(type_lines))
 
     # Heritage.
-    escaped_id = _escape_cypher(root_node.id)
-    heritage_rows = (
-        storage.execute_raw(
-            f"MATCH (n)-[r:CodeRelation]->(parent) "
-            f"WHERE n.id = '{escaped_id}' "
-            f"AND r.rel_type IN ['extends', 'implements'] "
-            f"RETURN parent.name, parent.file_path, r.rel_type"
-        )
-        or []
-    )
+    heritage_rows = _heritage_rows(storage, root_node.id)
     if heritage_rows:
         her_lines = [f"\n=== Heritage ({len(heritage_rows)}) ==="]
         for row in heritage_rows:
@@ -1451,15 +1446,9 @@ def handle_export(
         sections.append("\n".join(her_lines))
 
     # Community membership.
-    comm_rows = (
-        storage.execute_raw(
-            f"MATCH (n)-[:MEMBER_OF]->(c:Community) WHERE n.id = '{escaped_id}' RETURN c.name"
-        )
-        or []
-    )
-    if comm_rows:
-        comm_name = comm_rows[0][0] or "?"
-        sections.append(f"\n=== Community: {comm_name} ===")
+    communities = _community_names(storage, root_node.id)
+    if communities:
+        sections.append(f"\n=== Community: {communities[0]} ===")
 
     # Deeper hops if depth > 1.
     if depth >= 2:
