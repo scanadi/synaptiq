@@ -338,6 +338,19 @@ class TestEmbedGraphEmpty:
 # ---------------------------------------------------------------------------
 
 
+def _expected_threads() -> int | None:
+    """The threads value _get_model forwards to TextEmbedding.
+
+    Mirrors ``_get_model``'s own ``limits.embed_threads or None`` logic —
+    since W1.4 the interactive profile resolves a polite ``max(2, cores - 2)``
+    default rather than 0/None (the exact math is covered in
+    test_resources.py; here we only assert faithful forwarding).
+    """
+    from synaptiq.core.resources import current_limits
+
+    return current_limits().embed_threads or None
+
+
 class TestEmbedGraphModelConfig:
     """Model name and batch size configuration."""
 
@@ -352,7 +365,9 @@ class TestEmbedGraphModelConfig:
 
         embed_graph(sample_graph)
 
-        mock_te_cls.assert_called_once_with(model_name="BAAI/bge-small-en-v1.5", threads=None)
+        mock_te_cls.assert_called_once_with(
+            model_name="BAAI/bge-small-en-v1.5", threads=_expected_threads()
+        )
 
     @patch("fastembed.TextEmbedding")
     def test_custom_model_name(self, mock_te_cls: MagicMock, sample_graph: KnowledgeGraph) -> None:
@@ -365,7 +380,9 @@ class TestEmbedGraphModelConfig:
 
         embed_graph(sample_graph, model_name="BAAI/bge-base-en-v1.5")
 
-        mock_te_cls.assert_called_once_with(model_name="BAAI/bge-base-en-v1.5", threads=None)
+        mock_te_cls.assert_called_once_with(
+            model_name="BAAI/bge-base-en-v1.5", threads=_expected_threads()
+        )
 
     @patch("fastembed.TextEmbedding")
     def test_custom_batch_size_passed_to_embed(

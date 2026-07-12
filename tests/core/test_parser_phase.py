@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 
 from synaptiq.core.graph.graph import KnowledgeGraph
 from synaptiq.core.graph.model import GraphNode, NodeLabel, RelType, generate_id
+from synaptiq.core.ingestion import parser_phase as parser_phase_module
 from synaptiq.core.ingestion.parser_phase import (
     FileParseData,
     get_parser,
@@ -15,6 +18,7 @@ from synaptiq.core.ingestion.parser_phase import (
 from synaptiq.core.ingestion.walker import FileEntry
 from synaptiq.core.parsers.python_lang import PythonParser
 from synaptiq.core.parsers.typescript import TypeScriptParser
+from synaptiq.core.resources import set_jobs
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -441,3 +445,59 @@ class TestProcessParsingTypeScript:
         method_nodes = graph.get_nodes_by_label(NodeLabel.METHOD)
         method_names = {n.name for n in method_nodes}
         assert "start" in method_names
+
+
+class TestProcessParsingWorkerCount:
+    """max_workers resolution: explicit value wins; default derives from
+    current_limits().pool_workers (W1.4 — analyze --jobs)."""
+
+    @staticmethod
+    def _spy_executor(captured: dict) -> type[ThreadPoolExecutor]:
+        class SpyExecutor(ThreadPoolExecutor):
+            def __init__(self, max_workers=None, *args, **kwargs):
+                captured["max_workers"] = max_workers
+                super().__init__(max_workers=max_workers, *args, **kwargs)
+
+        return SpyExecutor
+
+    def test_explicit_max_workers_is_honored(
+        self, graph: KnowledgeGraph, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict = {}
+        monkeypatch.setattr(
+            parser_phase_module, "ThreadPoolExecutor", self._spy_executor(captured)
+        )
+        files = [_make_file_entry("src/utils.py", PYTHON_CODE, "python")]
+
+        process_parsing(files, graph, max_workers=2)
+
+        assert captured["max_workers"] == 2
+
+    def test_default_worker_count_derives_from_jobs_override(
+        self, graph: KnowledgeGraph, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict = {}
+        monkeypatch.setattr(
+            parser_phase_module, "ThreadPoolExecutor", self._spy_executor(captured)
+        )
+        set_jobs(3)
+        files = [_make_file_entry("src/utils.py", PYTHON_CODE, "python")]
+
+        process_parsing(files, graph)
+
+        assert captured["max_workers"] == 3
+
+    def test_default_worker_count_falls_back_to_pool_default(
+        self, graph: KnowledgeGraph, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No --jobs, no explicit max_workers: min(8, cpu_count) applies."""
+        captured: dict = {}
+        monkeypatch.setattr(
+            parser_phase_module, "ThreadPoolExecutor", self._spy_executor(captured)
+        )
+        monkeypatch.setattr("synaptiq.core.resources.os.cpu_count", lambda: 4)
+        files = [_make_file_entry("src/utils.py", PYTHON_CODE, "python")]
+
+        process_parsing(files, graph)
+
+        assert captured["max_workers"] == 4

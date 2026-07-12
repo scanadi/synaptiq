@@ -127,6 +127,68 @@ class TestAnalyzeProfile:
         assert "Walking files" in meta["stats"]["phase_timings"]
 
 
+class TestAnalyzeJobsFlag:
+    """Tests for `analyze --jobs` (W1.4)."""
+
+    def test_analyze_help_mentions_jobs_flag(self) -> None:
+        result = runner.invoke(app, ["analyze", "--help"])
+        assert result.exit_code == 0
+        assert "--jobs" in result.output
+
+    def test_analyze_help_documents_precedence(self) -> None:
+        """--help must document flag > env vars > profile defaults precedence.
+
+        Rich wraps the help text inside a panel whose `│` border characters
+        land mid-sentence at line breaks — strip them before collapsing
+        whitespace or the assertion depends on terminal width.
+        """
+        result = runner.invoke(app, ["analyze", "--help"])
+        output = " ".join(result.output.replace("│", " ").split())
+        assert "Precedence: --jobs > env vars > profile defaults." in output
+
+    def test_analyze_rejects_negative_jobs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(app, ["analyze", "--jobs", "-1"])
+        assert result.exit_code == 1
+        assert "--jobs must be >= 0" in result.output
+
+    def test_analyze_jobs_sets_process_wide_override(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """analyze --jobs N calls set_jobs(N) before storage/pipeline creation.
+
+        `analyze` imports `run_pipeline` locally (inside the function body),
+        so the spy must patch the source module — a patch on
+        `synaptiq.cli.main` would never be seen.
+        """
+        repo = tmp_path / "repo"
+        src = repo / "src"
+        src.mkdir(parents=True)
+        (src / "main.py").write_text("def main():\n    pass\n", encoding="utf-8")
+        monkeypatch.chdir(repo)
+
+        from synaptiq.core.ingestion import pipeline as pipeline_module
+        from synaptiq.core.resources import current_limits
+
+        captured: dict = {}
+        real_run_pipeline = pipeline_module.run_pipeline
+
+        def _spy_run_pipeline(*args, **kwargs):
+            captured["limits"] = current_limits()
+            return real_run_pipeline(*args, **kwargs)
+
+        monkeypatch.setattr(pipeline_module, "run_pipeline", _spy_run_pipeline)
+
+        result = runner.invoke(app, ["analyze", "--jobs", "2", "--no-embeddings"])
+
+        assert result.exit_code == 0, result.output
+        assert captured["limits"].kuzu_threads == 2
+        assert captured["limits"].embed_threads == 2
+        assert captured["limits"].pool_workers == 2
+
+
 class TestStatus:
     """Tests for the status command."""
 

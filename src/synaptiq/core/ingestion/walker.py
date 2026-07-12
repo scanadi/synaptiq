@@ -151,7 +151,7 @@ def read_file(repo_path: Path, file_path: Path) -> FileEntry | None:
 def walk_repo(
     repo_path: Path,
     gitignore_patterns: list[str] | None = None,
-    max_workers: int = 8,
+    max_workers: int | None = None,
 ) -> list[FileEntry]:
     """Walk a repository and return all supported source files with their content.
 
@@ -166,7 +166,10 @@ def walk_repo(
         Optional list of gitignore-style patterns (e.g. from
         :func:`synaptiq.config.ignore.load_gitignore`).
     max_workers:
-        Maximum number of threads for parallel file reading.  Defaults to 8.
+        Maximum number of threads for parallel file reading.  Defaults to
+        ``None``, which resolves ``current_limits().pool_workers`` at call
+        time (``min(8, cpu_count)`` unless capped further by
+        ``analyze --jobs``) — pass an explicit value to override.
 
     Returns
     -------
@@ -176,6 +179,11 @@ def walk_repo(
     """
     repo_path = repo_path.resolve()
     file_paths = discover_files(repo_path, gitignore_patterns)
+
+    if max_workers is None:
+        from synaptiq.core.resources import current_limits
+
+        max_workers = current_limits().pool_workers
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         results = executor.map(lambda fp: read_file(repo_path, fp), file_paths)

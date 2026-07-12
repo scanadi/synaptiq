@@ -185,16 +185,39 @@ def analyze(
     profile: bool = typer.Option(
         False, "--profile", help="Print a per-phase timing breakdown after indexing."
     ),
+    jobs: Optional[int] = typer.Option(
+        None,
+        "--jobs",
+        "-j",
+        help=(
+            "Cap Kuzu threads, ONNX embedding threads, and the walk/parse worker "
+            "pools to N. N=0 means explicit all-cores (restores uncapped "
+            "Kuzu/embedding threads, overriding SYNAPTIQ_* env vars too). Omitted "
+            "(default): SYNAPTIQ_KUZU_THREADS / SYNAPTIQ_KUZU_MEMORY_MB / "
+            "SYNAPTIQ_EMBED_THREADS apply if set, else embedding threads default "
+            "to a polite max(2, cores - 2) so a foreground index leaves the "
+            "machine usable (Kuzu threads and worker pools keep their library "
+            "defaults). Precedence: --jobs > env vars > profile defaults."
+        ),
+    ),
 ) -> None:
     """Index a repository into a knowledge graph."""
     from synaptiq.core.daemon.lock import LockManager
     from synaptiq.core.ingestion.pipeline import PipelineResult, run_pipeline
+    from synaptiq.core.resources import set_jobs
     from synaptiq.core.storage.kuzu_backend import open_with_recovery
 
     repo_path = path.resolve()
     if not repo_path.is_dir():
         _stderr_console.print(f"[red]Error:[/red] {repo_path} is not a directory.")
         raise typer.Exit(code=1)
+
+    if jobs is not None and jobs < 0:
+        _stderr_console.print("[red]Error:[/red] --jobs must be >= 0.")
+        raise typer.Exit(code=1)
+    # Must run before any storage backend or embedding model is created —
+    # both read current_limits() at creation time (see core/resources.py).
+    set_jobs(jobs)
 
     data_dir = repo_path / ".synaptiq"
     data_dir.mkdir(parents=True, exist_ok=True)
