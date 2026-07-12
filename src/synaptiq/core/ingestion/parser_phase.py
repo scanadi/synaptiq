@@ -9,8 +9,9 @@ to Symbol.
 from __future__ import annotations
 
 import logging
+import multiprocessing as mp
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -52,9 +53,12 @@ class FileParseData:
     content: str = ""
 
 # Parser instances are cached per (thread, language).  tree-sitter parser
-# objects are stateful and documented as single-thread-at-a-time, and
-# ``process_parsing`` calls this from a thread pool — sharing one parser
-# instance across threads would race inside the native parse call.
+# objects are stateful and documented as single-thread-at-a-time, so the
+# cache is thread-local: the thread-pool fan-out gives each worker thread
+# its own parser, and the process-pool fan-out gives each worker process
+# its own copy of this module (hence its own ``_PARSER_LOCAL``, populated
+# by that process's single task-running thread).  Either way no native
+# ``Parser`` is ever touched by two threads at once.
 _PARSER_LOCAL = threading.local()
 
 
@@ -177,6 +181,101 @@ def parse_file(file_path: str, content: str, language: str) -> FileParseData:
     )
 
 
+# Files handed to each process-pool task.  Chunking amortizes the per-task
+# pickling/IPC overhead of shipping work to workers; a value in the 16-32
+# range keeps chunks large enough to matter without starving workers on
+# medium repos.
+_PARSE_CHUNKSIZE = 32
+
+# Minimum file count before the process pool earns its startup + IPC cost.
+# Below this, spawning worker processes (and shipping file content to them)
+# dominates the actual parse work, so ``process_parsing`` uses the
+# in-process thread pool instead.  Small repos — and the existing unit
+# tests, which parse a handful of files — therefore stay on threads.
+_PROCESS_POOL_MIN_FILES = 100
+
+
+def _should_use_process_pool(n_files: int, max_workers: int) -> bool:
+    """Return whether process-parallel parsing is worth it for this batch.
+
+    Processes only pay off with enough files to amortize the spawn + IPC
+    overhead (``n_files >= _PROCESS_POOL_MIN_FILES``) and with more than
+    one worker to spread the load across.  A single worker (e.g.
+    ``--jobs 1`` or a one-core machine) always stays on threads.
+    """
+    return n_files >= _PROCESS_POOL_MIN_FILES and max_workers > 1
+
+
+def _parse_with_threads(files: list[FileEntry], max_workers: int) -> list[FileParseData]:
+    """Parse *files* on an in-process thread pool, preserving input order.
+
+    tree-sitter releases the GIL during native parsing, so threads give
+    some overlap; the pure-Python symbol extraction stays GIL-serialized
+    (why the process pool exists for large repos).
+    """
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        return list(
+            executor.map(
+                lambda f: parse_file(f.path, f.content, f.language),
+                files,
+            )
+        )
+
+
+def _parse_with_processes(files: list[FileEntry], max_workers: int) -> list[FileParseData]:
+    """Parse *files* across worker processes, preserving input order.
+
+    Uses an explicit ``spawn`` context: ``fork`` is unsafe once the parent
+    has ever started threads (prior pools leave locks in an unknown state
+    in the child), and ``spawn`` is macOS's default regardless.  Only
+    picklable primitives — the path/content/language strings — cross the
+    process boundary; :func:`parse_file` is a module-level function
+    re-imported inside each worker, and the returned :class:`FileParseData`
+    is a tree of plain, picklable dataclasses.  Files are chunked
+    (:data:`_PARSE_CHUNKSIZE`) to amortize per-task IPC.  ``executor.map``
+    yields results in submission order, so the returned list lines up with
+    *files* exactly as the thread path does.
+    """
+    ctx = mp.get_context("spawn")
+    paths = [f.path for f in files]
+    contents = [f.content for f in files]
+    languages = [f.language for f in files]
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as executor:
+        return list(
+            executor.map(
+                parse_file,
+                paths,
+                contents,
+                languages,
+                chunksize=_PARSE_CHUNKSIZE,
+            )
+        )
+
+
+def _parse_files(files: list[FileEntry], max_workers: int) -> list[FileParseData]:
+    """Parse every file, fanning out to processes when it's worth it.
+
+    Falls back to the thread pool for small file sets, a single-worker
+    limit, or when the process pool is unavailable / fails to start (e.g.
+    a sandbox that forbids subprocesses, or a mid-run ``BrokenProcessPool``)
+    — parallelism must never crash the pipeline.  On fallback the whole
+    batch is re-parsed on threads, which is safe because :func:`parse_file`
+    is pure.
+    """
+    if _should_use_process_pool(len(files), max_workers):
+        try:
+            return _parse_with_processes(files, max_workers)
+        except Exception:
+            logger.warning(
+                "Process-parallel parsing unavailable (%d files, %d workers); "
+                "falling back to thread pool",
+                len(files),
+                max_workers,
+                exc_info=True,
+            )
+    return _parse_with_threads(files, max_workers)
+
+
 def process_parsing(
     files: list[FileEntry],
     graph: KnowledgeGraph,
@@ -184,8 +283,12 @@ def process_parsing(
 ) -> list[FileParseData]:
     """Parse every file and populate the knowledge graph with symbol nodes.
 
-    Parsing is done in parallel using a thread pool (tree-sitter releases
-    the GIL during C parsing).  Graph mutation remains sequential since
+    Parsing is fanned out across worker *processes* on large repos (file
+    count ``>= _PROCESS_POOL_MIN_FILES`` with more than one worker), which
+    sidesteps the GIL for the pure-Python symbol extraction; it falls back
+    to an in-process *thread* pool for small repos, a single-worker limit,
+    or if the process pool is unavailable (see :func:`_parse_files`).
+    Graph mutation always remains sequential in the parent since
     :class:`KnowledgeGraph` is not thread-safe.
 
     For each symbol discovered during parsing a graph node is created with
@@ -196,8 +299,8 @@ def process_parsing(
         files: File entries produced by the walker phase.
         graph: The knowledge graph to populate.  File nodes are expected to
             already exist (created by the structure phase).
-        max_workers: Maximum number of threads for parallel parsing.
-            Defaults to ``None``, which resolves
+        max_workers: Maximum number of parallel parse workers (processes or
+            threads).  Defaults to ``None``, which resolves
             ``current_limits().pool_workers`` at call time (``min(8,
             cpu_count)`` unless capped further by ``analyze --jobs``) —
             pass an explicit value to override.
@@ -211,14 +314,9 @@ def process_parsing(
 
         max_workers = current_limits().pool_workers
 
-    # Phase 1: Parse all files in parallel.
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        all_parse_data = list(
-            executor.map(
-                lambda f: parse_file(f.path, f.content, f.language),
-                files,
-            )
-        )
+    # Phase 1: Parse all files in parallel — processes on large repos,
+    # threads on small repos or when the process pool is unavailable.
+    all_parse_data = _parse_files(files, max_workers)
 
     # Phase 2: Graph mutation (sequential — not thread-safe).
     for file_entry, parse_data in zip(files, all_parse_data):
