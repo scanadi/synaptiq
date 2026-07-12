@@ -242,6 +242,28 @@ class TestCypherGuardLiterals:
         ):
             assert check_read_only(query) is not None, query
 
+    def test_ladybug_mutating_procedures_blocked(self) -> None:
+        """review F18: mutating procedures new since kuzu 0.11.3 (ALGO graph
+        projection, FTS/vector index management) must be blocked — both via
+        CALL (the read-only-procedure allow-list) and bare (the first-clause
+        allow-list). Audited against ladybug 0.18.1."""
+        from synaptiq.core.cypher_guard import check_read_only
+
+        for query in (
+            "CALL project_graph('G', ['File'], [])",
+            "CALL drop_projected_graph('G')",
+            "CALL create_vector_index('Embedding', 'idx', 'vec')",
+            "CALL drop_vector_index('Embedding', 'idx')",
+            "CALL create_fts_index('File', 'idx', ['name'])",
+            # Bare (no CALL) standalone-function forms — underscores mean the
+            # WRITE_KEYWORDS deny-list does NOT match, so the first-clause
+            # allow-list is what rejects these.
+            "PROJECT_GRAPH('G', ['File'], [])",
+            "CREATE_VECTOR_INDEX('Embedding', 'idx', 'vec')",
+            "DROP_FTS_INDEX('File', 'idx')",
+        ):
+            assert check_read_only(query) is not None, query
+
 
 class TestSchemaMigration:
     def test_old_database_gains_properties_json_column(self, tmp_path: Path) -> None:

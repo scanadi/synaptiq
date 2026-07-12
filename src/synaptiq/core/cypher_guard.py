@@ -13,6 +13,20 @@ The deny-list alone is insufficient: LadybugDB also mutates state via
 ``ALTER``, ``EXPORT DATABASE`` (writes files to disk), ``IMPORT
 DATABASE``, and ``ATTACH`` — none of which contain a classic write
 keyword.
+
+Audited against ladybug 0.18.1 (2026-07-12): the mutating surface added
+since kuzu 0.11.3 — the ALGO extension's ``PROJECT_GRAPH`` /
+``DROP_PROJECTED_GRAPH``, the ``CREATE_/DROP_FTS_INDEX`` and
+``CREATE_/DROP_VECTOR_INDEX`` index procedures, ``COPY ... TO`` export
+variants, and ``ATTACH`` / ``DETACH`` / ``USE`` for the new external-source
+extensions (DuckDB, Delta, Iceberg, ADBC, HTTPFS, ...) — is already fully
+blocked. The index and graph-projection procedures are caught via the CALL
+allow-list (or, invoked bare, the first-clause allow-list; note their
+underscores mean a bare ``CREATE_VECTOR_INDEX`` is *not* matched by the
+``\\bCREATE\\b`` deny-list, but the first-clause check rejects it anyway),
+and the remaining statements via ``WRITE_KEYWORDS``. No new top-level
+mutating keyword was found that bypasses all three checks, so
+``WRITE_KEYWORDS`` and the read-only-procedure allow-list are unchanged.
 """
 
 from __future__ import annotations
