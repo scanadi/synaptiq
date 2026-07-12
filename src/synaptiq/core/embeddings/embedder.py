@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from collections.abc import Callable
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
@@ -40,6 +41,7 @@ def _get_model(model_name: str) -> TextEmbedding:
     threads = current_limits().embed_threads
     return TextEmbedding(model_name=model_name, threads=threads or None)
 
+
 # Labels worth embedding — skip Folder, Community, Process (structural only).
 EMBEDDABLE_LABELS: frozenset[NodeLabel] = frozenset(
     {
@@ -53,11 +55,23 @@ EMBEDDABLE_LABELS: frozenset[NodeLabel] = frozenset(
     }
 )
 
+
+def embeddable_node_count(graph: KnowledgeGraph) -> int:
+    """Number of nodes :func:`embed_graph` would encode for *graph*.
+
+    Shared by ``analyze --embeddings lazy`` (to tell the user how many
+    vectors are being encoded in the background) and the lazy worker (to
+    size its progress totals) so both report the same ``N``.
+    """
+    return sum(1 for n in graph.iter_nodes() if n.label in EMBEDDABLE_LABELS)
+
+
 def embed_graph(
     graph: KnowledgeGraph,
     model_name: str = "BAAI/bge-small-en-v1.5",
     batch_size: int = 64,
     previous: dict[str, tuple[str, list[float]]] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> list[NodeEmbedding]:
     """Generate embeddings for all embeddable nodes in the graph.
 
@@ -75,6 +89,11 @@ def embed_graph(
         previous: ``{node_id: (text_sha, vector)}`` from the prior index
             (see ``LadybugBackend.load_embeddings``).  ``None`` or ``{}``
             encodes everything.
+        progress_callback: Optional ``(done, total)`` callback invoked after
+            each encoded batch (and once up-front with the reused count) where
+            *total* is the embeddable-node count and *done* counts reused +
+            encoded so far.  Used by the lazy background worker to publish
+            per-batch progress to ``embeddings_state.json``.
 
     Returns:
         A list of :class:`NodeEmbedding` instances, one per embeddable node,
@@ -95,23 +114,30 @@ def embed_graph(
     for i, (node, sha) in enumerate(zip(nodes, shas)):
         prev = previous.get(node.id) if previous else None
         if prev is not None and prev[0] == sha:
-            results[i] = NodeEmbedding(
-                node_id=node.id, embedding=list(prev[1]), text_sha=sha
-            )
+            results[i] = NodeEmbedding(node_id=node.id, embedding=list(prev[1]), text_sha=sha)
         else:
             pending.append(i)
 
+    reused = len(nodes) - len(pending)
+    if progress_callback is not None:
+        progress_callback(reused, len(nodes))
+
     if pending:
         model = _get_model(model_name)
-        vectors = list(
-            model.embed([texts[i] for i in pending], batch_size=batch_size)
-        )
-        for i, vector in zip(pending, vectors):
+        done = reused
+        # Stream the generator so progress can be published per batch instead
+        # of only after every vector is materialized (the encode is the slow
+        # part — minutes on a cold index — so mid-flight progress matters).
+        vectors_iter = model.embed([texts[i] for i in pending], batch_size=batch_size)
+        for pos, vector in enumerate(vectors_iter):
+            i = pending[pos]
             results[i] = NodeEmbedding(
                 node_id=nodes[i].id, embedding=vector.tolist(), text_sha=shas[i]
             )
+            done += 1
+            if progress_callback is not None and (done % batch_size == 0 or done == len(nodes)):
+                progress_callback(done, len(nodes))
 
-    reused = len(nodes) - len(pending)
     if reused:
         logger.info(
             "Embeddings: %d reused, %d encoded (of %d symbols)",

@@ -207,10 +207,12 @@ class TestEmbeddingsAndVectorSearch:
         backend.add_nodes([n1, n2])
 
         # close_func embedding is close to query, far_func is orthogonal.
-        backend.store_embeddings([
-            NodeEmbedding(node_id=n1.id, embedding=[0.9, 0.1, 0.0]),
-            NodeEmbedding(node_id=n2.id, embedding=[0.0, 0.0, 1.0]),
-        ])
+        backend.store_embeddings(
+            [
+                NodeEmbedding(node_id=n1.id, embedding=[0.9, 0.1, 0.0]),
+                NodeEmbedding(node_id=n2.id, embedding=[0.0, 0.0, 1.0]),
+            ]
+        )
 
         results = backend.vector_search([1.0, 0.0, 0.0], limit=5)
         assert len(results) == 2
@@ -221,9 +223,7 @@ class TestEmbeddingsAndVectorSearch:
         """store_embeddings leaves a queryable HNSW index behind."""
         node = _make_node(name="idx_func", file_path="src/idx.py")
         backend.add_nodes([node])
-        backend.store_embeddings(
-            [NodeEmbedding(node_id=node.id, embedding=[1.0, 0.0, 0.0])]
-        )
+        backend.store_embeddings([NodeEmbedding(node_id=node.id, embedding=[1.0, 0.0, 0.0])])
 
         # Query the index directly via a pooled read connection — proves
         # both that the index exists and that it is visible beyond the
@@ -283,6 +283,44 @@ class TestEmbeddingsAndVectorSearch:
 
 
 # ---------------------------------------------------------------------------
+# Hybrid search degradation (W4.1 lazy embeddings window)
+# ---------------------------------------------------------------------------
+
+
+class TestHybridDegradationWithoutVectors:
+    """Between `analyze --embeddings lazy` returning and the worker finishing,
+    the Embedding table is empty. Hybrid search must degrade to BM25 + fuzzy
+    with zero vector contribution — never error."""
+
+    def test_hybrid_returns_keyword_results_when_table_empty(self, backend: LadybugBackend) -> None:
+        from synaptiq.core.search.hybrid import hybrid_search
+
+        node = _make_node(
+            name="validate_user", file_path="src/auth.py", content="check credentials"
+        )
+        backend.add_nodes([node])
+        backend.rebuild_fts_indexes()
+
+        # A query embedding IS supplied, but no vectors are stored yet.
+        results = hybrid_search("validate_user", backend, query_embedding=[0.1, 0.2, 0.3], limit=10)
+        assert results, "hybrid must return keyword results with zero vectors"
+        assert any(r.node_id == node.id for r in results)
+        # The vector component genuinely contributed nothing.
+        assert backend.vector_search([0.1, 0.2, 0.3], limit=10) == []
+
+    def test_hybrid_no_crash_with_full_width_query_vector(self, backend: LadybugBackend) -> None:
+        from synaptiq.core.search.hybrid import hybrid_search
+
+        node = _make_node(name="process_payment", file_path="src/billing.py")
+        backend.add_nodes([node])
+        backend.rebuild_fts_indexes()
+
+        # A realistic 384-d query vector against the empty table must not raise.
+        results = hybrid_search("process_payment", backend, query_embedding=[0.01] * 384, limit=10)
+        assert any(r.node_id == node.id for r in results)
+
+
+# ---------------------------------------------------------------------------
 # Fuzzy search tests
 # ---------------------------------------------------------------------------
 
@@ -333,10 +371,7 @@ class TestFuzzySearch:
 
     def test_fuzzy_limit(self, backend: LadybugBackend) -> None:
         """Only *limit* results should be returned."""
-        nodes = [
-            _make_node(name=f"func_{i}", file_path=f"src/f{i}.py")
-            for i in range(5)
-        ]
+        nodes = [_make_node(name=f"func_{i}", file_path=f"src/f{i}.py") for i in range(5)]
         backend.add_nodes(nodes)
 
         results = backend.fuzzy_search("func_0", limit=2, max_distance=2)
@@ -344,9 +379,7 @@ class TestFuzzySearch:
 
     def test_fuzzy_result_fields(self, backend: LadybugBackend) -> None:
         """SearchResult should have populated fields."""
-        node = _make_node(
-            name="my_handler", file_path="src/handlers.py", content="handler body"
-        )
+        node = _make_node(name="my_handler", file_path="src/handlers.py", content="handler body")
         backend.add_nodes([node])
 
         results = backend.fuzzy_search("my_handler", limit=10)

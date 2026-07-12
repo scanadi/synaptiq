@@ -252,12 +252,16 @@ synaptiq analyze .
 ```
 synaptiq analyze [PATH]          Index a repository (default: current directory)
     --full                       Force full rebuild (skip incremental)
-    --no-embeddings              Skip embedding generation for faster indexing
+    --embeddings MODE            lazy (default): index ready in seconds, then
+                                  encode vectors in the background; sync: encode
+                                  inline before returning; off: skip vectors.
+                                  (--no-embeddings is a deprecated alias for off.)
     --jobs / -j N                Cap LadybugDB threads, ONNX embedding threads,
                                   and walk/parse worker pools to N (0 = explicit
                                   all-cores). See "CPU usage" below.
 
-synaptiq status                  Show index status for current repo
+synaptiq status                  Show index status (incl. background embedding
+                                  progress: encoding N/M, complete, deferred)
 synaptiq list                    List all indexed repositories
 synaptiq clean                   Delete index for current repo
     --force / -f                 Skip confirmation prompt
@@ -310,6 +314,27 @@ warning) for one release.
 Precedence is **`--jobs` flag > environment variables > profile defaults**.
 `serve`/`mcp`/`watch` are unaffected — those long-running daemons always use
 the stricter "server" profile regardless of `--jobs`.
+
+### Background embeddings (`--embeddings lazy`, default)
+
+Encoding vectors dominates a cold index — on a large repo it can be ~98% of the
+total time. By default `analyze` therefore **commits the graph first** and
+returns a fully queryable index in seconds (keyword + fuzzy search work
+immediately), then encodes vectors in a detached background worker that fills in
+semantic search behind you.
+
+```bash
+synaptiq analyze .            # index ready in seconds; vectors fill in later
+synaptiq status               # → Embeddings: encoding 12,431/26,203
+                              #   …then → Embeddings: 26,203 (complete)
+```
+
+- `--embeddings sync` blocks until vectors are stored (the pre-1.x behavior).
+- `--embeddings off` skips vectors entirely (`--no-embeddings` is a deprecated alias).
+- The worker stays polite (`max(2, cores // 2)` ONNX threads) and never fights a
+  running `serve`/`watch` daemon for the database — if the index is busy it
+  defers, and the next `analyze`/rebuild encodes. `serve`/`watch` themselves
+  always embed synchronously.
 
 ---
 
