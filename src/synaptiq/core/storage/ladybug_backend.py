@@ -47,7 +47,7 @@ except ImportError:  # pragma: no cover - exercised in CSV-only environments
 
 from synaptiq.core.graph.graph import KnowledgeGraph
 from synaptiq.core.graph.model import GraphNode, GraphRelationship, NodeLabel
-from synaptiq.core.storage.base import NodeEmbedding, SearchResult
+from synaptiq.core.storage.base import EdgeRef, GraphDelta, NodeEmbedding, SearchResult
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +62,14 @@ _LABEL_MAP: dict[str, NodeLabel] = {label.value: label for label in NodeLabel}
 _SEARCHABLE_TABLES: list[str] = [
     t for t in _NODE_TABLE_NAMES if t not in ("Folder", "Community", "Process")
 ]
+
+# Symbol tables whose nodes carry a meaningful ``is_dead`` flag — mirrors
+# ``dead_code._SYMBOL_LABELS``. The scoped dead-code recount on the delta path
+# only touches these; File/Folder/Module/… are never flagged.
+_SYMBOL_TABLE_NAMES: frozenset[str] = frozenset(
+    _LABEL_TO_TABLE[label.value]
+    for label in (NodeLabel.FUNCTION, NodeLabel.METHOD, NodeLabel.CLASS)
+)
 
 _NODE_PROPERTIES = (
     "id STRING, "
@@ -759,6 +767,121 @@ class LadybugBackend:
             )
         except Exception:
             logger.debug("Failed to remove embeddings by id", exc_info=True)
+
+    def apply_graph_delta(self, delta: GraphDelta) -> None:
+        """Apply a scoped :class:`GraphDelta` atomically (incremental design §6.1).
+
+        Everything runs in ONE explicit transaction — reusing :meth:`_write_batch`'s
+        ``BEGIN`` / ``COMMIT`` / :meth:`_rollback_quietly` discipline — so a
+        mid-delta failure leaves the database exactly as it was. Applied in order:
+
+          1. ``edges_remove`` — delete exactly the edges the re-resolved files
+             previously contributed (idempotency without a global DETACH DELETE).
+          2. ``nodes_remove`` — surgical by-id removal of genuinely-removed
+             symbols (surviving symbols keep their cross-file inbound edges).
+          3. ``nodes_upsert`` — idempotent ``MERGE`` node upsert (a body-only
+             edit becomes a property refresh).
+          4. ``edges_add`` — idempotent ``MERGE`` edge insert (no duplicates).
+          5. ``dead_recount`` — recompute ``is_dead`` locally for affected
+             symbols, reusing ``process_dead_code``'s exemption predicate
+             (imported, not forked): dead iff zero incoming CALLS and not exempt.
+
+        FTS, the HNSW vector index, communities and processes are intentionally
+        left stale here and reconciled at consolidation — the same deferral
+        precedent as ``apply_reindex`` (W1.2); no rebuild happens on this path.
+        The dead-recount reads run on the write connection so they observe the
+        edge changes just applied within this same transaction.
+        """
+        assert self._conn is not None
+        if not (
+            delta.edges_remove
+            or delta.nodes_remove
+            or delta.nodes_upsert
+            or delta.edges_add
+            or delta.dead_recount
+        ):
+            return
+
+        conn = self._conn
+        conn.execute("BEGIN TRANSACTION")
+        try:
+            for ref in delta.edges_remove:
+                self._delete_edge(ref)
+            self._delete_nodes_by_id(delta.nodes_remove)
+            for node in delta.nodes_upsert:
+                self._insert_node(node)
+            for rel in delta.edges_add:
+                self._insert_relationship(rel)
+            self._recount_dead(delta.dead_recount)
+            conn.execute("COMMIT")
+        except BaseException:
+            self._rollback_quietly()
+            raise
+
+    def _delete_edge(self, ref: EdgeRef) -> None:
+        """Delete the ``(source)-[rel_type]->(target)`` edge. No own transaction.
+
+        Runs on ``self._conn`` so it participates in :meth:`apply_graph_delta`'s
+        transaction. Endpoints are matched untyped and keyed on the primary
+        ``id``, so the scan is index-bounded regardless of the rel-table group.
+        """
+        assert self._conn is not None
+        self._conn.execute(
+            "MATCH (a)-[r:CodeRelation]->(b) "
+            "WHERE a.id = $src AND b.id = $tgt AND r.rel_type = $rt "
+            "DELETE r",
+            parameters={"src": ref.source, "tgt": ref.target, "rt": ref.rel_type},
+        )
+
+    def _recount_dead(self, node_ids: set[str]) -> None:
+        """Recompute ``is_dead`` locally for each affected symbol.
+
+        Reuses ``process_dead_code``'s exemption predicate verbatim (imported,
+        not forked): a symbol is dead iff it has zero incoming CALLS and is not
+        exempt. Runs on the write connection inside :meth:`apply_graph_delta`'s
+        transaction, so the incoming-CALLS count reflects the edges applied
+        above. Only Function/Method/Class ids carry a meaningful ``is_dead``
+        flag (``dead_code._SYMBOL_LABELS``); other ids are skipped, as are ids
+        whose node no longer exists (it was removed earlier in this delta).
+        """
+        if not node_ids:
+            return
+        assert self._conn is not None
+        from synaptiq.core.ingestion.dead_code import is_symbol_exempt_from_dead_code
+
+        for node_id in node_ids:
+            table = _table_for_id(node_id)
+            if table not in _SYMBOL_TABLE_NAMES:
+                continue
+            incoming_rows = self._drain(
+                self._conn.execute(
+                    "MATCH ()-[r:CodeRelation]->(n) "
+                    "WHERE n.id = $id AND r.rel_type = 'calls' "
+                    "RETURN count(r)",
+                    parameters={"id": node_id},
+                )
+            )
+            incoming = int(incoming_rows[0][0]) if incoming_rows else 0
+            if incoming > 0:
+                is_dead = False
+            else:
+                meta = self._drain(
+                    self._conn.execute(
+                        f"MATCH (n:{table}) WHERE n.id = $id "
+                        f"RETURN n.name, n.is_entry_point, n.is_exported, n.file_path",
+                        parameters={"id": node_id},
+                    )
+                )
+                if not meta:
+                    continue  # node was removed earlier in this delta
+                name, is_ep, is_exp, fpath = meta[0][0], meta[0][1], meta[0][2], meta[0][3]
+                is_dead = not is_symbol_exempt_from_dead_code(
+                    name or "", bool(is_ep), bool(is_exp), fpath or ""
+                )
+            self._conn.execute(
+                f"MATCH (n:{table}) WHERE n.id = $id SET n.is_dead = $d",
+                parameters={"id": node_id, "d": is_dead},
+            )
 
     # ------------------------------------------------------------------
     # Read operations (use pooled connections — safe for concurrent use)

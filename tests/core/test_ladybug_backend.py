@@ -1557,3 +1557,269 @@ class TestRemoveNodesById:
 
         assert backend.remove_nodes_by_id([]) == 0
         assert backend.get_node(a.id) is not None
+
+
+# ---------------------------------------------------------------------------
+# W3.2d — GraphDelta storage ops (scoped delete+insert, dead recount, atomic)
+# ---------------------------------------------------------------------------
+
+
+class TestApplyGraphDelta:
+    """apply_graph_delta applies a scoped GraphDelta atomically: edges_remove,
+    nodes_remove (by id), nodes_upsert (MERGE), edges_add (MERGE), then a scoped
+    is_dead recount — with FTS/HNSW/community/process left stale.
+    """
+
+    @staticmethod
+    def _edge_set(backend: LadybugBackend) -> set[tuple[str, str, str]]:
+        return {
+            (r[0], r[1], r[2])
+            for r in backend.execute_raw(
+                "MATCH (a)-[r:CodeRelation]->(b) RETURN a.id, b.id, r.rel_type"
+            )
+        }
+
+    @staticmethod
+    def _fn(
+        name: str,
+        file_path: str,
+        *,
+        content: str = "",
+        is_exported: bool = False,
+        is_dead: bool = False,
+    ) -> GraphNode:
+        return GraphNode(
+            id=generate_id(NodeLabel.FUNCTION, file_path, name),
+            label=NodeLabel.FUNCTION,
+            name=name,
+            file_path=file_path,
+            content=content,
+            is_exported=is_exported,
+            is_dead=is_dead,
+        )
+
+    def test_add_modify_delete_produces_exact_node_and_edge_sets(
+        self, backend: LadybugBackend
+    ) -> None:
+        from synaptiq.core.storage.base import EdgeRef, GraphDelta
+
+        foo = self._fn("foo", "src/a.py", content="old")
+        bar = self._fn("bar", "src/a.py")
+        qux = self._fn("qux", "src/a.py")
+        caller = self._fn("caller", "src/c.py")
+        backend.add_nodes([foo, bar, qux, caller])
+        backend.add_relationships(
+            [
+                _make_rel(caller.id, foo.id, rel_type=RelType.CALLS),  # cross-file inbound
+                _make_rel(foo.id, bar.id, rel_type=RelType.CALLS),
+                _make_rel(foo.id, qux.id, rel_type=RelType.CALLS),
+            ]
+        )
+
+        baz = self._fn("baz", "src/a.py")
+        delta = GraphDelta(
+            nodes_upsert=[self._fn("foo", "src/a.py", content="new"), baz],  # modify foo, add baz
+            nodes_remove=[qux.id],  # delete qux
+            edges_add=[_make_rel(foo.id, baz.id, rel_type=RelType.CALLS)],
+            edges_remove=[EdgeRef("calls", foo.id, bar.id)],  # foo no longer calls bar
+            dead_recount={foo.id, bar.id, baz.id, qux.id},
+        )
+        backend.apply_graph_delta(delta)
+
+        assert backend.get_node(foo.id).content == "new"  # body-only modify applied
+        assert backend.get_node(baz.id) is not None  # add
+        assert backend.get_node(bar.id) is not None  # survivor
+        assert backend.get_node(qux.id) is None  # delete
+        assert backend.get_node(caller.id) is not None
+
+        # Exact edge set: inbound caller->foo survives; foo->baz added; foo->bar
+        # removed (edges_remove); foo->qux removed (qux node cascade).
+        assert self._edge_set(backend) == {
+            (caller.id, foo.id, "calls"),
+            (foo.id, baz.id, "calls"),
+        }
+
+        # Scoped recount: bar lost its only caller -> dead; foo still called -> alive.
+        assert backend.get_node(bar.id).is_dead is True
+        assert backend.get_node(foo.id).is_dead is False
+
+    def test_cross_file_inbound_edge_survives_body_only_reindex(
+        self, backend: LadybugBackend
+    ) -> None:
+        # End-to-end design scenario: editing A's body must not drop C -> A.foo.
+        from synaptiq.core.storage.base import EdgeRef, GraphDelta
+
+        foo = self._fn("foo", "src/a.py", content="def foo(): return 1")
+        helper = self._fn("helper", "src/a.py")
+        caller = self._fn("caller", "src/c.py")
+        backend.add_nodes([foo, helper, caller])
+        backend.add_relationships(
+            [
+                _make_rel(caller.id, foo.id, rel_type=RelType.CALLS),
+                _make_rel(foo.id, helper.id, rel_type=RelType.CALLS),
+            ]
+        )
+
+        # Re-resolve src/a.py after a body-only edit to foo: its outbound edges
+        # are removed-then-readded; foo is upserted with new content; nothing is
+        # removed. C -> A.foo (inbound, from an unchanged file) must survive.
+        delta = GraphDelta(
+            nodes_upsert=[self._fn("foo", "src/a.py", content="def foo(): return 2")],
+            edges_remove=[EdgeRef("calls", foo.id, helper.id)],
+            edges_add=[_make_rel(foo.id, helper.id, rel_type=RelType.CALLS)],
+            dead_recount={foo.id, helper.id},
+        )
+        backend.apply_graph_delta(delta)
+
+        assert backend.get_node(foo.id).content == "def foo(): return 2"
+        assert {n.name for n in backend.get_callers(foo.id)} == {"caller"}
+        assert self._edge_set(backend) == {
+            (caller.id, foo.id, "calls"),
+            (foo.id, helper.id, "calls"),
+        }
+
+    def test_reapplying_same_delta_is_idempotent(self, backend: LadybugBackend) -> None:
+        from synaptiq.core.storage.base import EdgeRef, GraphDelta
+
+        a = self._fn("a", "src/a.py")
+        b = self._fn("b", "src/a.py")
+        backend.add_nodes([a, b])
+
+        delta = GraphDelta(
+            edges_add=[_make_rel(a.id, b.id, rel_type=RelType.CALLS)],
+            edges_remove=[EdgeRef("calls", b.id, a.id)],  # absent — no-op delete
+        )
+        backend.apply_graph_delta(delta)
+        first = self._edge_set(backend)
+        backend.apply_graph_delta(delta)  # re-apply
+        second = self._edge_set(backend)
+
+        assert first == second == {(a.id, b.id, "calls")}
+        # Physical (not just set) count: the re-added edge is MERGE-matched, not
+        # duplicated — the delta path is genuinely idempotent.
+        assert backend.execute_raw("MATCH ()-[r:CodeRelation]->() RETURN count(r)")[0][0] == 1
+
+    def test_dead_recount_flags_symbol_when_last_caller_removed(
+        self, backend: LadybugBackend
+    ) -> None:
+        from synaptiq.core.storage.base import EdgeRef, GraphDelta
+
+        orphan = self._fn("orphan", "src/a.py")  # not exempt
+        caller = self._fn("caller", "src/c.py")
+        backend.add_nodes([orphan, caller])
+        backend.add_relationships([_make_rel(caller.id, orphan.id, rel_type=RelType.CALLS)])
+        assert backend.get_node(orphan.id).is_dead is False
+
+        backend.apply_graph_delta(
+            GraphDelta(
+                edges_remove=[EdgeRef("calls", caller.id, orphan.id)],
+                dead_recount={orphan.id},
+            )
+        )
+
+        assert backend.get_node(orphan.id).is_dead is True
+
+    def test_dead_recount_clears_when_incoming_call_added(self, backend: LadybugBackend) -> None:
+        from synaptiq.core.storage.base import GraphDelta
+
+        orphan = self._fn("orphan", "src/a.py", is_dead=True)  # starts flagged dead
+        caller = self._fn("caller", "src/c.py")
+        backend.add_nodes([orphan, caller])
+
+        backend.apply_graph_delta(
+            GraphDelta(
+                edges_add=[_make_rel(caller.id, orphan.id, rel_type=RelType.CALLS)],
+                dead_recount={orphan.id},
+            )
+        )
+
+        assert backend.get_node(orphan.id).is_dead is False
+
+    def test_dead_recount_respects_exemption_predicate(self, backend: LadybugBackend) -> None:
+        # Exported symbol with zero incoming calls stays alive — same predicate
+        # as process_dead_code (reused, not forked).
+        from synaptiq.core.storage.base import GraphDelta
+
+        exported = self._fn("public_api", "src/a.py", is_exported=True)
+        backend.add_nodes([exported])
+
+        backend.apply_graph_delta(GraphDelta(dead_recount={exported.id}))
+
+        assert backend.get_node(exported.id).is_dead is False
+
+    def test_nodes_remove_cleans_embeddings(self, backend: LadybugBackend) -> None:
+        from synaptiq.core.storage.base import GraphDelta, NodeEmbedding
+
+        a = self._fn("a", "src/a.py")
+        b = self._fn("b", "src/a.py")
+        backend.add_nodes([a, b])
+        backend.store_embeddings(
+            [
+                NodeEmbedding(node_id=a.id, embedding=[1.0, 0.0, 0.0], text_sha="sa"),
+                NodeEmbedding(node_id=b.id, embedding=[0.0, 1.0, 0.0], text_sha="sb"),
+            ]
+        )
+
+        backend.apply_graph_delta(GraphDelta(nodes_remove=[a.id]))
+
+        remaining = {r[0] for r in backend.execute_raw("MATCH (e:Embedding) RETURN e.node_id")}
+        assert a.id not in remaining
+        assert b.id in remaining
+
+    def test_mid_delta_failure_rolls_back_atomically(
+        self, backend: LadybugBackend, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from synaptiq.core.storage.base import GraphDelta
+
+        a = self._fn("a", "src/a.py")
+        b = self._fn("b", "src/a.py")
+        c = self._fn("c", "src/a.py")
+        backend.add_nodes([a, b, c])
+        backend.add_relationships([_make_rel(a.id, b.id, rel_type=RelType.CALLS)])
+        before_edges = self._edge_set(backend)
+        before_nodes = {r[0] for r in backend.execute_raw("MATCH (n:Function) RETURN n.id")}
+
+        real_insert = backend._insert_relationship
+        state = {"n": 0}
+
+        def flaky(rel: GraphRelationship) -> None:
+            state["n"] += 1
+            if state["n"] == 2:
+                raise RuntimeError("induced mid-delta failure")
+            real_insert(rel)
+
+        monkeypatch.setattr(backend, "_insert_relationship", flaky)
+
+        new = self._fn("new", "src/a.py")
+        delta = GraphDelta(
+            nodes_upsert=[new],
+            nodes_remove=[c.id],  # applied before the failing edge insert
+            edges_add=[
+                _make_rel(a.id, c.id, rel_type=RelType.CALLS),  # 1st edge: ok
+                _make_rel(b.id, c.id, rel_type=RelType.CALLS),  # 2nd edge: raises
+            ],
+        )
+        with pytest.raises(RuntimeError, match="induced mid-delta failure"):
+            backend.apply_graph_delta(delta)
+
+        # Whole delta rolled back: node removal, node upsert and the first edge
+        # insert are all reverted — DB is byte-for-byte as before.
+        monkeypatch.undo()
+        assert self._edge_set(backend) == before_edges
+        after_nodes = {r[0] for r in backend.execute_raw("MATCH (n:Function) RETURN n.id")}
+        assert after_nodes == before_nodes
+        assert backend.get_node(new.id) is None
+        assert backend.get_node(c.id) is not None  # removal rolled back
+
+        # Connection recovers for subsequent writes.
+        backend.add_nodes([self._fn("later", "src/a.py")])
+
+    def test_empty_delta_opens_no_transaction(self, backend: LadybugBackend) -> None:
+        from synaptiq.core.storage.base import GraphDelta
+
+        spy = _ConnSpy(backend._conn)
+        backend._conn = spy  # type: ignore[assignment]
+
+        backend.apply_graph_delta(GraphDelta())
+
+        assert "BEGIN TRANSACTION" not in spy.log
