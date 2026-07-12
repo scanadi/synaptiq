@@ -19,6 +19,8 @@ _PRUNE_DIRS: frozenset[str] = frozenset(
     ".git", "node_modules", "__pycache__", ".venv", "venv", ".env",
     "dist", "build", ".idea", ".vscode", ".mypy_cache", ".pytest_cache",
     ".ruff_cache", ".tox", ".eggs", ".synaptiq",
+    # Go: vendored third-party packages are not the user's own source.
+    "vendor",
 })
 
 

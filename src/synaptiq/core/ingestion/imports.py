@@ -68,6 +68,7 @@ def resolve_import_path(
     file_index: dict[str, str],
     source_roots: set[str] | None = None,
     ruby_basename_index: _RubyBasenameIndex | None = None,
+    go_package_index: _GoPackageIndex | None = None,
 ) -> str | None:
     """Resolve an import statement to the target file's node ID.
 
@@ -101,8 +102,39 @@ def resolve_import_path(
         return _resolve_js_ts(importing_file, import_info, file_index)
     if language == "ruby":
         return _resolve_ruby(importing_file, import_info, file_index, ruby_basename_index)
+    if language == "go":
+        # A Go package import resolves to every .go file in the package
+        # directory; this single-result entry point returns the first (see
+        # _resolve_import_targets / process_imports for the full fan-out).
+        targets = _resolve_go(import_info, file_index, go_package_index)
+        return targets[0] if targets else None
 
     return None
+
+
+def _resolve_import_targets(
+    importing_file: str,
+    import_info: ImportInfo,
+    file_index: dict[str, str],
+    source_roots: set[str] | None,
+    ruby_basename_index: _RubyBasenameIndex | None,
+    go_package_index: _GoPackageIndex | None,
+) -> list[str]:
+    """Return **all** target file node IDs an import resolves to.
+
+    Go package imports fan out to every ``.go`` file in the target package
+    directory (one IMPORTS edge per file, mirroring the file-level granularity
+    of Python package resolution and letting :mod:`calls` resolve a
+    ``pkg.Symbol`` call against whichever file of the package defines it).
+    Every other language resolves to at most one file, so its single result is
+    wrapped in a list (or an empty list when unresolved).
+    """
+    if _detect_language(importing_file) == "go":
+        return _resolve_go(import_info, file_index, go_package_index)
+    single = resolve_import_path(
+        importing_file, import_info, file_index, source_roots, ruby_basename_index
+    )
+    return [single] if single else []
 
 def process_imports(
     parse_data: list[FileParseData],
@@ -125,32 +157,39 @@ def process_imports(
     # is built at most once, lazily, on the first Ruby require that falls
     # through to the autoload-convention fallback (see _RubyBasenameIndex).
     ruby_basename_index = _RubyBasenameIndex(file_index)
+    # Shared across the run for Go package resolution (built lazily on the
+    # first Go import; see _GoPackageIndex).
+    go_package_index = _GoPackageIndex(file_index)
 
     for fpd in parse_data:
         source_file_id = generate_id(NodeLabel.FILE, fpd.file_path)
 
         for imp in fpd.parse_result.imports:
-            target_id = resolve_import_path(
-                fpd.file_path, imp, file_index, source_roots, ruby_basename_index
+            target_ids = _resolve_import_targets(
+                fpd.file_path, imp, file_index, source_roots,
+                ruby_basename_index, go_package_index,
             )
-            if target_id is None:
-                continue
+            for target_id in target_ids:
+                # A Go package fans out to every file in its directory; never
+                # link a file to itself.
+                if target_id == source_file_id:
+                    continue
 
-            pair = (source_file_id, target_id)
-            if pair in seen:
-                continue
-            seen.add(pair)
+                pair = (source_file_id, target_id)
+                if pair in seen:
+                    continue
+                seen.add(pair)
 
-            rel_id = f"imports:{source_file_id}->{target_id}"
-            graph.add_relationship(
-                GraphRelationship(
-                    id=rel_id,
-                    type=RelType.IMPORTS,
-                    source=source_file_id,
-                    target=target_id,
-                    properties={"symbols": ",".join(imp.names)},
+                rel_id = f"imports:{source_file_id}->{target_id}"
+                graph.add_relationship(
+                    GraphRelationship(
+                        id=rel_id,
+                        type=RelType.IMPORTS,
+                        source=source_file_id,
+                        target=target_id,
+                        properties={"symbols": ",".join(imp.names)},
+                    )
                 )
-            )
 
 def _detect_language(file_path: str) -> str:
     """Infer language from a file's extension."""
@@ -163,6 +202,8 @@ def _detect_language(file_path: str) -> str:
         return "javascript"
     if suffix in _RUBY_EXTENSIONS:
         return "ruby"
+    if suffix == ".go":
+        return "go"
     return ""
 
 def _resolve_python(
@@ -445,3 +486,81 @@ def _underscore(name: str) -> str:
         s = re.sub(r"([a-z\d])([A-Z])", r"\1_\2", s)
         segments.append(s.lower())
     return "/".join(segments)
+
+
+def _resolve_go(
+    import_info: ImportInfo,
+    file_index: dict[str, str],
+    go_package_index: _GoPackageIndex | None = None,
+) -> list[str]:
+    """Resolve a Go ``import`` path to the node IDs of the package's files.
+
+    A Go import path is ``<module-prefix>/<package-dir>``; the package's
+    surface is spread across *every* ``.go`` file in that directory, so the
+    import resolves to all of them (one IMPORTS edge per file downstream).
+    External/stdlib packages (``fmt``, ``net/http``) resolve to nothing.
+
+    Args:
+        go_package_index: Optional shared :class:`_GoPackageIndex`. A throwaway
+            instance scoped to this call is built when omitted.
+    """
+    if go_package_index is None:
+        go_package_index = _GoPackageIndex(file_index)
+    return go_package_index.resolve(import_info.module)
+
+
+def _build_go_package_index(file_index: dict[str, str]) -> dict[str, list[str]]:
+    """Group every ``.go`` *file_index* entry by its directory.
+
+    Each bucket is sorted for determinism. The directory keys are matched
+    against import-path suffixes by :class:`_GoPackageIndex`.
+    """
+    buckets: dict[str, list[str]] = defaultdict(list)
+    for path, node_id in file_index.items():
+        if path.endswith(".go"):
+            buckets[str(PurePosixPath(path).parent)].append(node_id)
+    for bucket in buckets.values():
+        bucket.sort()
+    return buckets
+
+
+class _GoPackageIndex:
+    """Memoized ``package_dir -> sorted [.go node_id, ...]`` index for Go
+    import resolution.
+
+    A Go import path mirrors the on-disk package directory prefixed by the
+    module path from ``go.mod``. The manifest is not a source file, so it never
+    enters the graph; instead of parsing it, this index matches the import
+    path's trailing segments against the discovered package directories. Go
+    requires the import path to mirror the directory layout, so the **longest**
+    path-suffix that names a real package directory is the target — stripping
+    the module prefix falls out for free, and repos with no ``go.mod``
+    (GOPATH-style) or nested modules resolve just the same.
+
+    Building the directory grouping is deferred until the first lookup — a run
+    with no Go imports never pays for it — and reused across the whole
+    :func:`process_imports` run when a single instance is shared.
+    """
+
+    def __init__(self, file_index: dict[str, str]) -> None:
+        self._file_index = file_index
+        self._dirs: dict[str, list[str]] | None = None
+
+    def resolve(self, import_path: str) -> list[str]:
+        """Return the node IDs of every ``.go`` file in *import_path*'s package.
+
+        Tries progressively shorter suffixes of the import path (longest first,
+        i.e. most specific) and returns the first that names a known package
+        directory. Returns ``[]`` for external packages.
+        """
+        if self._dirs is None:
+            self._dirs = _build_go_package_index(self._file_index)
+        if not import_path:
+            return []
+        parts = import_path.split("/")
+        for i in range(len(parts)):
+            suffix = "/".join(parts[i:])
+            match = self._dirs.get(suffix)
+            if match:
+                return match
+        return []

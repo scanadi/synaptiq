@@ -17,6 +17,7 @@ SUPPORTED_EXTENSIONS: dict[str, str] = {
     ".gemspec": "ruby",
     ".ru": "ruby",
     ".rbi": "ruby",
+    ".go": "go",
 }
 
 # Ruby (and a few other ecosystems) use suffix-less or non-``.rb`` files that are

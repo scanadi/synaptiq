@@ -72,6 +72,34 @@ _RB_HTTP_CALL = re.compile(
     r"\.(get|post|put|delete|patch|head)\s*\(?\s*[\"']([^\"']+)[\"']",
 )
 
+# Go route registration: net/http ``mux.HandleFunc("/x", h)`` / ``http.Handle``
+# and the gin/echo/chi/gorilla router DSL ``r.GET("/x", h)`` / ``r.Get("/x", h)``.
+# Group 1 is the receiver (used to reject ``http.Get`` — a *client* call, see
+# below — while keeping ``http.HandleFunc``), group 2 the verb, group 3 the
+# path. Go string literals are double-quoted or raw-backtick-quoted (single
+# quotes are runes, never URLs).
+_GO_ENDPOINT = re.compile(
+    r'\b(\w+)\.(Get|Post|Put|Delete|Patch|Head|Options|HandleFunc|Handle)'
+    r'\s*\(\s*["`]([^"`]+)["`]',
+    re.IGNORECASE,
+)
+
+# Go net/http client helpers: ``http.Get("url")`` / ``http.Post(...)`` /
+# ``http.Head`` / ``http.PostForm``. Case-sensitive — the stdlib API is
+# capitalised.
+_GO_HTTP_CALL = re.compile(
+    r'\bhttp\.(Get|Post|Head|PostForm)\s*\(\s*["`]([^"`]+)["`]',
+)
+
+# Go request builder: ``http.NewRequest("GET", "url", body)`` and
+# ``http.NewRequestWithContext(ctx, "GET", "url", body)`` — the optional leading
+# ctx arg is skipped by ``(?:[^,]+,\s*)?``. Group 1 is the method, group 2 the
+# URL.
+_GO_HTTP_NEWREQUEST = re.compile(
+    r'\bhttp\.NewRequest\w*\s*\(\s*(?:[^,]+,\s*)?'
+    r'["`](GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)["`]\s*,\s*["`]([^"`]+)["`]',
+)
+
 
 # ------------------------------------------------------------------
 # Cheap pre-filter — skip the per-line regex pass entirely for files that
@@ -108,9 +136,17 @@ _RB_HTTP_CALL = re.compile(
 #             get/post/put/delete/patch/head/options.
 #             `_RB_HTTP_CALL` always requires one of the literal receivers
 #             `HTTParty`/`Faraday`/`RestClient`/`Typhoeus`/`Net::HTTP`.
+#   Go      — `_GO_ENDPOINT` matches `<identifier>.<verb>(` where `<verb>` is a
+#             closed set get/post/put/delete/patch/head/options/handlefunc/
+#             handle (no distinctive receiver anchor is possible — routers are
+#             named `r`/`router`/`mux`/`e`/…). Every verb must be a token;
+#             `handle` is a literal substring of `handlefunc`, so one token
+#             covers both. `_GO_HTTP_CALL` and `_GO_HTTP_NEWREQUEST` always
+#             require the literal receiver `http` right before the dot, so the
+#             single token `http` anchors both.
 #
 # The check is done against `content.lower()` with lower-cased tokens. Both
-# Ruby regexes are case-sensitive (no `re.IGNORECASE`) in their real
+# Ruby regexes and the Go client regexes are case-sensitive in their real
 # matching, so lower-casing only ever *adds* candidate files versus the
 # exact-case regex — never drops one — which keeps the filter sound.
 # ------------------------------------------------------------------
@@ -141,12 +177,24 @@ _RB_PREFILTER_TOKENS = (
     "typhoeus",
     "net::http",
 )
+_GO_PREFILTER_TOKENS = (
+    "get",
+    "post",
+    "put",
+    "delete",
+    "patch",
+    "head",
+    "options",
+    "handle",  # substring of "handlefunc" too
+    "http",
+)
 
 _PREFILTER_TOKENS_BY_LANGUAGE: dict[str, tuple[str, ...]] = {
     "python": _PY_PREFILTER_TOKENS,
     "typescript": _TS_PREFILTER_TOKENS,
     "javascript": _TS_PREFILTER_TOKENS,
     "ruby": _RB_PREFILTER_TOKENS,
+    "go": _GO_PREFILTER_TOKENS,
 }
 
 
@@ -263,6 +311,47 @@ def extract_rest_info_from_source(
                         http_method=m.group(2).lower(),
                         line=i,
                         receiver=m.group(1),
+                    )
+                )
+
+    elif language == "go":
+        for i, line in enumerate(lines, 1):
+            # Route registration (net/http HandleFunc/Handle + gin/echo/chi
+            # router verbs).
+            for m in _GO_ENDPOINT.finditer(line):
+                receiver = m.group(1).lower()
+                verb = m.group(2).lower()
+                # ``http.Get``/``http.Post``/… is a client call (below), not a
+                # route; only ``http.HandleFunc``/``http.Handle`` are routes.
+                if receiver == "http" and verb not in ("handlefunc", "handle"):
+                    continue
+                # HandleFunc/Handle are method-agnostic — default to GET, which
+                # process_rest_linking treats as ambiguous (matches any method).
+                method = "get" if verb in ("handlefunc", "handle") else verb
+                endpoints.append(
+                    EndpointInfo(
+                        url_pattern=m.group(3),
+                        http_method=method,
+                        function_name="",
+                        line=i,
+                    )
+                )
+            # net/http client helpers.
+            for m in _GO_HTTP_CALL.finditer(line):
+                method = m.group(1).lower()
+                if method == "postform":
+                    method = "post"
+                http_calls.append(
+                    HttpCallInfo(url=m.group(2), http_method=method, line=i, receiver="http")
+                )
+            # http.NewRequest / NewRequestWithContext.
+            for m in _GO_HTTP_NEWREQUEST.finditer(line):
+                http_calls.append(
+                    HttpCallInfo(
+                        url=m.group(2),
+                        http_method=m.group(1).lower(),
+                        line=i,
+                        receiver="http",
                     )
                 )
 
@@ -574,6 +663,8 @@ def _detect_language(file_path: str) -> str | None:
         return "javascript"
     if file_path.endswith((".rb", ".rake", ".ru", ".gemspec", ".rbi")):
         return "ruby"
+    if file_path.endswith(".go"):
+        return "go"
     return None
 
 

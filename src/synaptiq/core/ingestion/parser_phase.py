@@ -123,10 +123,15 @@ def get_parser(language: str) -> LanguageParser:
 
         parser = RubyParser()
 
+    elif language == "go":
+        from synaptiq.core.parsers.go_lang import GoParser
+
+        parser = GoParser()
+
     else:
         raise ValueError(
             f"Unsupported language {language!r}. "
-            f"Expected one of: python, typescript, javascript, ruby"
+            f"Expected one of: python, typescript, javascript, ruby, go"
         )
 
     cache[language] = parser

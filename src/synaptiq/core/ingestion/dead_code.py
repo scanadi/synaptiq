@@ -100,7 +100,7 @@ def _is_test_file(file_path: str) -> bool:
         or "__fixtures__" in parts
         or any(p.startswith("test_") for p in parts)
         or file_path.endswith("conftest.py")
-        or filename.endswith(("_spec.rb", "_test.rb"))
+        or filename.endswith(("_spec.rb", "_test.rb", "_test.go"))
         or _has_test_suffix(filename)
     )
 
@@ -223,6 +223,18 @@ def _is_python_public_api(name: str, file_path: str) -> bool:
     """Return ``True`` if *name* is a public symbol in an ``__init__.py`` file."""
     return file_path.endswith("__init__.py") and not name.startswith("_")
 
+def _is_go_runtime_entry(name: str, file_path: str) -> bool:
+    """Return ``True`` for Go functions the runtime invokes with no call site.
+
+    ``main`` (the program entry point) and ``init`` (package initialisers, which
+    Go calls automatically and may declare more than once per package) never
+    have an incoming CALLS edge but are never dead.  Exported Go identifiers are
+    handled by the ``is_exported`` exemption (the parser adds every upper-cased
+    name to ``exports``), and ``Test*``/``Benchmark*``/``Fuzz*``/``Example*``
+    functions live in ``_test.go`` files caught by :func:`_is_test_file`.
+    """
+    return file_path.endswith(".go") and name in ("main", "init")
+
 def _is_config_file_hook(name: str, file_path: str) -> bool:
     """Return ``True`` if *name* is a known framework config hook in a config file."""
     if name in _CONFIG_CALLBACK_PATTERNS:
@@ -260,6 +272,7 @@ def _is_exempt(
     - It is a dunder method (``__str__``, ``__repr__``, etc.).
     - It is a Ruby metaprogramming hook (``method_missing``, etc.).
     - It is a public symbol in a Python ``__init__.py`` file.
+    - It is a Go runtime entry (``main`` / ``init`` in a ``.go`` file).
     """
     return (
         is_entry_point
@@ -271,6 +284,7 @@ def _is_exempt(
         or _is_dunder(name)
         or name in _RUBY_METAPROGRAMMING_NAMES
         or _is_python_public_api(name, file_path)
+        or _is_go_runtime_entry(name, file_path)
         or _is_config_file_hook(name, file_path)
         or _is_framework_entry_file(file_path)
     )

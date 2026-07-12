@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Synaptiq is a graph-powered code intelligence engine that indexes codebases into a knowledge graph (LadybugDB) and exposes it via MCP tools for AI agents and a Typer CLI for developers. It supports Python, TypeScript, JavaScript, and Ruby via tree-sitter parsing.
+Synaptiq is a graph-powered code intelligence engine that indexes codebases into a knowledge graph (LadybugDB) and exposes it via MCP tools for AI agents and a Typer CLI for developers. It supports Python, TypeScript, JavaScript, Ruby, and Go via tree-sitter parsing.
 
 Package name: `synaptiq` (published to PyPI). Python 3.11+ required.
 
@@ -66,12 +66,12 @@ The core of Synaptiq is `src/synaptiq/core/ingestion/pipeline.py` which orchestr
 3. `parser_phase.py` — tree-sitter AST extraction → Function/Class/Method/Module/Interface/Enum/TypeAlias nodes
 4. `imports.py` — import resolution to actual files (IMPORTS edges)
 5. `calls.py` — call tracing with confidence scores (CALLS edges, 1.0=exact, 0.8=receiver, 0.5=fuzzy)
-6. `rest_linking.py` — links REST endpoints to HTTP client calls across services (Python FastAPI/Flask, TS Express/axios, Ruby Sinatra/Rails routes + HTTParty/Faraday/RestClient/Typhoeus/Net::HTTP). Per-language regex extractors live in `extract_rest_info_from_source`.
-7. `heritage.py` — class inheritance (EXTENDS), interface implementation (IMPLEMENTS), and Ruby module mixins (MIXES_IN, from `include`/`extend`/`prepend`)
+6. `rest_linking.py` — links REST endpoints to HTTP client calls across services (Python FastAPI/Flask, TS Express/axios, Ruby Sinatra/Rails routes + HTTParty/Faraday/RestClient/Typhoeus/Net::HTTP, Go net/http HandleFunc/Handle + gin/echo/chi/gorilla router verbs + http.Get/Post/PostForm/NewRequest client calls). Per-language regex extractors live in `extract_rest_info_from_source`.
+7. `heritage.py` — class inheritance (EXTENDS), interface implementation (IMPLEMENTS), Ruby module mixins (MIXES_IN, from `include`/`extend`/`prepend`), and Go embedding (struct anonymous fields + interface elements → EXTENDS). Go interface *satisfaction* is undecidable without type checking, so no IMPLEMENTS edges are emitted for Go.
 8. `types.py` — type references from params/returns/variables (USES_TYPE edges)
 9. `community.py` — Leiden algorithm clustering (MEMBER_OF edges), seeded for determinism
 10. `processes.py` — framework-aware entry point detection + BFS flow tracing
-11. `dead_code.py` — multi-pass dead code analysis with exemptions for decorators, protocols, overrides; Ruby adds `initialize` constructors, metaprogramming hooks (`method_missing`, `inherited`, ...), `attr_*`/Rails-callback macro methods, and Rails framework base classes
+11. `dead_code.py` — multi-pass dead code analysis with exemptions for decorators, protocols, overrides; Ruby adds `initialize` constructors, metaprogramming hooks (`method_missing`, `inherited`, ...), `attr_*`/Rails-callback macro methods, and Rails framework base classes; Go adds `main`/`init` runtime entries and `_test.go` files (Go's exported-identifier convention is surfaced as `is_exported` by the parser, and `Test*`/`Benchmark*`/`Fuzz*`/`Example*` live in `_test.go`)
 12. `coupling.py` — git history co-change analysis (COUPLED_WITH edges)
 13. Embeddings (optional) — fastembed BAAI/bge-small-en-v1.5 384-dim vectors for semantic search. `analyze --embeddings lazy|sync|off` (default **lazy**; `--no-embeddings` is a deprecated alias for `off`). **lazy** (W4.1): `analyze` commits the graph first and returns a queryable index in seconds, then a detached worker (`core/embeddings/lazy_worker.py`, spawned as `synaptiq _embed-worker`) encodes vectors in the background — progress lands in `.synaptiq/embeddings_state.json` (surfaced by `synaptiq status`). The worker snapshots `meta.json`'s `last_indexed_at` as a staleness anchor, encodes read-only, then stores under the single-writer lock (retry → `deferred` if a daemon/racing analyze holds it; never fights the lock, never wipes). **sync** encodes inline (pre-W4.1 behavior). Daemons (`serve`/`watch`) always embed **synchronously** in their global rebuild — lazy is a CLI-`analyze` concept. Incremental across rebuilds (sync + daemon paths): vectors carry a `text_sha` of their source text, and `embed_graph(previous=...)` reuses stored vectors (snapshot via `load_previous_embeddings` BEFORE `bulk_load` wipes the DB) so only changed symbols hit ONNX — a one-file change re-encodes a handful of symbols, not all ~19k. (The lazy worker re-encodes the full set in the background since `bulk_load` clears the Embedding table before it runs.)
 
@@ -113,9 +113,11 @@ The `serve` command auto-detects role at startup. Design doc: `docs/plans/2026-0
 
 ### Parsers
 
-`src/synaptiq/core/parsers/` — `BaseParser` base class in `base.py`, with `python_lang.py`, `typescript.py`, and `ruby_lang.py` implementations. New language parsers extend `BaseParser` and register in `config/languages.py`.
+`src/synaptiq/core/parsers/` — `BaseParser` base class in `base.py`, with `python_lang.py`, `typescript.py`, `ruby_lang.py`, and `go_lang.py` implementations. New language parsers extend `BaseParser` and register in `config/languages.py`.
 
 Ruby support recognizes `.rb`, `.rake`, `.gemspec`, `.ru`, `.rbi` extensions plus suffix-less special files (`Rakefile`, `Gemfile`, `Guardfile`, `Capfile`, `Vagrantfile`, `Brewfile`, `Podfile`) via `SPECIAL_FILENAMES`. The parser emits `module` symbols (→ `MODULE` nodes) and a heritage `kind="mixin"` for `include`/`extend`/`prepend` (→ `MIXES_IN` edges); `class A < B` stays `EXTENDS`. Plain Ruby has no type annotations, so `types.py`/`USES_TYPE` emission is out of scope (future Sorbet/RBS work).
+
+Go support (`.go`) is single-pass. Symbol mapping: `func` → `function`; receiver funcs → `method` with `class_name` = the receiver type (pointer/generic stripped); `type X struct` → `class`; `type X interface` → `interface`; `type X = Y` / `type X Y` → `type_alias`; top-level `const`/`var` → `constant` (an unmapped kind — parsed, not materialised); each file's `package` clause → a `module` node. Struct embedding (anonymous fields) and interface embedding (`type_elem`) → `EXTENDS`; interface satisfaction is deliberately **not** modeled (no `IMPLEMENTS`). Go's exported convention (upper-case first letter) is surfaced via `ParseResult.exports` → `is_exported`. Import resolution (`imports.py`) maps a package import path to every `.go` file in the matching package directory (directory-suffix match — the go.mod module prefix is stripped implicitly, no manifest parse needed), one IMPORTS edge per file. Composite literals (`T{}` / `&T{}`) emit a call to the type (the Go analogue of `new`). `vendor/` is pruned by the walker; `_test.go` files are indexed (dead-code exemptions cover their `Test*` funcs).
 
 ## Code Style
 
@@ -133,4 +135,4 @@ Ruby support recognizes `.rb`, `.rake`, `.gemspec`, `.ru`, `.rbi` extensions plu
 
 ## Key Dependencies
 
-tree-sitter (parsing), ladybug (LadybugDB graph DB), igraph+leidenalg (community detection), fastembed (ONNX embeddings), mcp SDK (FastMCP), typer+rich (CLI), watchfiles (file watcher), pathspec (gitignore).
+tree-sitter (parsing; language grammars: tree-sitter-python/-javascript/-typescript/-ruby/-go), ladybug (LadybugDB graph DB), igraph+leidenalg (community detection), fastembed (ONNX embeddings), mcp SDK (FastMCP), typer+rich (CLI), watchfiles (file watcher), pathspec (gitignore).
