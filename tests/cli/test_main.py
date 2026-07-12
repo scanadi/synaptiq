@@ -72,6 +72,61 @@ class TestHelp:
             assert cmd in result.output, f"Command '{cmd}' not found in --help output"
 
 
+class TestAnalyzeProfile:
+    """Tests for `analyze --profile`."""
+
+    @staticmethod
+    def _write_tiny_repo(repo: Path) -> None:
+        src = repo / "src"
+        src.mkdir(parents=True)
+        (src / "main.py").write_text(
+            "def main():\n    return helper()\n\n\ndef helper():\n    return 42\n",
+            encoding="utf-8",
+        )
+
+    def test_analyze_profile_prints_timing_table(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repo = tmp_path / "repo"
+        self._write_tiny_repo(repo)
+        monkeypatch.chdir(repo)
+
+        result = runner.invoke(app, ["analyze", "--profile", "--no-embeddings"])
+
+        assert result.exit_code == 0, result.output
+        assert "Phase timings" in result.output
+        assert "Walking files" in result.output
+        assert "% of total" in result.output
+
+    def test_analyze_without_profile_omits_timing_table(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repo = tmp_path / "repo"
+        self._write_tiny_repo(repo)
+        monkeypatch.chdir(repo)
+
+        result = runner.invoke(app, ["analyze", "--no-embeddings"])
+
+        assert result.exit_code == 0, result.output
+        assert "Phase timings" not in result.output
+
+    def test_analyze_always_records_phase_timings_in_meta(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """phase_timings lands in meta.json regardless of --profile — it's a
+        display-only flag; the timing data itself is always captured."""
+        repo = tmp_path / "repo"
+        self._write_tiny_repo(repo)
+        monkeypatch.chdir(repo)
+
+        result = runner.invoke(app, ["analyze", "--no-embeddings"])
+        assert result.exit_code == 0, result.output
+
+        meta = json.loads((repo / ".synaptiq" / "meta.json").read_text())
+        assert "phase_timings" in meta["stats"]
+        assert "Walking files" in meta["stats"]["phase_timings"]
+
+
 class TestStatus:
     """Tests for the status command."""
 

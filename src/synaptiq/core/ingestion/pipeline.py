@@ -24,7 +24,8 @@ import json
 import logging
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -62,6 +63,11 @@ class PipelineResult:
     duration_seconds: float = 0.0
     incremental: bool = False
     changed_files: int = 0
+    # Wall-clock seconds per phase, keyed by the same names passed to
+    # progress_callback (plus "Loading to storage" / "Generating embeddings"
+    # when a storage backend is supplied). Values approximately sum to
+    # duration_seconds.
+    phase_timings: dict[str, float] = field(default_factory=dict)
 
 
 _SYMBOL_LABELS: frozenset[NodeLabel] = frozenset(NodeLabel) - {
@@ -114,57 +120,57 @@ def run_pipeline(
         if progress_callback is not None:
             progress_callback(phase, pct)
 
-    report("Walking files", 0.0)
-    gitignore = load_gitignore(repo_path)
-    files = walk_repo(repo_path, gitignore)
-    result.files = len(files)
-    report("Walking files", 1.0)
+    @contextmanager
+    def timed_phase(phase: str):
+        """Bracket *phase* with the existing report(0.0)/report(1.0) calls
+        (contract unchanged) and record its wall time on ``result``."""
+        report(phase, 0.0)
+        t0 = time.monotonic()
+        try:
+            yield
+        finally:
+            result.phase_timings[phase] = time.monotonic() - t0
+            report(phase, 1.0)
+
+    with timed_phase("Walking files"):
+        gitignore = load_gitignore(repo_path)
+        files = walk_repo(repo_path, gitignore)
+        result.files = len(files)
 
     graph = KnowledgeGraph()
 
-    report("Processing structure", 0.0)
-    process_structure(files, graph)
-    report("Processing structure", 1.0)
+    with timed_phase("Processing structure"):
+        process_structure(files, graph)
 
-    report("Parsing code", 0.0)
-    parse_data = process_parsing(files, graph)
-    report("Parsing code", 1.0)
+    with timed_phase("Parsing code"):
+        parse_data = process_parsing(files, graph)
 
-    report("Resolving imports", 0.0)
-    process_imports(parse_data, graph)
-    report("Resolving imports", 1.0)
+    with timed_phase("Resolving imports"):
+        process_imports(parse_data, graph)
 
-    report("Tracing calls", 0.0)
-    process_calls(parse_data, graph)
-    report("Tracing calls", 1.0)
+    with timed_phase("Tracing calls"):
+        process_calls(parse_data, graph)
 
-    report("Linking REST endpoints", 0.0)
-    result.rest_links = process_rest_linking(parse_data, graph)
-    report("Linking REST endpoints", 1.0)
+    with timed_phase("Linking REST endpoints"):
+        result.rest_links = process_rest_linking(parse_data, graph)
 
-    report("Extracting heritage", 0.0)
-    process_heritage(parse_data, graph)
-    report("Extracting heritage", 1.0)
+    with timed_phase("Extracting heritage"):
+        process_heritage(parse_data, graph)
 
-    report("Analyzing types", 0.0)
-    process_types(parse_data, graph)
-    report("Analyzing types", 1.0)
+    with timed_phase("Analyzing types"):
+        process_types(parse_data, graph)
 
-    report("Detecting communities", 0.0)
-    result.clusters = process_communities(graph)
-    report("Detecting communities", 1.0)
+    with timed_phase("Detecting communities"):
+        result.clusters = process_communities(graph)
 
-    report("Detecting execution flows", 0.0)
-    result.processes = process_processes(graph)
-    report("Detecting execution flows", 1.0)
+    with timed_phase("Detecting execution flows"):
+        result.processes = process_processes(graph)
 
-    report("Finding dead code", 0.0)
-    result.dead_code = process_dead_code(graph)
-    report("Finding dead code", 1.0)
+    with timed_phase("Finding dead code"):
+        result.dead_code = process_dead_code(graph)
 
-    report("Analyzing git history", 0.0)
-    result.coupled_pairs = process_coupling(graph, repo_path)
-    report("Analyzing git history", 1.0)
+    with timed_phase("Analyzing git history"):
+        result.coupled_pairs = process_coupling(graph, repo_path)
 
     if storage is not None:
         # Snapshot before bulk_load — it resets the whole database,
@@ -173,19 +179,17 @@ def run_pipeline(
             load_previous_embeddings(storage) if not skip_embeddings else {}
         )
 
-        report("Loading to storage", 0.0)
-        storage.bulk_load(graph)
-        report("Loading to storage", 1.0)
+        with timed_phase("Loading to storage"):
+            storage.bulk_load(graph)
 
         if not skip_embeddings:
-            report("Generating embeddings", 0.0)
-            from synaptiq.core.embeddings.embedder import embed_graph
+            with timed_phase("Generating embeddings"):
+                from synaptiq.core.embeddings.embedder import embed_graph
 
-            embeddings = embed_graph(graph, previous=previous_embeddings)
-            if embeddings:
-                storage.store_embeddings(embeddings)
-            result.embeddings = len(embeddings)
-            report("Generating embeddings", 1.0)
+                embeddings = embed_graph(graph, previous=previous_embeddings)
+                if embeddings:
+                    storage.store_embeddings(embeddings)
+                result.embeddings = len(embeddings)
 
     result.symbols = sum(1 for n in graph.iter_nodes() if n.label in _SYMBOL_LABELS)
     result.relationships = graph.relationship_count
@@ -334,6 +338,7 @@ def write_meta(data_dir: Path, repo_path: Path, result: PipelineResult) -> None:
             "dead_code": result.dead_code,
             "coupled_pairs": result.coupled_pairs,
             "embeddings": result.embeddings,
+            "phase_timings": result.phase_timings,
         },
         "last_indexed_at": datetime.now(tz=timezone.utc).isoformat(),
     }
