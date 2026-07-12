@@ -170,9 +170,7 @@ def run_pipeline(
             # collect_coupling_commits (pure subprocess + str parsing); it never
             # touches `graph`, which has no internal locking.
             graph_files = {f.path for f in files}
-            git_future = git_log_executor.submit(
-                collect_coupling_commits, repo_path, graph_files
-            )
+            git_future = git_log_executor.submit(collect_coupling_commits, repo_path, graph_files)
 
         graph = KnowledgeGraph()
 
@@ -235,9 +233,7 @@ def run_pipeline(
     if storage is not None:
         # Snapshot before bulk_load — it resets the whole database,
         # embedding table included.
-        previous_embeddings = (
-            load_previous_embeddings(storage) if not skip_embeddings else {}
-        )
+        previous_embeddings = load_previous_embeddings(storage) if not skip_embeddings else {}
 
         with timed_phase("Loading to storage"):
             storage.bulk_load(graph)
@@ -378,6 +374,12 @@ def build_full_index(
     pipeline crunches.  Embedding failures (model unavailable, offline)
     degrade gracefully — the graph is still usable without fresh vectors.
 
+    Daemon path: ``serve``/``watch`` global rebuilds embed **synchronously**
+    here (warm + cheap via ``text_sha`` reuse).  The lazy background worker
+    (``analyze --embeddings lazy``, see ``core/embeddings/lazy_worker.py``) is a
+    CLI-``analyze`` concept only — two background encoders colliding with a
+    daemon's own rebuild would be worse than a short synchronous re-embed.
+
     *previous_embeddings* (``{node_id: (text_sha, vector)}``, from
     :func:`load_previous_embeddings`) lets the embed step reuse vectors
     for symbols whose text did not change.
@@ -397,8 +399,7 @@ def build_full_index(
             result.embeddings = len(embeddings)
         except Exception:
             logger.warning(
-                "Embedding generation failed; vector search will be stale "
-                "until it succeeds",
+                "Embedding generation failed; vector search will be stale until it succeeds",
                 exc_info=True,
             )
     return graph, embeddings, result

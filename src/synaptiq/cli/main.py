@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 import sys
+from enum import Enum
 from pathlib import Path
 from typing import Optional
 
@@ -17,6 +18,21 @@ from synaptiq import __version__
 
 console = Console()
 _stderr_console = Console(stderr=True)
+
+
+class EmbeddingsMode(str, Enum):
+    """How ``analyze`` handles vector embeddings.
+
+    * ``lazy`` (default) — commit the graph first (index queryable in
+      seconds), then encode vectors in a detached background worker.
+    * ``sync`` — encode vectors inline before returning (the pre-W4.1
+      behaviour); the command blocks until embeddings are stored.
+    * ``off`` — skip embeddings entirely (keyword + fuzzy search only).
+    """
+
+    lazy = "lazy"
+    sync = "sync"
+    off = "off"
 
 
 def _write_meta(data_dir: Path, repo_path: Path, result: object) -> None:
@@ -177,8 +193,9 @@ def main(
     ),
 ) -> None:
     """Synaptiq — Graph-powered code intelligence engine."""
-    # Update check — skip for MCP transport commands (stdout is the protocol).
-    if len(sys.argv) < 2 or sys.argv[1] not in ("serve", "mcp"):
+    # Update check — skip for MCP transport commands (stdout is the protocol)
+    # and the detached embedding worker (a silent background process).
+    if len(sys.argv) < 2 or sys.argv[1] not in ("serve", "mcp", "_embed-worker"):
         from synaptiq.cli.update_check import check_for_update_message, trigger_background_check
 
         msg = check_for_update_message()
@@ -191,8 +208,21 @@ def main(
 def analyze(
     path: Path = typer.Argument(Path("."), help="Path to the repository to index."),
     full: bool = typer.Option(False, "--full", help="Perform a full re-index."),
+    embeddings: EmbeddingsMode = typer.Option(
+        EmbeddingsMode.lazy,
+        "--embeddings",
+        help=(
+            "Vector embedding strategy. lazy (default): return a queryable index "
+            "in seconds, then encode vectors in a background worker (check "
+            "progress with `synaptiq status`). sync: encode inline before "
+            "returning. off: skip embeddings (keyword + fuzzy search only)."
+        ),
+    ),
     no_embeddings: bool = typer.Option(
-        False, "--no-embeddings", help="Skip embedding generation for faster indexing."
+        False,
+        "--no-embeddings",
+        hidden=True,
+        help="Deprecated alias for `--embeddings off`.",
     ),
     profile: bool = typer.Option(
         False, "--profile", help="Print a per-phase timing breakdown after indexing."
@@ -215,6 +245,8 @@ def analyze(
 ) -> None:
     """Index a repository into a knowledge graph."""
     from synaptiq.core.daemon.lock import LockManager
+    from synaptiq.core.embeddings.embedder import embeddable_node_count
+    from synaptiq.core.embeddings.lazy_worker import spawn_lazy_worker
     from synaptiq.core.ingestion.pipeline import PipelineResult, run_pipeline
     from synaptiq.core.resources import set_jobs
     from synaptiq.core.storage.ladybug_backend import open_with_recovery
@@ -231,6 +263,18 @@ def analyze(
     # both read current_limits() at creation time (see core/resources.py).
     set_jobs(jobs)
 
+    # Resolve the embeddings strategy. --no-embeddings is a deprecated alias for
+    # --embeddings off: it still works (don't break scripts) but warns once.
+    mode = embeddings
+    if no_embeddings:
+        _stderr_console.print(
+            "[yellow]Warning:[/yellow] --no-embeddings is deprecated; use --embeddings off."
+        )
+        mode = EmbeddingsMode.off
+    # run_pipeline encodes inline only for sync; lazy defers to the background
+    # worker, off skips entirely.
+    skip_inline_embeddings = mode is not EmbeddingsMode.sync
+
     data_dir = repo_path / ".synaptiq"
     data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -240,12 +284,17 @@ def analyze(
     if lock_info is None:
         existing = lock_mgr.read_existing()
         if existing is not None and not existing.is_stale():
-            # Server is running — delegate reindex via its Unix socket.
+            # Server is running — delegate reindex via its Unix socket. Daemons
+            # embed synchronously (lazy is a CLI-analyze concept), so lazy/sync
+            # both let the server encode; only off skips.
             console.print(
                 f"[bold]Server running (PID {existing.pid}), requesting reindex...[/bold]"
             )
             _reindex_via_server(
-                existing.socket, full=full, skip_embeddings=no_embeddings, profile=profile
+                existing.socket,
+                full=full,
+                skip_embeddings=(mode is EmbeddingsMode.off),
+                profile=profile,
             )
             return
         # Stale lock — clean up and retry.
@@ -266,9 +315,7 @@ def analyze(
         # build_fts_indexes=False: bulk_load builds FTS over the populated
         # tables and swaps the fresh database in, so building empty FTS indexes
         # on this initial open would be pure waste (~2s on LadybugDB).
-        storage = open_with_recovery(
-            db_path, data_dir / "meta.json", build_fts_indexes=False
-        )
+        storage = open_with_recovery(db_path, data_dir / "meta.json", build_fts_indexes=False)
 
         result: PipelineResult | None = None
         with Progress(
@@ -282,18 +329,24 @@ def analyze(
             def on_progress(phase: str, pct: float) -> None:
                 progress.update(task, description=f"{phase} ({pct:.0%})")
 
-            _, result = run_pipeline(
+            graph, result = run_pipeline(
                 repo_path=repo_path,
                 storage=storage,
                 full=full,
                 progress_callback=on_progress,
-                skip_embeddings=no_embeddings,
+                skip_embeddings=skip_inline_embeddings,
             )
 
         _write_meta(data_dir, repo_path, result)
 
+        # How many symbols the background worker will encode (lazy mode only).
+        pending_embeddings = embeddable_node_count(graph) if mode is EmbeddingsMode.lazy else 0
+
         console.print()
-        console.print("[bold green]Indexing complete.[/bold green]")
+        if mode is EmbeddingsMode.lazy:
+            console.print("[bold green]Index ready.[/bold green]")
+        else:
+            console.print("[bold green]Indexing complete.[/bold green]")
         console.print(f"  Files:          {result.files}")
         console.print(f"  Symbols:        {result.symbols}")
         console.print(f"  Relationships:  {result.relationships}")
@@ -313,16 +366,88 @@ def analyze(
             console.print()
             _print_phase_timing_table(result.phase_timings, result.duration_seconds)
 
+        # Release the DB handle BEFORE spawning the worker so its read-only open
+        # (to load the graph) never collides with this process's write handle.
         storage.close()
+
+        if mode is EmbeddingsMode.lazy and pending_embeddings > 0:
+            pid = spawn_lazy_worker(repo_path)
+            console.print()
+            if pid is not None:
+                console.print(
+                    f"[cyan]Encoding {pending_embeddings:,} embeddings in the "
+                    f"background[/cyan] (PID {pid}) — run "
+                    "[bold]synaptiq status[/bold] to check progress."
+                )
+            else:
+                _stderr_console.print(
+                    "[yellow]Warning:[/yellow] could not start the background "
+                    "embedding worker; run `synaptiq analyze --embeddings sync` "
+                    "to encode vectors."
+                )
     finally:
         lock_mgr.release()
+
+
+@app.command(name="_embed-worker", hidden=True)
+def _embed_worker(
+    repo_path: Path = typer.Argument(..., help="Repository path to encode embeddings for."),
+) -> None:
+    """(internal) Detached background embedding worker.
+
+    Spawned by `analyze --embeddings lazy`. Not meant to be run by hand — it
+    encodes vectors for an already-committed index and publishes progress to
+    `.synaptiq/embeddings_state.json`.
+    """
+    import logging
+
+    from synaptiq.core.embeddings.lazy_worker import run_lazy_embedding_worker
+
+    # Diagnostics land in .synaptiq/embed_worker.log (the spawner redirects this
+    # process's stdout/stderr there). Safe to configure globally: dedicated proc.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    raise typer.Exit(code=run_lazy_embedding_worker(repo_path.resolve()))
+
+
+def _format_embeddings_status(data_dir: Path, stats: dict) -> str | None:
+    """One-line embeddings status for `synaptiq status`.
+
+    Prefers the live worker state file (``embeddings_state.json``); falls back
+    to the stored count in ``meta.json``.  Returns ``None`` when there is
+    nothing meaningful to show.
+    """
+    from synaptiq.core.embeddings.lazy_worker import read_state
+
+    state = read_state(data_dir)
+    if state is not None:
+        kind = state.get("state")
+        if kind == "encoding":
+            done = state.get("done", 0)
+            total = state.get("total", 0)
+            return f"encoding {done:,}/{total:,}"
+        if kind == "complete":
+            count = stats.get("embeddings", state.get("total", 0))
+            return f"{count:,} (complete)"
+        if kind == "failed":
+            return f"[red]failed[/red]: {state.get('error', 'unknown error')}"
+        if kind == "deferred":
+            detail = state.get("detail", "re-run `synaptiq analyze` to encode")
+            return f"[yellow]deferred[/yellow] ({detail})"
+    count = stats.get("embeddings", 0)
+    if count:
+        return f"{count:,}"
+    return None
 
 
 @app.command()
 def status() -> None:
     """Show index status for current repository."""
     repo_path = Path.cwd().resolve()
-    meta_path = repo_path / ".synaptiq" / "meta.json"
+    data_dir = repo_path / ".synaptiq"
+    meta_path = data_dir / "meta.json"
 
     if not meta_path.exists():
         console.print(
@@ -348,6 +473,10 @@ def status() -> None:
         console.print(f"  Dead code:      {stats['dead_code']}")
     if stats.get("coupled_pairs", 0) > 0:
         console.print(f"  Coupled pairs:  {stats['coupled_pairs']}")
+
+    embeddings_line = _format_embeddings_status(data_dir, stats)
+    if embeddings_line is not None:
+        console.print(f"  Embeddings:     {embeddings_line}")
 
 
 @app.command(name="list")

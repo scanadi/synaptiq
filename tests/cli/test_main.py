@@ -189,6 +189,122 @@ class TestAnalyzeJobsFlag:
         assert captured["limits"].pool_workers == 2
 
 
+class _FakeEmbedModel:
+    """Deterministic fastembed stand-in so CLI tests never download ONNX."""
+
+    def embed(self, texts, batch_size: int = 64):
+        import hashlib
+
+        import numpy as np
+
+        for text in texts:
+            seed = int.from_bytes(hashlib.md5(text.encode()).digest()[:4], "big")
+            yield np.random.default_rng(seed).random(384).astype(np.float32)
+
+
+class TestAnalyzeEmbeddingsFlag:
+    """Tests for `analyze --embeddings lazy|sync|off` (W4.1)."""
+
+    @staticmethod
+    def _tiny_repo(repo: Path) -> None:
+        src = repo / "src"
+        src.mkdir(parents=True)
+        (src / "main.py").write_text(
+            "def main():\n    return helper()\n\n\ndef helper():\n    return 42\n",
+            encoding="utf-8",
+        )
+
+    def test_help_lists_embeddings_modes(self) -> None:
+        result = runner.invoke(app, ["analyze", "--help"])
+        output = " ".join(result.output.replace("│", " ").split())
+        assert "--embeddings" in output
+        assert "lazy" in output and "sync" in output and "off" in output
+
+    def test_lazy_is_default_and_spawns_worker(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repo = tmp_path / "repo"
+        self._tiny_repo(repo)
+        monkeypatch.chdir(repo)
+
+        spawned: dict = {}
+        monkeypatch.setattr(
+            "synaptiq.core.embeddings.lazy_worker.spawn_lazy_worker",
+            lambda rp: spawned.setdefault("repo", rp) or 9999,
+        )
+
+        result = runner.invoke(app, ["analyze"])  # no --embeddings → lazy
+        assert result.exit_code == 0, result.output
+        assert "Index ready" in result.output
+        assert "in the background" in result.output
+        assert spawned["repo"] == repo.resolve()
+
+    def test_off_skips_embeddings_and_worker(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repo = tmp_path / "repo"
+        self._tiny_repo(repo)
+        monkeypatch.chdir(repo)
+
+        calls = {"n": 0}
+        monkeypatch.setattr(
+            "synaptiq.core.embeddings.lazy_worker.spawn_lazy_worker",
+            lambda rp: calls.__setitem__("n", calls["n"] + 1),
+        )
+
+        result = runner.invoke(app, ["analyze", ".", "--embeddings", "off"])
+        assert result.exit_code == 0, result.output
+        assert "Indexing complete" in result.output
+        assert "in the background" not in result.output
+        assert calls["n"] == 0
+        meta = json.loads((repo / ".synaptiq" / "meta.json").read_text())
+        assert meta["stats"]["embeddings"] == 0
+
+    def test_sync_embeds_inline_without_worker(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repo = tmp_path / "repo"
+        self._tiny_repo(repo)
+        monkeypatch.chdir(repo)
+
+        monkeypatch.setattr(
+            "synaptiq.core.embeddings.embedder._get_model",
+            lambda *a, **k: _FakeEmbedModel(),
+        )
+        calls = {"n": 0}
+        monkeypatch.setattr(
+            "synaptiq.core.embeddings.lazy_worker.spawn_lazy_worker",
+            lambda rp: calls.__setitem__("n", calls["n"] + 1),
+        )
+
+        result = runner.invoke(app, ["analyze", ".", "--embeddings", "sync"])
+        assert result.exit_code == 0, result.output
+        assert "Indexing complete" in result.output
+        assert calls["n"] == 0  # sync never spawns a background worker
+        meta = json.loads((repo / ".synaptiq" / "meta.json").read_text())
+        assert meta["stats"]["embeddings"] > 0  # vectors stored inline
+
+    def test_no_embeddings_alias_warns_and_skips(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repo = tmp_path / "repo"
+        self._tiny_repo(repo)
+        monkeypatch.chdir(repo)
+
+        calls = {"n": 0}
+        monkeypatch.setattr(
+            "synaptiq.core.embeddings.lazy_worker.spawn_lazy_worker",
+            lambda rp: calls.__setitem__("n", calls["n"] + 1),
+        )
+
+        result = runner.invoke(app, ["analyze", ".", "--no-embeddings"])
+        assert result.exit_code == 0, result.output
+        assert "deprecated" in result.output
+        assert calls["n"] == 0  # behaves like off
+        meta = json.loads((repo / ".synaptiq" / "meta.json").read_text())
+        assert meta["stats"]["embeddings"] == 0
+
+
 class TestStatus:
     """Tests for the status command."""
 
@@ -226,6 +342,58 @@ class TestStatus:
         assert "10" in result.output  # files
         assert "42" in result.output  # symbols
         assert "100" in result.output  # relationships
+
+    @staticmethod
+    def _write_index(tmp_path: Path, state: dict | None, *, embeddings: int = 0) -> Path:
+        data_dir = tmp_path / ".synaptiq"
+        data_dir.mkdir(exist_ok=True)
+        meta = {
+            "version": "1.0.0",
+            "stats": {"files": 1, "symbols": 2, "relationships": 3, "embeddings": embeddings},
+            "last_indexed_at": "2026-07-12T10:00:00+00:00",
+        }
+        (data_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        if state is not None:
+            (data_dir / "embeddings_state.json").write_text(json.dumps(state), encoding="utf-8")
+        return data_dir
+
+    def test_status_shows_encoding_progress(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        self._write_index(tmp_path, {"state": "encoding", "done": 12431, "total": 26203})
+        result = runner.invoke(app, ["status"])
+        assert result.exit_code == 0
+        assert "encoding 12,431/26,203" in result.output
+
+    def test_status_shows_complete(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        self._write_index(tmp_path, {"state": "complete", "done": 42, "total": 42}, embeddings=42)
+        result = runner.invoke(app, ["status"])
+        assert "42 (complete)" in result.output
+
+    def test_status_shows_failed(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        self._write_index(tmp_path, {"state": "failed", "error": "model offline"})
+        result = runner.invoke(app, ["status"])
+        assert "failed" in result.output
+        assert "model offline" in result.output
+
+    def test_status_shows_deferred(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        self._write_index(tmp_path, {"state": "deferred", "detail": "index locked"})
+        result = runner.invoke(app, ["status"])
+        assert "deferred" in result.output
+
+    def test_status_falls_back_to_meta_count(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With no state file, the stored embedding count is shown."""
+        monkeypatch.chdir(tmp_path)
+        self._write_index(tmp_path, None, embeddings=17)
+        result = runner.invoke(app, ["status"])
+        assert "Embeddings:" in result.output
+        assert "17" in result.output
 
 
 class TestListRepos:
