@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import posixpath
 import re
+from collections import defaultdict
 from pathlib import PurePosixPath
 
 from synaptiq.core.graph.graph import KnowledgeGraph
@@ -66,6 +67,7 @@ def resolve_import_path(
     import_info: ImportInfo,
     file_index: dict[str, str],
     source_roots: set[str] | None = None,
+    ruby_basename_index: _RubyBasenameIndex | None = None,
 ) -> str | None:
     """Resolve an import statement to the target file's node ID.
 
@@ -80,6 +82,12 @@ def resolve_import_path(
         file_index: Mapping of relative file paths to their graph node IDs.
         source_roots: Optional set of detected source roots for resolving
             imports in ``src/`` layout projects.
+        ruby_basename_index: Optional shared :class:`_RubyBasenameIndex` for
+            Ruby autoload-convention fallback resolution. Callers resolving
+            many imports against the same *file_index* (e.g.
+            :func:`process_imports`) should build one instance and pass it
+            to every call so the underlying basename index is built at most
+            once. When omitted, a throwaway instance is created per call.
 
     Returns:
         The node ID of the resolved target file, or ``None`` if the import
@@ -92,7 +100,7 @@ def resolve_import_path(
     if language in ("typescript", "javascript"):
         return _resolve_js_ts(importing_file, import_info, file_index)
     if language == "ruby":
-        return _resolve_ruby(importing_file, import_info, file_index)
+        return _resolve_ruby(importing_file, import_info, file_index, ruby_basename_index)
 
     return None
 
@@ -113,12 +121,18 @@ def process_imports(
     file_index = build_file_index(graph)
     source_roots = _detect_source_roots(file_index)
     seen: set[tuple[str, str]] = set()
+    # Shared across the whole run: the underlying basename->candidates index
+    # is built at most once, lazily, on the first Ruby require that falls
+    # through to the autoload-convention fallback (see _RubyBasenameIndex).
+    ruby_basename_index = _RubyBasenameIndex(file_index)
 
     for fpd in parse_data:
         source_file_id = generate_id(NodeLabel.FILE, fpd.file_path)
 
         for imp in fpd.parse_result.imports:
-            target_id = resolve_import_path(fpd.file_path, imp, file_index, source_roots)
+            target_id = resolve_import_path(
+                fpd.file_path, imp, file_index, source_roots, ruby_basename_index
+            )
             if target_id is None:
                 continue
 
@@ -304,6 +318,7 @@ def _resolve_ruby(
     importing_file: str,
     import_info: ImportInfo,
     file_index: dict[str, str],
+    basename_index: _RubyBasenameIndex | None = None,
 ) -> str | None:
     """Resolve a Ruby ``require``/``require_relative``/``autoload`` to a file node.
 
@@ -317,6 +332,11 @@ def _resolve_ruby(
       (``UserService`` -> ``app/services/user_service.rb``).
 
     Returns ``None`` for external gems (``require "rails"``) and missing files.
+
+    Args:
+        basename_index: Optional pre-built/shared basename index for the
+            autoload-convention fallback (see :class:`_RubyBasenameIndex`).
+            A throwaway instance scoped to this call is used when omitted.
     """
     module = import_info.module
 
@@ -333,9 +353,12 @@ def _resolve_ruby(
     # Convention-based fallback: match by snake_cased basename. The required
     # feature itself may already be snake_case ("user_service"); autoload also
     # carries the CamelCase constant in ``names`` ("UserService").
+    if basename_index is None:
+        basename_index = _RubyBasenameIndex(file_index)
+
     candidates = [module, *import_info.names]
     for candidate in candidates:
-        result = _resolve_ruby_by_basename(_underscore(candidate), file_index)
+        result = basename_index.resolve(_underscore(candidate))
         if result:
             return result
 
@@ -353,26 +376,60 @@ def _try_ruby_paths(base_path: str, file_index: dict[str, str]) -> str | None:
             return file_index[candidate]
     return None
 
-def _resolve_ruby_by_basename(
-    name: str, file_index: dict[str, str]
-) -> str | None:
-    """Match *name* against file basenames using the Rails autoload convention.
+def _ruby_basename_target(name: str) -> str:
+    """Compute the ``.rb``-suffixed basename that *name* should match.
 
     ``name`` is a (possibly ``/``-namespaced) snake_case path; only the final
     segment is compared against each indexed file's basename, so
-    ``user_service`` resolves to ``app/services/user_service.rb`` regardless of
-    its directory.  Returns the lexicographically-first match for determinism.
+    ``user_service`` and ``app/services/user_service`` both target
+    ``user_service.rb``.
     """
     target = PurePosixPath(name).name
     if not target.endswith(".rb"):
         target = f"{target}.rb"
+    return target
 
-    matches = sorted(
-        node_id
-        for path, node_id in file_index.items()
-        if PurePosixPath(path).name == target
-    )
-    return matches[0] if matches else None
+def _build_ruby_basename_index(file_index: dict[str, str]) -> dict[str, list[str]]:
+    """Group every *file_index* entry by basename for O(1) autoload lookups.
+
+    Each bucket is sorted so that, exactly like the ``sorted(...)`` call it
+    replaces, the lexicographically-first node ID wins when multiple files
+    in different directories share a basename.
+    """
+    buckets: dict[str, list[str]] = defaultdict(list)
+    for path, node_id in file_index.items():
+        buckets[PurePosixPath(path).name].append(node_id)
+    for bucket in buckets.values():
+        bucket.sort()
+    return buckets
+
+class _RubyBasenameIndex:
+    """Memoized ``basename -> sorted [node_id, ...]`` index for Ruby autoload
+    resolution.
+
+    The previous implementation re-scanned and re-sorted the *entire* file
+    index for every unresolved ``require`` (``O(files)`` per lookup). This
+    class instead builds a ``basename -> sorted candidates`` grouping once
+    and reuses it for every subsequent lookup (``O(1)`` after the first).
+
+    Building the index is deferred until the first lookup — a require that
+    resolves via a literal path never needs it — so projects with no
+    autoload-style requires (or no Ruby at all) never pay for it. Callers
+    that resolve many requires against the same *file_index* (a whole
+    :func:`process_imports` run) should create a single instance and share
+    it so the one-time build cost is paid at most once for the run.
+    """
+
+    def __init__(self, file_index: dict[str, str]) -> None:
+        self._file_index = file_index
+        self._buckets: dict[str, list[str]] | None = None
+
+    def resolve(self, name: str) -> str | None:
+        """Return the winning node ID for *name*'s basename target, if any."""
+        if self._buckets is None:
+            self._buckets = _build_ruby_basename_index(self._file_index)
+        matches = self._buckets.get(_ruby_basename_target(name))
+        return matches[0] if matches else None
 
 def _underscore(name: str) -> str:
     """Convert a Ruby constant path to its conventional snake_case file path.

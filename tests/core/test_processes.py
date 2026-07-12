@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import random
+import time
+
 import pytest
 
 from synaptiq.core.graph.graph import KnowledgeGraph
@@ -446,6 +449,79 @@ class TestTraceFlowMaxDepth:
 
 
 # ---------------------------------------------------------------------------
+# 4b. W2.5a: trace_flow's heap-based branch selection (processes.py:238-240)
+#
+# These pin two subtleties of the pre-existing full-sort-then-skip loop
+# that a naive ``heapq.nlargest(max_branching, ...)`` truncation would get
+# wrong:
+#   1. An edge to an already-visited node must not consume the branch
+#      budget -- the search has to keep looking past it.
+#   2. Equal-confidence edges keep their original (insertion) order among
+#      the selected branches (Python's stable sort + reverse=True keeps
+#      ties in original order, not reversed order).
+# ---------------------------------------------------------------------------
+
+
+class TestTraceFlowBranchingSkipsVisitedWithinBudget:
+    """A high-confidence edge to an already-visited node must not consume
+    the branch budget -- the search must continue past it to find enough
+    NEW nodes, exactly like the pre-heap full-sort-then-skip loop did.
+    """
+
+    def test_looks_past_visited_top_ranked_edge(self) -> None:
+        g = KnowledgeGraph()
+        e = _add_function(g, "e")
+        d = _add_function(g, "d")
+        p = _add_function(g, "p")
+        q = _add_function(g, "q")
+        r = _add_function(g, "r")
+
+        # E's two outgoing edges both get taken (budget 2): d first
+        # (highest confidence), then p.
+        _add_call(g, e, d, confidence=1.0)
+        _add_call(g, e, p, confidence=0.9)
+
+        # d's outgoing edges, ranked by confidence: p (already visited via
+        # e), then q, then r. With a branch budget of 2, the algorithm must
+        # skip p (visited, doesn't consume budget) and then take BOTH q
+        # and r -- a naive top-2-by-confidence truncation would only ever
+        # consider {p, q}, skip p, and stop after q, silently dropping r.
+        _add_call(g, d, p, confidence=1.0)
+        _add_call(g, d, q, confidence=0.9)
+        _add_call(g, d, r, confidence=0.5)
+
+        flow = trace_flow(e, g, max_branching=2)
+        flow_names = {n.name for n in flow}
+
+        assert flow_names == {"e", "d", "p", "q", "r"}
+
+
+class TestTraceFlowBranchingTieBreak:
+    """Equal-confidence outgoing edges keep their original (insertion)
+    order among the selected branches, matching the old
+    ``list.sort(key=..., reverse=True)`` stable-sort tie-break.
+    """
+
+    def test_equal_confidence_ties_keep_insertion_order(self) -> None:
+        g = KnowledgeGraph()
+        e = _add_function(g, "e")
+        x = _add_function(g, "x")
+        y = _add_function(g, "y")
+        z = _add_function(g, "z")
+
+        # All three tie on confidence; only the budget's worth (2) should
+        # be taken, in insertion order: x, then y (z is dropped).
+        _add_call(g, e, x, confidence=0.5)
+        _add_call(g, e, y, confidence=0.5)
+        _add_call(g, e, z, confidence=0.5)
+
+        flow = trace_flow(e, g, max_branching=2)
+        flow_names = [n.name for n in flow]
+
+        assert flow_names == ["e", "x", "y"]
+
+
+# ---------------------------------------------------------------------------
 # 5. test_generate_process_label
 # ---------------------------------------------------------------------------
 
@@ -583,3 +659,141 @@ class TestProcessProcessesReturnsCount:
         process_nodes = graph.get_nodes_by_label(NodeLabel.PROCESS)
         assert count == len(process_nodes)
         assert count > 0
+
+
+# ---------------------------------------------------------------------------
+# 10. W2.5a equivalence + scale — deduplicate_flows inverted-index rewrite
+#
+# ``_deduplicate_flows_reference`` below is a frozen, verbatim copy of the
+# pre-W2.5a all-pairs O(n^2) algorithm (the one that used to live in
+# ``deduplicate_flows`` itself). It is deliberately NOT imported from
+# source -- the whole point is to pin the *old* behaviour independently of
+# whatever ``synaptiq.core.ingestion.processes.deduplicate_flows`` does now,
+# so a future edit to the real implementation can't accidentally make this
+# test compare an implementation against itself.
+# ---------------------------------------------------------------------------
+
+
+def _deduplicate_flows_reference(
+    flows: list[list[GraphNode]],
+) -> list[list[GraphNode]]:
+    """Frozen copy of the pre-W2.5a O(n^2) all-pairs implementation."""
+    flows_sorted = sorted(flows, key=len, reverse=True)
+
+    kept: list[list[GraphNode]] = []
+    kept_sets: list[set[str]] = []
+
+    for flow in flows_sorted:
+        flow_ids = {n.id for n in flow}
+        is_duplicate = False
+
+        for kept_set in kept_sets:
+            if not flow_ids or not kept_set:
+                continue
+            intersection = flow_ids & kept_set
+            smaller_size = min(len(flow_ids), len(kept_set))
+            overlap = len(intersection) / smaller_size
+            if overlap > 0.5:
+                is_duplicate = True
+                break
+
+        if not is_duplicate:
+            kept.append(flow)
+            kept_sets.append(flow_ids)
+
+    return kept
+
+
+def _make_flow(node_ids: list[str]) -> list[GraphNode]:
+    """Build a flow (list of GraphNode) from a list of node ids."""
+    return [GraphNode(id=nid, label=NodeLabel.FUNCTION, name=nid) for nid in node_ids]
+
+
+class TestDeduplicateFlowsEquivalence:
+    """The inverted-index rewrite must match the frozen O(n^2) reference."""
+
+    def test_matches_reference_on_many_overlapping_flows(self) -> None:
+        """500 flows across 50 disjoint clusters, with heavy intra-cluster
+        overlap (some near-duplicates should collapse) and zero
+        inter-cluster overlap (most flows should survive) -- this exercises
+        both the "shares a node -> must compare" and "shares nothing -> safe
+        to skip" branches of the inverted-index pruning.
+        """
+        rng = random.Random(20260712)
+        flows: list[list[GraphNode]] = []
+
+        for cluster in range(50):
+            base = [f"c{cluster}n{i}" for i in range(20)]
+            for _variant in range(10):
+                length = rng.randint(3, 20)
+                node_ids = rng.sample(base, length)
+                flows.append(_make_flow(node_ids))
+
+        assert len(flows) == 500
+
+        expected = _deduplicate_flows_reference(list(flows))
+        actual = deduplicate_flows(list(flows))
+
+        expected_ids = [[n.id for n in f] for f in expected]
+        actual_ids = [[n.id for n in f] for f in actual]
+        assert actual_ids == expected_ids
+        # Sanity: both some collapsing (intra-cluster) and some survival
+        # (inter-cluster) actually happened, so the comparison is meaningful.
+        assert 50 <= len(actual) < 500
+
+    def test_matches_reference_with_equal_length_ties(self) -> None:
+        """Many same-length flows exercise the stable-sort tie-break: ties
+        must keep their original relative order, exactly like Python's
+        ``sorted(..., reverse=True)``.
+        """
+        rng = random.Random(9)
+        flows: list[list[GraphNode]] = []
+        for i in range(120):
+            # All flows the same length (10) so `sorted(key=len, reverse=True)`
+            # is an all-ties sort -- original order must be preserved.
+            node_ids = [f"t{i}n{j}" for j in range(10)]
+            # Deliberately overlap a couple of neighbours' ids so some
+            # duplicate decisions are actually exercised, not just no-ops.
+            if i % 7 == 0 and i > 0:
+                node_ids[:3] = [f"t{i - 1}n{j}" for j in range(3)]
+            rng.shuffle(node_ids)
+            flows.append(_make_flow(node_ids))
+
+        expected = _deduplicate_flows_reference(list(flows))
+        actual = deduplicate_flows(list(flows))
+
+        expected_ids = [[n.id for n in f] for f in expected]
+        actual_ids = [[n.id for n in f] for f in actual]
+        assert actual_ids == expected_ids
+
+    def test_empty_flow_is_always_kept(self) -> None:
+        """A flow with zero nodes never registers as a duplicate (matches
+        the original guard: ``if not flow_ids or not kept_set: continue``).
+        """
+        empty_flow: list[GraphNode] = []
+        other = _make_flow(["a", "b", "c"])
+
+        expected = _deduplicate_flows_reference([empty_flow, other, empty_flow])
+        actual = deduplicate_flows([empty_flow, other, empty_flow])
+
+        assert len(actual) == len(expected) == 3
+
+
+class TestDeduplicateFlowsScale:
+    """The inverted-index rewrite must stay fast on a large, mostly-disjoint
+    input -- the scenario that made the old all-pairs algorithm O(n^2).
+    """
+
+    def test_500_disjoint_flows_completes_quickly(self) -> None:
+        flows = [_make_flow([f"f{i}n{j}" for j in range(20)]) for i in range(500)]
+
+        start = time.perf_counter()
+        result = deduplicate_flows(flows)
+        elapsed = time.perf_counter() - start
+
+        # Fully disjoint flows can never overlap -> all 500 survive.
+        assert len(result) == 500
+        # Generous bound (the new implementation should take low
+        # milliseconds here); this only needs to catch a regression back
+        # to O(n^2) all-pairs comparison, not chase a tight benchmark.
+        assert elapsed < 2.0

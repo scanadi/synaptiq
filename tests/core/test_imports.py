@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import time
+from pathlib import PurePosixPath
+
 import pytest
 
 from synaptiq.core.graph.graph import KnowledgeGraph
@@ -12,6 +15,7 @@ from synaptiq.core.graph.model import (
     generate_id,
 )
 from synaptiq.core.ingestion.imports import (
+    _RubyBasenameIndex,
     build_file_index,
     process_imports,
     resolve_import_path,
@@ -547,3 +551,190 @@ class TestProcessImportsNoDuplicates:
 
         imports_rels = graph.get_relationships_by_type(RelType.IMPORTS)
         assert len(imports_rels) == 1
+
+
+# ---------------------------------------------------------------------------
+# W2.5b equivalence + scale — Ruby basename resolution indexing
+#
+# ``_resolve_ruby_by_basename_reference`` below is a frozen, verbatim copy
+# of the pre-W2.5b per-lookup scan+sort implementation (it used to be
+# ``_resolve_ruby_by_basename`` in source). It is deliberately NOT imported
+# from source -- the whole point is to pin the *old* behaviour independently
+# of whatever ``_RubyBasenameIndex`` does now, so a future edit to the real
+# implementation can't accidentally make this test compare an
+# implementation against itself.
+# ---------------------------------------------------------------------------
+
+
+def _resolve_ruby_by_basename_reference(
+    name: str, file_index: dict[str, str]
+) -> str | None:
+    """Frozen copy of the pre-W2.5b scan-the-whole-index-per-lookup
+    implementation. Same sort key as today: the lexicographically-first
+    *node id* (not path) among files sharing the target basename wins.
+    """
+    target = PurePosixPath(name).name
+    if not target.endswith(".rb"):
+        target = f"{target}.rb"
+
+    matches = sorted(
+        node_id
+        for path, node_id in file_index.items()
+        if PurePosixPath(path).name == target
+    )
+    return matches[0] if matches else None
+
+
+def _build_large_ruby_file_index() -> dict[str, str]:
+    """A 130+ file index with several basenames that are deliberately
+    ambiguous (same basename, multiple directories) so the "which node id
+    wins" tie-break is actually exercised.
+    """
+    file_index: dict[str, str] = {}
+
+    ambiguous: dict[str, list[str]] = {
+        "user_service": [
+            "app/services",
+            "lib/legacy",
+            "vendor/gems/foo/lib",
+            "z_shadow/services",
+        ],
+        "base_controller": [
+            "app/controllers",
+            "app/controllers/api",
+            "lib/legacy/controllers",
+        ],
+        "http_client": ["lib/net", "app/clients", "vendor/http_client/lib"],
+    }
+    for basename, dirs in ambiguous.items():
+        for d in dirs:
+            path = f"{d}/{basename}.rb"
+            file_index[path] = generate_id(NodeLabel.FILE, path)
+
+    # Pad out to 130+ unambiguous files.
+    for i in range(120):
+        path = f"app/models/model_{i:03d}.rb"
+        file_index[path] = generate_id(NodeLabel.FILE, path)
+
+    return file_index
+
+
+class TestRubyBasenameIndexEquivalence:
+    """The indexed lookup must match the frozen per-lookup scan+sort
+    reference on a large file index with ambiguous basenames.
+    """
+
+    def test_matches_reference_for_ambiguous_and_unique_names(self) -> None:
+        file_index = _build_large_ruby_file_index()
+        assert len(file_index) >= 100
+
+        lookups = [
+            "user_service",
+            "UserService",
+            "base_controller",
+            "BaseController",
+            "http_client",
+            "HTTPClient",
+            "model_000",
+            "model_042",
+            "model_119",
+            "app/services/user_service",  # namespaced-looking input
+            "does_not_exist",
+            "does/not/exist_either",
+        ]
+
+        index = _RubyBasenameIndex(file_index)
+        for name in lookups:
+            expected = _resolve_ruby_by_basename_reference(name, file_index)
+            actual = index.resolve(name)
+            assert actual == expected, f"mismatch for {name!r}"
+
+    def test_ambiguous_winner_is_lexicographically_first_node_id(self) -> None:
+        """Pin the actual winning value (not just old==new) for one
+        ambiguous basename, so a silent shift in tie-break key (e.g. path
+        instead of node id) would be caught even if both implementations
+        drifted together.
+        """
+        file_index = _build_large_ruby_file_index()
+        expected_winner = min(
+            generate_id(NodeLabel.FILE, f"{d}/user_service.rb")
+            for d in ("app/services", "lib/legacy", "vendor/gems/foo/lib", "z_shadow/services")
+        )
+
+        index = _RubyBasenameIndex(file_index)
+        assert index.resolve("user_service") == expected_winner
+        assert _resolve_ruby_by_basename_reference("user_service", file_index) == expected_winner
+
+    def test_end_to_end_through_process_imports(self) -> None:
+        """The winner selection also holds through the full public API
+        (resolve_import_path -> _resolve_ruby -> _RubyBasenameIndex), not
+        just the indexed helper in isolation.
+        """
+        g = KnowledgeGraph()
+        paths = [
+            "app/services/user_service.rb",
+            "lib/legacy/user_service.rb",
+            "app/main.rb",
+        ]
+        for path in paths:
+            g.add_node(
+                GraphNode(
+                    id=generate_id(NodeLabel.FILE, path),
+                    label=NodeLabel.FILE,
+                    name=path.rsplit("/", 1)[-1],
+                    file_path=path,
+                    language="ruby",
+                )
+            )
+
+        parse_data = [
+            FileParseData(
+                file_path="app/main.rb",
+                language="ruby",
+                parse_result=ParseResult(
+                    imports=[
+                        ImportInfo(
+                            module="user_service",
+                            names=["UserService"],
+                            is_relative=False,
+                        ),
+                    ],
+                ),
+            ),
+        ]
+
+        process_imports(parse_data, g)
+
+        imports_rels = g.get_relationships_by_type(RelType.IMPORTS)
+        assert len(imports_rels) == 1
+        expected_winner = min(
+            generate_id(NodeLabel.FILE, "app/services/user_service.rb"),
+            generate_id(NodeLabel.FILE, "lib/legacy/user_service.rb"),
+        )
+        assert imports_rels[0].target == expected_winner
+
+
+class TestRubyBasenameIndexScale:
+    """The indexed lookup must stay fast across many repeated lookups
+    against a large file index -- the scenario that made the old
+    scan-the-whole-index-per-lookup implementation expensive.
+    """
+
+    def test_many_lookups_on_shared_index_complete_quickly(self) -> None:
+        file_index = _build_large_ruby_file_index()
+        # 600 lookups (120 distinct basenames, repeated 5x) against a
+        # single shared index, mirroring how process_imports reuses one
+        # _RubyBasenameIndex across an entire run.
+        names = [f"model_{i:03d}" for i in range(120)] * 5
+        assert len(names) == 600
+
+        index = _RubyBasenameIndex(file_index)
+
+        start = time.perf_counter()
+        results = [index.resolve(name) for name in names]
+        elapsed = time.perf_counter() - start
+
+        assert all(r is not None for r in results)
+        # Generous bound -- only needs to catch a regression back to an
+        # O(files) scan per lookup, not chase a tight benchmark.
+        assert elapsed < 2.0
