@@ -152,7 +152,9 @@ class RubyParser(LanguageParser):
                 kind=kind,
                 start_line=node.start_point[0] + 1,
                 end_line=node.end_point[0] + 1,
-                content=content[node.start_byte : node.end_byte],
+                # node.text is the node's exact source bytes — slicing the str
+                # with byte offsets would drift on any non-ASCII content.
+                content=node.text.decode("utf8"),
                 signature=self._build_signature(node, name),
                 class_name=class_name,
             )
@@ -189,7 +191,9 @@ class RubyParser(LanguageParser):
                 kind=kind,
                 start_line=node.start_point[0] + 1,
                 end_line=node.end_point[0] + 1,
-                content=content[node.start_byte : node.end_byte],
+                # node.text is the node's exact source bytes — slicing the str
+                # with byte offsets would drift on any non-ASCII content.
+                content=node.text.decode("utf8"),
                 signature=self._build_signature(node, name, receiver=receiver),
                 class_name=class_name,
             )
@@ -216,7 +220,9 @@ class RubyParser(LanguageParser):
             kind="class",
             start_line=node.start_point[0] + 1,
             end_line=node.end_point[0] + 1,
-            content=content[node.start_byte : node.end_byte],
+            # node.text is the node's exact source bytes — slicing the str
+            # with byte offsets would drift on any non-ASCII content.
+            content=node.text.decode("utf8"),
         )
         result.symbols.append(symbol)
 
@@ -248,7 +254,9 @@ class RubyParser(LanguageParser):
             kind="module",
             start_line=node.start_point[0] + 1,
             end_line=node.end_point[0] + 1,
-            content=content[node.start_byte : node.end_byte],
+            # node.text is the node's exact source bytes — slicing the str
+            # with byte offsets would drift on any non-ASCII content.
+            content=node.text.decode("utf8"),
         )
         result.symbols.append(symbol)
 
@@ -279,7 +287,9 @@ class RubyParser(LanguageParser):
                 kind="constant",
                 start_line=node.start_point[0] + 1,
                 end_line=node.end_point[0] + 1,
-                content=content[node.start_byte : node.end_byte],
+                # node.text is the node's exact source bytes — slicing the str
+                # with byte offsets would drift on any non-ASCII content.
+                content=node.text.decode("utf8"),
                 class_name=class_name,
             )
         )
