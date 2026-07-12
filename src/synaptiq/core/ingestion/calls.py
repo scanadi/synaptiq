@@ -101,6 +101,18 @@ _RUBY_CALL_BLOCKLIST: frozenset[str] = frozenset({
     "freeze!", "tap", "then", "yield_self",
 })
 
+# Go builtin functions whose definitions do not live in the user's codebase.
+# Kept separate from ``_CALL_BLOCKLIST`` and applied ONLY to Go files: several
+# of these names (``make``, ``new``, ``copy``, ``delete``, ``close``, ``min``,
+# ``max``, ``clear``, ``append`` ...) are perfectly ordinary user-defined
+# function names in Python/TS/Ruby, so blocklisting them globally would drop
+# legitimate CALLS edges in non-Go codebases.
+_GO_CALL_BLOCKLIST: frozenset[str] = frozenset({
+    "append", "cap", "clear", "close", "complex", "copy", "delete", "imag",
+    "len", "make", "max", "min", "new", "panic", "print", "println", "real",
+    "recover",
+})
+
 
 def _build_import_cache(
     file_path: str,
@@ -464,13 +476,15 @@ def process_calls(
     for fpd in parse_data:
         import_cache = _build_import_cache(fpd.file_path, graph)
 
-        # Ruby's Enumerable/Kernel names collide with ordinary user function
-        # names in other languages, so only fold them in for Ruby files.
-        blocklist = (
-            _CALL_BLOCKLIST | _RUBY_CALL_BLOCKLIST
-            if fpd.language == "ruby"
-            else _CALL_BLOCKLIST
-        )
+        # Ruby's Enumerable/Kernel and Go's builtin names collide with ordinary
+        # user function names in other languages, so only fold each in for its
+        # own language's files.
+        if fpd.language == "ruby":
+            blocklist = _CALL_BLOCKLIST | _RUBY_CALL_BLOCKLIST
+        elif fpd.language == "go":
+            blocklist = _CALL_BLOCKLIST | _GO_CALL_BLOCKLIST
+        else:
+            blocklist = _CALL_BLOCKLIST
 
         for call in fpd.parse_result.calls:
             # Builtin/stdlib names never resolve as call targets, but their

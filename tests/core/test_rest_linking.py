@@ -4,6 +4,9 @@ from synaptiq.core.graph.graph import KnowledgeGraph
 from synaptiq.core.graph.model import GraphNode, NodeLabel, generate_id
 from synaptiq.core.ingestion.parser_phase import FileParseData
 from synaptiq.core.ingestion.rest_linking import (
+    _GO_ENDPOINT,
+    _GO_HTTP_CALL,
+    _GO_HTTP_NEWREQUEST,
     _PY_ENDPOINT_DECORATOR,
     _PY_HTTP_CALL,
     _PY_HTTP_CALL_FSTRING,
@@ -199,6 +202,89 @@ class TestRubyExtractionEdgeCases:
         assert hcs == []
 
 
+class TestGoExtraction:
+    def test_nethttp_handlefunc_endpoint(self):
+        code = 'func r() {\n\tmux.HandleFunc("/users", h.ServeUsers)\n}'
+        eps, hcs = extract_rest_info_from_source(code, "server.go", "go")
+        assert len(eps) == 1
+        assert eps[0].url_pattern == "/users"
+        assert eps[0].http_method == "get"  # HandleFunc is method-agnostic
+        assert eps[0].line == 2
+
+    def test_nethttp_handle_endpoint(self):
+        code = 'http.Handle("/static", fs)'
+        eps, hcs = extract_rest_info_from_source(code, "server.go", "go")
+        assert len(eps) == 1
+        assert eps[0].url_pattern == "/static"
+        assert eps[0].http_method == "get"
+
+    def test_gin_router_verbs(self):
+        code = 'r.GET("/items", list)\nr.POST("/items", create)'
+        eps, hcs = extract_rest_info_from_source(code, "routes.go", "go")
+        assert [(e.http_method, e.url_pattern) for e in eps] == [
+            ("get", "/items"),
+            ("post", "/items"),
+        ]
+
+    def test_chi_router_capitalized_verbs(self):
+        code = 'r.Get("/health", ok)\nr.Delete("/items/{id}", del)'
+        eps, hcs = extract_rest_info_from_source(code, "routes.go", "go")
+        assert [(e.http_method, e.url_pattern) for e in eps] == [
+            ("get", "/health"),
+            ("delete", "/items/{id}"),
+        ]
+
+    def test_raw_string_backtick_url(self):
+        code = "e.GET(`/raw/path`, handler)"
+        eps, hcs = extract_rest_info_from_source(code, "routes.go", "go")
+        assert len(eps) == 1
+        assert eps[0].url_pattern == "/raw/path"
+
+    def test_http_client_get(self):
+        code = 'resp, _ := http.Get("http://svc/users")'
+        eps, hcs = extract_rest_info_from_source(code, "client.go", "go")
+        assert eps == []
+        assert len(hcs) == 1
+        assert hcs[0].http_method == "get"
+        assert hcs[0].receiver == "http"
+        assert hcs[0].url == "http://svc/users"
+
+    def test_http_client_postform_normalizes_to_post(self):
+        code = 'http.PostForm("http://svc/form", vals)'
+        eps, hcs = extract_rest_info_from_source(code, "client.go", "go")
+        assert len(hcs) == 1
+        assert hcs[0].http_method == "post"
+
+    def test_http_newrequest(self):
+        code = 'req, _ := http.NewRequest("PUT", "http://svc/items/1", body)'
+        eps, hcs = extract_rest_info_from_source(code, "client.go", "go")
+        assert len(hcs) == 1
+        assert hcs[0].http_method == "put"
+        assert hcs[0].url == "http://svc/items/1"
+
+    def test_http_newrequest_with_context(self):
+        code = 'req, _ := http.NewRequestWithContext(ctx, "GET", "http://svc/x", nil)'
+        eps, hcs = extract_rest_info_from_source(code, "client.go", "go")
+        assert len(hcs) == 1
+        assert hcs[0].http_method == "get"
+        assert hcs[0].url == "http://svc/x"
+
+
+class TestGoExtractionEdgeCases:
+    def test_http_get_not_misread_as_route(self):
+        # ``http.Get`` is a client call, never a route — no endpoint emitted.
+        code = 'http.Get("http://svc/users")'
+        eps, hcs = extract_rest_info_from_source(code, "client.go", "go")
+        assert eps == []
+        assert len(hcs) == 1
+
+    def test_non_literal_url_ignored(self):
+        code = 'http.Get(url)\nr.GET(pathVar, handler)'
+        eps, hcs = extract_rest_info_from_source(code, "x.go", "go")
+        assert eps == []
+        assert hcs == []
+
+
 class TestDetectLanguage:
     def test_ruby_extensions(self):
         assert _detect_language("app.rb") == "ruby"
@@ -211,7 +297,7 @@ class TestDetectLanguage:
         assert _detect_language("a.py") == "python"
         assert _detect_language("a.ts") == "typescript"
         assert _detect_language("a.js") == "javascript"
-        assert _detect_language("a.go") is None
+        assert _detect_language("a.go") == "go"
 
 
 # ---------------------------------------------------------------------------
@@ -540,6 +626,7 @@ _REGEXES_BY_LANGUAGE: dict[str, tuple] = {
     "typescript": (_TS_ENDPOINT, _TS_FETCH, _TS_AXIOS),
     "javascript": (_TS_ENDPOINT, _TS_FETCH, _TS_AXIOS),
     "ruby": (_RB_ENDPOINT, _RB_HTTP_CALL),
+    "go": (_GO_ENDPOINT, _GO_HTTP_CALL, _GO_HTTP_NEWREQUEST),
 }
 
 # (content, language) samples — the full set of source snippets exercised
@@ -578,6 +665,17 @@ _PREFILTER_SAMPLES: list[tuple[str, str]] = [
     ),
     ('File.delete "/tmp/cache"\nuser.post "/x"', "ruby"),
     ("HTTParty.get(url)\nNet::HTTP.get(uri)", "ruby"),
+    # Go samples — every extractor family plus deliberate negatives.
+    ('func r() {\n\tmux.HandleFunc("/users", h.ServeUsers)\n}', "go"),
+    ('http.Handle("/static", fs)', "go"),
+    ('r.GET("/items", list)\nr.POST("/items", create)', "go"),
+    ('r.Get("/health", ok)\nr.Delete("/items/{id}", del)', "go"),
+    ("e.GET(`/raw/path`, handler)", "go"),
+    ('resp, _ := http.Get("http://svc/users")', "go"),
+    ('http.PostForm("http://svc/form", vals)', "go"),
+    ('req, _ := http.NewRequest("PUT", "http://svc/items/1", body)', "go"),
+    ('req, _ := http.NewRequestWithContext(ctx, "GET", "http://svc/x", nil)', "go"),
+    ("http.Get(url)\nr.GET(pathVar, handler)", "go"),
     (_GOLDEN_PY_API, "python"),
     (_GOLDEN_PY_CLIENT, "python"),
     (_GOLDEN_TS_ROUTES, "typescript"),

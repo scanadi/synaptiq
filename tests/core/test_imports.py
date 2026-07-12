@@ -15,6 +15,8 @@ from synaptiq.core.graph.model import (
     generate_id,
 )
 from synaptiq.core.ingestion.imports import (
+    _GoPackageIndex,
+    _resolve_go,
     _RubyBasenameIndex,
     build_file_index,
     process_imports,
@@ -331,6 +333,126 @@ class TestResolveRubyExternal:
         imp = ImportInfo(module="../lib/missing", names=[], is_relative=True)
         result = resolve_import_path("app/main.rb", imp, file_index)
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# resolve_import_path / _resolve_go — Go
+# ---------------------------------------------------------------------------
+
+
+_GO_FILE_PATHS = [
+    "main.go",
+    "models/user.go",
+    "models/repo.go",
+    "services/user_service.go",
+    "internal/models/thing.go",
+]
+
+
+@pytest.fixture()
+def go_file_index() -> dict[str, str]:
+    return {path: generate_id(NodeLabel.FILE, path) for path in _GO_FILE_PATHS}
+
+
+class TestResolveGo:
+    """Go package imports resolve to every .go file in the package directory.
+
+    Resolution is directory-based (import path suffix → package dir), so the
+    ``example.com/app`` module prefix is stripped without parsing go.mod.
+    """
+
+    def test_package_resolves_to_all_files_in_dir(
+        self, go_file_index: dict[str, str]
+    ) -> None:
+        imp = ImportInfo(module="example.com/app/models")
+        targets = _resolve_go(imp, go_file_index)
+        assert set(targets) == {
+            generate_id(NodeLabel.FILE, "models/user.go"),
+            generate_id(NodeLabel.FILE, "models/repo.go"),
+        }
+
+    def test_single_file_package(self, go_file_index: dict[str, str]) -> None:
+        imp = ImportInfo(module="example.com/app/services")
+        targets = _resolve_go(imp, go_file_index)
+        assert targets == [generate_id(NodeLabel.FILE, "services/user_service.go")]
+
+    def test_longest_suffix_wins(self, go_file_index: dict[str, str]) -> None:
+        # internal/models must beat the root-level models package.
+        imp = ImportInfo(module="example.com/app/internal/models")
+        targets = _resolve_go(imp, go_file_index)
+        assert targets == [generate_id(NodeLabel.FILE, "internal/models/thing.go")]
+
+    def test_external_package_resolves_to_nothing(
+        self, go_file_index: dict[str, str]
+    ) -> None:
+        assert _resolve_go(ImportInfo(module="net/http"), go_file_index) == []
+        assert _resolve_go(ImportInfo(module="fmt"), go_file_index) == []
+
+    def test_resolve_import_path_returns_first(
+        self, go_file_index: dict[str, str]
+    ) -> None:
+        # The single-result entry point returns the first (sorted) file id.
+        imp = ImportInfo(module="example.com/app/models")
+        result = resolve_import_path("services/user_service.go", imp, go_file_index)
+        assert result == generate_id(NodeLabel.FILE, "models/repo.go")
+
+    def test_shared_index_matches_throwaway(self, go_file_index: dict[str, str]) -> None:
+        shared = _GoPackageIndex(go_file_index)
+        imp = ImportInfo(module="example.com/app/models")
+        assert _resolve_go(imp, go_file_index, shared) == _resolve_go(imp, go_file_index)
+
+
+class TestProcessImportsGo:
+    """A Go package import fans out to one IMPORTS edge per file in the dir."""
+
+    def _go_graph(self) -> KnowledgeGraph:
+        g = KnowledgeGraph()
+        for path in _GO_FILE_PATHS:
+            g.add_node(
+                GraphNode(
+                    id=generate_id(NodeLabel.FILE, path),
+                    label=NodeLabel.FILE,
+                    name=PurePosixPath(path).name,
+                    file_path=path,
+                    language="go",
+                )
+            )
+        return g
+
+    def test_package_import_creates_one_edge_per_file(self) -> None:
+        graph = self._go_graph()
+        parse_data = [
+            FileParseData(
+                file_path="services/user_service.go",
+                language="go",
+                parse_result=ParseResult(
+                    imports=[ImportInfo(module="example.com/app/models")],
+                ),
+            ),
+        ]
+        process_imports(parse_data, graph)
+
+        rels = graph.get_relationships_by_type(RelType.IMPORTS)
+        targets = {r.target for r in rels}
+        assert targets == {
+            generate_id(NodeLabel.FILE, "models/user.go"),
+            generate_id(NodeLabel.FILE, "models/repo.go"),
+        }
+        assert all(
+            r.source == generate_id(NodeLabel.FILE, "services/user_service.go") for r in rels
+        )
+
+    def test_external_import_creates_no_edges(self) -> None:
+        graph = self._go_graph()
+        parse_data = [
+            FileParseData(
+                file_path="main.go",
+                language="go",
+                parse_result=ParseResult(imports=[ImportInfo(module="net/http")]),
+            ),
+        ]
+        process_imports(parse_data, graph)
+        assert graph.get_relationships_by_type(RelType.IMPORTS) == []
 
 
 # ---------------------------------------------------------------------------
