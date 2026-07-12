@@ -65,3 +65,17 @@ Raw JSON: session task output `bpzm9odjy` (numbers transcribed above verbatim).
 **Not visible here (Wave-2 wins at scale):** process-parallel parsing 6.36× on a 500-file corpus (W2.1, threshold-gated); single-pass walks ~1.2× on extraction (W2.2, honest below-estimate result — old symbol walk was already light); calls-phase symbol-ID reuse + O(1) same-file resolution (W2.5c); flow-dedup and Ruby-import quadratic fixes (W2.5ab). The real `analyze` CLI additionally skips ~1.9s of empty-FTS build on open (W2.7) that this bench's timed phases don't include.
 
 **Caveat — these numbers were measured WITH pyarrow installed** (the `fast-load` / dev extra). A default `pip install synaptiq` has no pyarrow and takes the CSV COPY path, so the "Loading to storage" numbers above will be **higher** until pyarrow is installed or promoted to a core dependency (owner decision pending).
+
+---
+
+# Production validation — lvlp-app (post-review-fixes, main @ 0298bd3)
+
+**Target:** 3,514 files / 22,689 symbols / 115,684 relationships / ~26k embeddings (790k LOC). Prior reference: **726s** full index on v1.5.1 (kuzu) capped to 6/10 cores, 2026-07-12 14:35. Dev build, default settings, `--profile`, `/usr/bin/time -l`.
+
+| Run | Wall time | Avg cores | Notes |
+|---|---|---|---|
+| 1. Cold, `--no-embeddings` | **10.7s** | 1.7 | Whole pipeline+storage; old kuzu-0.11.3 single-file index handled cleanly by the recovery path; graph parity vs old index (symbol count exact; rel/coupling deltas = rolling git window) |
+| 2. Cold, with embeddings | **630s** (vs 726s, −13%) | 7.1 | **98.3% of wall time is ONNX encode (619.6s)**; pipeline+storage = ~11s; peak RSS 4.5GB |
+| 3. Warm re-run, with embeddings | **15.8s** | 2.4 | text_sha reuse: 26k vectors reused, embed phase 619.6s → 4.4s; index file 385MB → 239MB (−38%) |
+
+**Conclusions:** (1) the non-ML pipeline is effectively solved at this scale (~11s for 790k LOC); (2) warm full re-analysis at ~16s makes `analyze` a viable everyday command; (3) cold-start embedding encode is now >98% of first-index time — **W4.1 lazy background embeddings is the single remaining product lever** (index usable in ~11s, vectors fill in behind); W4.4 fast-embeddings would attack the same 620s.
