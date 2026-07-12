@@ -29,6 +29,22 @@ from typing import Any, Callable, Iterator
 
 import kuzu
 
+try:
+    # kuzu 0.11.3's replacement scan (``COPY <table> FROM <in-memory object>``)
+    # references ``importlib.util`` without importing it, so the very first COPY
+    # raises ``AttributeError: module 'importlib' has no attribute 'util'``.
+    # Importing it here (stdlib, cheap, idempotent) makes the attribute
+    # resolvable for kuzu's native loader — kept next to the pyarrow import so it
+    # is present exactly when the Arrow bulk path can run.
+    import importlib.util  # noqa: F401
+
+    import pyarrow as pa
+
+    _HAS_PYARROW = True
+except ImportError:  # pragma: no cover - exercised in CSV-only environments
+    pa = None  # type: ignore[assignment]
+    _HAS_PYARROW = False
+
 from synaptiq.core.graph.graph import KnowledgeGraph
 from synaptiq.core.graph.model import GraphNode, GraphRelationship, NodeLabel
 from synaptiq.core.storage.base import NodeEmbedding, SearchResult
@@ -123,6 +139,17 @@ def _serialize_properties(properties: dict[str, Any] | None) -> str:
         return json.dumps(properties, default=str)
     except (TypeError, ValueError):
         return ""
+
+
+def _arrow_str(value: str | None) -> str | None:
+    """Coerce empty/``None`` strings to ``None`` for the Arrow COPY path.
+
+    Kuzu's CSV reader stores an empty field as ``NULL``, so the CSV bulk path
+    already persists ``""`` as ``NULL``. Mirroring that here keeps the Arrow and
+    CSV loaders byte-identical: a non-empty string is stored verbatim, while
+    ``""``/``None`` land as ``NULL`` in both paths.
+    """
+    return value if value else None
 
 
 def deserialize_properties(raw: Any) -> dict[str, Any]:
@@ -246,7 +273,9 @@ class KuzuBackend:
         """
         return self._generation
 
-    def initialize(self, path: Path, *, read_only: bool = False) -> None:
+    def initialize(
+        self, path: Path, *, read_only: bool = False, _build_fts_indexes: bool = True
+    ) -> None:
         """Open or create the KuzuDB database at *path* and set up the schema.
 
         Args:
@@ -258,6 +287,14 @@ class KuzuBackend:
                 schema is verified so a database created by an older
                 synaptiq fails loudly instead of silently returning
                 empty results for every query.
+            _build_fts_indexes: Internal. When ``False``, skip building the
+                (empty) FTS indexes during schema creation — used by
+                :meth:`bulk_load` for its ``.rebuild`` database, which calls
+                :meth:`rebuild_fts_indexes` right after the COPY to build them
+                over the populated tables. Building them on empty tables first
+                is pure waste (~25% of the storage-load time). The default
+                ``True`` preserves behaviour for every other caller, so a
+                database queried before any bulk_load still has its indexes.
         """
         from synaptiq.core.resources import current_limits
 
@@ -278,7 +315,7 @@ class KuzuBackend:
         with self._pool_lock:
             self._generation += 1
         if not read_only:
-            self._create_schema()
+            self._create_schema(build_fts=_build_fts_indexes)
         else:
             self._verify_schema()
 
@@ -1009,7 +1046,8 @@ class KuzuBackend:
     def store_embeddings(self, embeddings: list[NodeEmbedding]) -> None:
         """Persist embedding vectors and build the HNSW vector index.
 
-        Attempts batch CSV COPY FROM first, falls back to individual MERGE.
+        Attempts a batch COPY FROM first (Arrow when pyarrow is installed, else
+        CSV), falling back to individual MERGE on failure.
         """
         assert self._conn is not None
         if not embeddings:
@@ -1019,7 +1057,7 @@ class KuzuBackend:
         # the indexed column (fallback path) both fail while it exists.
         self._drop_vector_index()
 
-        if not self._bulk_store_embeddings_csv(embeddings):
+        if not self._bulk_store_embeddings(embeddings):
             dim = len(embeddings[0].embedding)
             for emb in embeddings:
                 try:
@@ -1230,7 +1268,8 @@ class KuzuBackend:
         scratch rather than ``MATCH (n) DETACH DELETE n`` also avoids a
         Kuzu native segfault on large deletes.
 
-        Uses CSV-based COPY FROM for bulk loading nodes and relationships,
+        Uses COPY FROM for bulk loading nodes and relationships — an in-memory
+        Arrow table when pyarrow is installed, otherwise a temporary CSV —
         falling back to individual inserts if COPY FROM fails.
 
         The swap waits for in-flight reads to drain first: a read whose
@@ -1244,11 +1283,14 @@ class KuzuBackend:
 
         self._remove_db_files(tmp_path)
         builder = KuzuBackend()
-        builder.initialize(tmp_path)
+        # Skip building FTS indexes on the empty schema — rebuild_fts_indexes()
+        # below builds them over the populated tables right after the COPY, so
+        # the empty-table build would be pure waste (~25% of storage-load time).
+        builder.initialize(tmp_path, _build_fts_indexes=False)
         try:
-            if not builder._bulk_load_nodes_csv(graph):
+            if not builder._bulk_load_nodes(graph):
                 builder.add_nodes(list(graph.iter_nodes()))
-            if not builder._bulk_load_rels_csv(graph):
+            if not builder._bulk_load_rels(graph):
                 builder.add_relationships(list(graph.iter_relationships()))
             builder.rebuild_fts_indexes()
         except BaseException:
@@ -1323,10 +1365,24 @@ class KuzuBackend:
             if csv_path:
                 Path(csv_path).unlink(missing_ok=True)
 
-    def _bulk_load_nodes_csv(self, graph: KnowledgeGraph) -> bool:
-        """Load all nodes via temporary CSV files + COPY FROM.
+    def _arrow_copy(self, table: str, arrow_tbl: pa.Table) -> None:
+        """COPY an in-memory pyarrow Table into *table*.
 
-        Returns True on success, False if COPY FROM is not available.
+        Kuzu resolves the source object via a replacement scan that inspects
+        this frame's local variables, so ``arrow_tbl`` MUST stay the name both
+        of the parameter and of the identifier in the query — do not rename one
+        without the other. A typed Arrow table carries multiline strings and
+        ``FLOAT[dim]`` vectors natively, so no ``PARALLEL=false`` flag, temp
+        file, or per-value stringification is needed.
+        """
+        assert self._conn is not None
+        self._conn.execute(f"COPY {table} FROM arrow_tbl")
+
+    def _group_nodes_by_table(self, graph: KnowledgeGraph) -> dict[str, list[GraphNode]]:
+        """Bucket nodes into their label tables, deduplicated by ``node.id``.
+
+        The last occurrence of a duplicate id wins. Shared by the CSV and Arrow
+        bulk paths so both load a byte-identical row set.
         """
         by_table: dict[str, list[GraphNode]] = {}
         for node in graph.iter_nodes():
@@ -1334,7 +1390,6 @@ class KuzuBackend:
             if table:
                 by_table.setdefault(table, []).append(node)
 
-        # Deduplicate by node.id within each table, keeping the last occurrence.
         for table, nodes in by_table.items():
             seen: dict[str, int] = {}
             for i, node in enumerate(nodes):
@@ -1346,9 +1401,27 @@ class KuzuBackend:
                     table,
                 )
                 by_table[table] = [nodes[i] for i in sorted(seen.values())]
+        return by_table
 
+    def _bulk_load_nodes(self, graph: KnowledgeGraph) -> bool:
+        """Bulk-load nodes via the fastest available COPY path.
+
+        Prefers the in-memory Arrow path when pyarrow is installed, else the
+        temp-CSV path. Returns ``True`` on success; ``False`` signals
+        :meth:`bulk_load` to fall back to row-by-row inserts (idempotent MERGE),
+        exactly as the CSV path did before.
+        """
+        if _HAS_PYARROW:
+            return self._bulk_load_nodes_arrow(graph)
+        return self._bulk_load_nodes_csv(graph)
+
+    def _bulk_load_nodes_csv(self, graph: KnowledgeGraph) -> bool:
+        """Load all nodes via temporary CSV files + COPY FROM.
+
+        Returns True on success, False if COPY FROM is not available.
+        """
         try:
-            for table, nodes in by_table.items():
+            for table, nodes in self._group_nodes_by_table(graph).items():
                 self._csv_copy(
                     table,
                     [
@@ -1378,10 +1451,66 @@ class KuzuBackend:
             )
             return False
 
-    def _bulk_load_rels_csv(self, graph: KnowledgeGraph) -> bool:
-        """Load all relationships via temporary CSV files + COPY FROM.
+    def _bulk_load_nodes_arrow(self, graph: KnowledgeGraph) -> bool:
+        """Load all nodes via in-memory pyarrow tables + COPY FROM.
 
-        Returns True on success, False if COPY FROM is not available.
+        Column order and types mirror ``_NODE_PROPERTIES``. Empty strings are
+        coerced to ``NULL`` (see :func:`_arrow_str`) so the result is identical
+        to the CSV path, whose reader stores an empty field as ``NULL``.
+        Returns ``False`` on failure so the caller falls back to row-by-row.
+        """
+        try:
+            for table, nodes in self._group_nodes_by_table(graph).items():
+                arrow_tbl = pa.table(
+                    {
+                        "id": pa.array([n.id for n in nodes], type=pa.string()),
+                        "name": pa.array([_arrow_str(n.name) for n in nodes], type=pa.string()),
+                        "file_path": pa.array(
+                            [_arrow_str(n.file_path) for n in nodes], type=pa.string()
+                        ),
+                        "start_line": pa.array([n.start_line for n in nodes], type=pa.int64()),
+                        "end_line": pa.array([n.end_line for n in nodes], type=pa.int64()),
+                        "content": pa.array(
+                            [_arrow_str(n.content) for n in nodes], type=pa.string()
+                        ),
+                        "signature": pa.array(
+                            [_arrow_str(n.signature) for n in nodes], type=pa.string()
+                        ),
+                        "language": pa.array(
+                            [_arrow_str(n.language) for n in nodes], type=pa.string()
+                        ),
+                        "class_name": pa.array(
+                            [_arrow_str(n.class_name) for n in nodes], type=pa.string()
+                        ),
+                        "is_dead": pa.array([n.is_dead for n in nodes], type=pa.bool_()),
+                        "is_entry_point": pa.array(
+                            [n.is_entry_point for n in nodes], type=pa.bool_()
+                        ),
+                        "is_exported": pa.array([n.is_exported for n in nodes], type=pa.bool_()),
+                        "properties_json": pa.array(
+                            [_arrow_str(_serialize_properties(n.properties)) for n in nodes],
+                            type=pa.string(),
+                        ),
+                    }
+                )
+                self._arrow_copy(table, arrow_tbl)
+            return True
+        except Exception:
+            logger.warning(
+                "Arrow COPY for nodes failed; falling back to slow row-by-row inserts",
+                exc_info=True,
+            )
+            return False
+
+    def _group_rels_by_pair(
+        self, graph: KnowledgeGraph
+    ) -> dict[tuple[str, str], list[GraphRelationship]]:
+        """Bucket relationships by ``(src_table, dst_table)``, deduplicated.
+
+        Deduplication keys on full edge identity — source, target, type, role,
+        and step_number — so e.g. USES_TYPE edges with different roles between
+        the same pair survive (mirrors the in-memory relationship ID
+        semantics). Shared by the CSV and Arrow bulk paths.
         """
         by_pair: dict[tuple[str, str], list[GraphRelationship]] = {}
         for rel in graph.iter_relationships():
@@ -1390,9 +1519,6 @@ class KuzuBackend:
             if src_table and dst_table:
                 by_pair.setdefault((src_table, dst_table), []).append(rel)
 
-        # Deduplicate by full edge identity — including role and step_number,
-        # so e.g. USES_TYPE edges with different roles between the same pair
-        # survive (mirrors the in-memory relationship ID semantics).
         for pair_key, rels in by_pair.items():
             seen: dict[tuple[str, str, str, str, int], int] = {}
             for i, rel in enumerate(rels):
@@ -1413,9 +1539,25 @@ class KuzuBackend:
                     pair_key[1],
                 )
                 by_pair[pair_key] = [rels[i] for i in sorted(seen.values())]
+        return by_pair
 
+    def _bulk_load_rels(self, graph: KnowledgeGraph) -> bool:
+        """Bulk-load relationships via the fastest available COPY path.
+
+        Arrow when pyarrow is installed, else CSV. ``False`` falls back to
+        row-by-row inserts, exactly as the CSV path did before.
+        """
+        if _HAS_PYARROW:
+            return self._bulk_load_rels_arrow(graph)
+        return self._bulk_load_rels_csv(graph)
+
+    def _bulk_load_rels_csv(self, graph: KnowledgeGraph) -> bool:
+        """Load all relationships via temporary CSV files + COPY FROM.
+
+        Returns True on success, False if COPY FROM is not available.
+        """
         try:
-            for (src_table, dst_table), rels in by_pair.items():
+            for (src_table, dst_table), rels in self._group_rels_by_pair(graph).items():
                 self._csv_copy(
                     f"CodeRelation_{src_table}_{dst_table}",
                     [
@@ -1437,6 +1579,51 @@ class KuzuBackend:
         except Exception:
             logger.warning(
                 "CSV COPY for relationships failed; falling back to slow row-by-row inserts",
+                exc_info=True,
+            )
+            return False
+
+    def _bulk_load_rels_arrow(self, graph: KnowledgeGraph) -> bool:
+        """Load all relationships via in-memory pyarrow tables + COPY FROM.
+
+        The first two columns (source/target node ids) are matched positionally
+        as the rel FROM/TO; the rest mirror the ``_REL_PROPERTIES`` order and
+        types. Property coercion matches the CSV path exactly (empty role/symbols
+        strings become ``NULL``). Returns ``False`` on failure.
+        """
+        try:
+            for (src_table, dst_table), rels in self._group_rels_by_pair(graph).items():
+                props = [r.properties or {} for r in rels]
+                arrow_tbl = pa.table(
+                    {
+                        "src": pa.array([r.source for r in rels], type=pa.string()),
+                        "dst": pa.array([r.target for r in rels], type=pa.string()),
+                        "rel_type": pa.array([r.type.value for r in rels], type=pa.string()),
+                        "confidence": pa.array(
+                            [float(p.get("confidence", 1.0)) for p in props], type=pa.float64()
+                        ),
+                        "role": pa.array(
+                            [_arrow_str(str(p.get("role", ""))) for p in props], type=pa.string()
+                        ),
+                        "step_number": pa.array(
+                            [int(p.get("step_number", 0)) for p in props], type=pa.int64()
+                        ),
+                        "strength": pa.array(
+                            [float(p.get("strength", 0.0)) for p in props], type=pa.float64()
+                        ),
+                        "co_changes": pa.array(
+                            [int(p.get("co_changes", 0)) for p in props], type=pa.int64()
+                        ),
+                        "symbols": pa.array(
+                            [_arrow_str(str(p.get("symbols", ""))) for p in props], type=pa.string()
+                        ),
+                    }
+                )
+                self._arrow_copy(f"CodeRelation_{src_table}_{dst_table}", arrow_tbl)
+            return True
+        except Exception:
+            logger.warning(
+                "Arrow COPY for relationships failed; falling back to slow row-by-row inserts",
                 exc_info=True,
             )
             return False
@@ -1475,8 +1662,59 @@ class KuzuBackend:
             )
             return False
 
-    def _create_schema(self) -> None:
-        """Create node/rel/embedding tables and the FTS extension."""
+    def _bulk_store_embeddings(self, embeddings: list[NodeEmbedding]) -> bool:
+        """Store embeddings via the fastest available COPY path.
+
+        Arrow when pyarrow is installed, else CSV. ``False`` falls back to the
+        row-by-row MERGE path in :meth:`store_embeddings`.
+        """
+        if _HAS_PYARROW:
+            return self._bulk_store_embeddings_arrow(embeddings)
+        return self._bulk_store_embeddings_csv(embeddings)
+
+    def _bulk_store_embeddings_arrow(self, embeddings: list[NodeEmbedding]) -> bool:
+        """Store embeddings via an in-memory pyarrow Table + COPY FROM.
+
+        The vector column is a ``FLOAT[dim]`` fixed-size list, so vectors are
+        copied natively — no per-float ``str()`` and no ``[..]`` string parse.
+        Recreates the Embedding table at the actual width first, exactly like
+        the CSV path. Returns ``False`` on failure.
+        """
+        assert self._conn is not None
+        try:
+            dim = len(embeddings[0].embedding)
+            try:
+                self._conn.execute("DROP TABLE Embedding")
+            except Exception:
+                pass
+            self._conn.execute(f"CREATE NODE TABLE IF NOT EXISTS Embedding({_embedding_ddl(dim)})")
+            arrow_tbl = pa.table(
+                {
+                    "node_id": pa.array([e.node_id for e in embeddings], type=pa.string()),
+                    "vec": pa.array(
+                        [e.embedding for e in embeddings], type=pa.list_(pa.float32(), dim)
+                    ),
+                    "text_sha": pa.array(
+                        [_arrow_str(e.text_sha) for e in embeddings], type=pa.string()
+                    ),
+                }
+            )
+            self._arrow_copy("Embedding", arrow_tbl)
+            return True
+        except Exception:
+            logger.warning(
+                "Arrow COPY for embeddings failed; falling back to slow row-by-row inserts",
+                exc_info=True,
+            )
+            return False
+
+    def _create_schema(self, *, build_fts: bool = True) -> None:
+        """Create node/rel/embedding tables and the FTS extension.
+
+        When ``build_fts`` is ``False`` the (empty) FTS indexes are not built —
+        see :meth:`initialize`'s ``_build_fts_indexes`` for why the bulk_load
+        rebuild path skips them.
+        """
         assert self._conn is not None
 
         try:
@@ -1518,7 +1756,8 @@ class KuzuBackend:
         except Exception:
             logger.debug("REL TABLE GROUP creation skipped", exc_info=True)
 
-        self._create_fts_indexes()
+        if build_fts:
+            self._create_fts_indexes()
 
     def _create_fts_indexes(self) -> None:
         """Create FTS indexes for every searchable node table (idempotent).
