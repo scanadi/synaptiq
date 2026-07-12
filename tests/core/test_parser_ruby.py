@@ -554,6 +554,103 @@ class TestParseAttrAccessors:
 
 
 # ---------------------------------------------------------------------------
+# Non-ASCII content (byte-offset vs str-index regression — B1)
+# ---------------------------------------------------------------------------
+
+
+class TestParseNonAsciiContent:
+    """Multi-byte UTF-8 content earlier in the file must not shift the
+    extracted ``content``/``signature`` of symbols that follow it.
+
+    tree-sitter reports ``start_byte``/``end_byte`` as offsets into the
+    UTF-8-encoded source, not into the Python ``str``. Every non-ASCII
+    character (2-4 bytes, but a single ``str`` index) that appears before a
+    symbol used to desync a ``content[start_byte:end_byte]`` slice from the
+    symbol's actual text.
+    """
+
+    CODE = (
+        "# émojis 🎉🚀 and åäö accented\n"
+        'GREETING = "héllo wörld"\n'
+        "\n"
+        "class Greeter\n"
+        "  # ünïcödé comment inside class\n"
+        "  def hello(name)\n"
+        '    "héllo, #{name}"\n'
+        "  end\n"
+        "\n"
+        "  def self.shout\n"
+        '    "🎉"\n'
+        "  end\n"
+        "end\n"
+    )
+
+    def _symbol(self, parser: RubyParser, name: str) -> object:
+        syms = parser.parse(self.CODE, "greeter.rb").symbols
+        return next(s for s in syms if s.name == name)
+
+    def test_constant_content_exact(self, parser: RubyParser) -> None:
+        const = self._symbol(parser, "GREETING")
+        assert const.content == 'GREETING = "héllo wörld"'
+        assert const.start_line == 2
+        assert const.end_line == 2
+
+    def test_class_content_exact(self, parser: RubyParser) -> None:
+        cls = self._symbol(parser, "Greeter")
+        assert cls.content == (
+            "class Greeter\n"
+            "  # ünïcödé comment inside class\n"
+            "  def hello(name)\n"
+            '    "héllo, #{name}"\n'
+            "  end\n"
+            "\n"
+            "  def self.shout\n"
+            '    "🎉"\n'
+            "  end\n"
+            "end"
+        )
+        assert cls.start_line == 4
+        assert cls.end_line == 13
+
+    def test_method_content_and_signature_exact(self, parser: RubyParser) -> None:
+        method = self._symbol(parser, "hello")
+        assert method.content == 'def hello(name)\n    "héllo, #{name}"\n  end'
+        assert method.signature == "def hello(name)"
+        assert method.class_name == "Greeter"
+        assert method.start_line == 6
+        assert method.end_line == 8
+
+    def test_singleton_method_content_and_signature_exact(self, parser: RubyParser) -> None:
+        method = self._symbol(parser, "shout")
+        assert method.content == 'def self.shout\n    "🎉"\n  end'
+        assert method.signature == "def self.shout"
+        assert method.start_line == 10
+        assert method.end_line == 12
+
+    def test_module_content_and_signature_exact(self, parser: RubyParser) -> None:
+        # A module variant of the same regression: non-ASCII text before the
+        # module definition must not shift its content window either.
+        code = (
+            "# prïce: €5 for a café ☕\n"
+            "module Pricing\n"
+            "  def convert(amount)\n"
+            "    amount\n"
+            "  end\n"
+            "end\n"
+        )
+        result = parser.parse(code, "pricing.rb")
+        mod = next(s for s in result.symbols if s.kind == "module")
+        assert mod.name == "Pricing"
+        assert mod.content == "module Pricing\n  def convert(amount)\n    amount\n  end\nend"
+        assert mod.start_line == 2
+        assert mod.end_line == 6
+
+        method = next(s for s in result.symbols if s.kind == "method")
+        assert method.content == "def convert(amount)\n    amount\n  end"
+        assert method.signature == "def convert(amount)"
+
+
+# ---------------------------------------------------------------------------
 # Error / edge cases
 # ---------------------------------------------------------------------------
 
