@@ -47,6 +47,13 @@ except ImportError:  # pragma: no cover - exercised in CSV-only environments
 
 from synaptiq.core.graph.graph import KnowledgeGraph
 from synaptiq.core.graph.model import GraphNode, GraphRelationship, NodeLabel
+from synaptiq.core.ingestion.manifest import (
+    Manifest,
+    build_manifest,
+    load_manifest_from_rows,
+    serialize_file_manifest,
+    serialize_index_manifest,
+)
 from synaptiq.core.storage.base import EdgeRef, GraphDelta, NodeEmbedding, SearchResult
 
 logger = logging.getLogger(__name__)
@@ -191,6 +198,29 @@ def _embedding_ddl(dim: int) -> str:
     from, so rebuilds can reuse vectors for unchanged symbols.
     """
     return f"node_id STRING, vec FLOAT[{dim}], text_sha STRING, PRIMARY KEY(node_id)"
+
+
+# Incremental-indexing manifest tables (W3.2a). Two standalone node tables that
+# live INSIDE the index DB (design D3, spike-confirmed) so the manifest rides the
+# crash-safe ``.rebuild`` swap and ``open_with_recovery`` for free. Their names
+# are deliberately NOT in ``NodeLabel`` (hence not in ``_NODE_TABLE_NAMES``), so
+# ``_migrate_schema`` / ``_verify_schema`` / FTS / the ``CodeRelation`` rel group
+# never touch them and ``load_graph`` never sees them. Column order is
+# contractual with ``core.ingestion.manifest`` (FILE_MANIFEST_COLUMNS + the
+# read queries below) — keep them in lockstep.
+_MANIFEST_FILE_TABLE = "FileManifest"
+_MANIFEST_INDEX_TABLE = "IndexManifest"
+_MANIFEST_SINGLETON_ID = "singleton"
+_FILE_MANIFEST_DDL = (
+    f"CREATE NODE TABLE IF NOT EXISTS {_MANIFEST_FILE_TABLE}("
+    "path STRING, content_sha STRING, language STRING, "
+    "symbol_ids STRING, symbol_sigs STRING, out_edges STRING, "
+    "PRIMARY KEY(path))"
+)
+_INDEX_MANIFEST_DDL = (
+    f"CREATE NODE TABLE IF NOT EXISTS {_MANIFEST_INDEX_TABLE}("
+    "id STRING, manifest_version INT64, data STRING, PRIMARY KEY(id))"
+)
 
 
 # Maximum number of read connections to keep in the pool.
@@ -1610,6 +1640,10 @@ class LadybugBackend:
             if not builder._bulk_load_rels(graph):
                 builder.add_relationships(list(graph.iter_relationships()))
             builder.rebuild_fts_indexes()
+            # Stamp a fresh incremental-indexing manifest into the builder DB so
+            # it rides the swap into the live index (W3.2a). Best-effort — it
+            # never raises, so it cannot abort the build.
+            builder._write_full_manifest(graph)
         except BaseException:
             builder.close()
             self._remove_db_files(tmp_path)
@@ -2148,6 +2182,8 @@ class LadybugBackend:
         except Exception:
             logger.debug("REL TABLE GROUP creation skipped", exc_info=True)
 
+        self._create_manifest_tables()
+
         if build_fts:
             self._create_fts_indexes()
 
@@ -2169,6 +2205,136 @@ class LadybugBackend:
             except Exception:
                 # Index may already exist — that's fine.
                 pass
+
+    # ------------------------------------------------------------------
+    # Incremental-indexing manifest (W3.2a) — DDL + read/write.
+    # Storage I/O only; the logical schema, fingerprints, diff, and
+    # version/corruption gating live in ``core.ingestion.manifest``.
+    # ------------------------------------------------------------------
+
+    def _create_manifest_tables(self) -> None:
+        """Create the manifest node tables (idempotent).
+
+        Standalone tables outside ``NodeLabel`` — invisible to the
+        ``CodeRelation`` rel group, FTS, ``_migrate_schema``/``_verify_schema``,
+        and ``load_graph``. Called from :meth:`_create_schema` so a freshly built
+        ``.rebuild`` DB carries them and the manifest survives the swap.
+        """
+        assert self._conn is not None
+        try:
+            self._conn.execute(_FILE_MANIFEST_DDL)
+            self._conn.execute(_INDEX_MANIFEST_DDL)
+        except Exception:
+            logger.debug("manifest table creation skipped", exc_info=True)
+
+    def write_manifest(self, manifest: Manifest) -> None:
+        """Persist *manifest* into the current DB, replacing any prior manifest.
+
+        Full replace: clears both manifest tables, bulk-writes the per-file rows,
+        then writes the index singleton **last** as a completion marker (a
+        partial/crashed write leaves no singleton, so :meth:`read_manifest`
+        reports "no manifest" and the caller does a full rebuild). Not wrapped in
+        an explicit transaction — it mirrors the COPY-based bulk path and is
+        crash-safe by riding :meth:`bulk_load`'s ``.rebuild`` swap. Uses the
+        write connection, so callers serialize via the external lock.
+        """
+        assert self._conn is not None
+        self._create_manifest_tables()
+        self._conn.execute(f"MATCH (m:{_MANIFEST_FILE_TABLE}) DETACH DELETE m")
+        self._conn.execute(f"MATCH (im:{_MANIFEST_INDEX_TABLE}) DETACH DELETE im")
+        rows = [serialize_file_manifest(fm) for fm in manifest.files.values()]
+        if rows:
+            self._write_manifest_file_rows(rows)
+        version, data = serialize_index_manifest(manifest.index)
+        self._conn.execute(
+            f"CREATE (im:{_MANIFEST_INDEX_TABLE} {{id: $id, manifest_version: $v, data: $d}})",
+            parameters={"id": _MANIFEST_SINGLETON_ID, "v": version, "d": data},
+        )
+
+    def _write_manifest_file_rows(self, rows: list[list[Any]]) -> None:
+        """Insert FileManifest rows via CSV COPY, falling back to row MERGE.
+
+        Mirrors the node bulk path: COPY is fast at repo scale, and the MERGE
+        fallback keeps the write working in COPY-unavailable environments.
+        """
+        assert self._conn is not None
+        try:
+            self._csv_copy(_MANIFEST_FILE_TABLE, rows)
+            return
+        except Exception:
+            logger.debug("manifest CSV COPY failed; falling back to row inserts", exc_info=True)
+        stmt = (
+            f"MERGE (m:{_MANIFEST_FILE_TABLE} {{path: $path}}) "
+            "SET m.content_sha = $content_sha, m.language = $language, "
+            "m.symbol_ids = $symbol_ids, m.symbol_sigs = $symbol_sigs, "
+            "m.out_edges = $out_edges"
+        )
+        for row in rows:
+            self._conn.execute(
+                stmt,
+                parameters={
+                    "path": row[0],
+                    "content_sha": row[1],
+                    "language": row[2],
+                    "symbol_ids": row[3],
+                    "symbol_sigs": row[4],
+                    "out_edges": row[5],
+                },
+            )
+
+    def _write_full_manifest(self, graph: KnowledgeGraph) -> None:
+        """Build a fresh manifest from *graph* and persist it — best-effort.
+
+        Called by :meth:`bulk_load` on the ``.rebuild`` builder so every full
+        build stamps a current manifest that rides the swap into the live DB.
+        Fully isolated: any failure is swallowed (the manifest is an optimization
+        with a full-rebuild fallback), so a manifest problem can never abort an
+        index build. ``git_head`` is left ``None`` here — the graph does not
+        carry it; the pipeline/consolidation owner (W3.2e) populates it when it
+        computes coupling.
+        """
+        try:
+            from synaptiq import __version__
+
+            self.write_manifest(build_manifest(graph, tool_version=__version__))
+        except Exception:
+            logger.warning(
+                "manifest build/write failed during bulk_load; the next analyze "
+                "will fall back to a full rebuild",
+                exc_info=True,
+            )
+
+    def read_manifest(self) -> Manifest | None:
+        """Load the stored manifest, or ``None`` to force a full rebuild.
+
+        Never raises. Returns ``None`` on a missing/empty manifest (§8 trigger
+        1), a ``manifest_version`` mismatch (trigger 2), or any unreadable/corrupt
+        row (trigger 5) — the caller treats ``None`` as "no trustworthy manifest,
+        use the full path". The fingerprint check (trigger 3) is the caller's; it
+        needs the current walk (``manifest.compute_fingerprint`` vs the stored
+        ``full_fingerprint``).
+        """
+        try:
+            with self._read_conn() as conn:
+                index_rows = self._drain(
+                    conn.execute(
+                        f"MATCH (im:{_MANIFEST_INDEX_TABLE}) RETURN im.manifest_version, im.data"
+                    )
+                )
+                file_rows = self._drain(
+                    conn.execute(
+                        f"MATCH (m:{_MANIFEST_FILE_TABLE}) RETURN "
+                        "m.path, m.content_sha, m.language, m.symbol_ids, "
+                        "m.symbol_sigs, m.out_edges"
+                    )
+                )
+        except Exception:
+            # Manifest tables absent (pre-manifest / read-only old index) or
+            # otherwise unreadable → no trustworthy manifest.
+            logger.debug("read_manifest query failed", exc_info=True)
+            return None
+        index_row = index_rows[0] if index_rows else None
+        return load_manifest_from_rows(index_row, file_rows)
 
     def _get_prepared(self, key: str, query: str) -> Any:
         """Return a cached prepared statement for ``key``, preparing once.

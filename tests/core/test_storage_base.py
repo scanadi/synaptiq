@@ -137,6 +137,12 @@ class TestStorageBackend:
             def apply_graph_delta(self, delta):
                 pass
 
+            def write_manifest(self, manifest):
+                pass
+
+            def read_manifest(self):
+                return None
+
             def traverse_with_depth(self, start_id, depth, direction="callers"):
                 return []
 
