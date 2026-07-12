@@ -11,10 +11,12 @@ import json
 import logging
 import re
 from collections import deque
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from synaptiq.core.cypher_guard import check_read_only
+from synaptiq.core.graph.graph import KnowledgeGraph
 from synaptiq.core.ingestion.dead_code import _is_test_file
 from synaptiq.core.memory import MemoryStore
 from synaptiq.core.search.hybrid import hybrid_search
@@ -1127,24 +1129,26 @@ def handle_file_context(storage: StorageBackend, file_path: str) -> str:
 
 
 def handle_cycles(storage: StorageBackend, min_size: int = 2) -> str:
-    """Detect circular dependencies using strongly connected components."""
+    """Detect circular dependencies using strongly connected components.
+
+    The graph load and SCC decomposition only change when the index is
+    rebuilt, so the expensive part is memoized per storage *generation*
+    (see :attr:`~synaptiq.core.storage.kuzu_backend.KuzuBackend.generation`)
+    \u2014 mirrors the projection cache in ``core/search/pagerank.py``.  Only the
+    cheap ``min_size`` filter and text formatting run on every call.
+    """
     min_size = max(2, min_size)
+    generation = getattr(storage, "generation", 0)
 
     try:
-        graph = storage.load_graph()
+        graph, groups = _cached_scc_groups(storage, generation)
     except Exception as exc:
         return f"Error loading graph: {exc}"
 
-    from synaptiq.core.ingestion.community import export_to_igraph
-
-    ig_graph, index_to_node_id = export_to_igraph(graph)
-
-    if ig_graph.vcount() == 0:
+    if not groups:
         return "No symbols in the graph to analyze."
 
-    sccs = ig_graph.connected_components(mode="strong")
-
-    cycles = [list(component) for component in sccs if len(component) >= min_size]
+    cycles = [group for group in groups if len(group) >= min_size]
 
     if not cycles:
         return "No circular dependencies detected."
@@ -1154,8 +1158,7 @@ def handle_cycles(storage: StorageBackend, min_size: int = 2) -> str:
     lines = [f"Circular Dependencies ({len(cycles)} groups)"]
     lines.append("=" * 48)
 
-    for i, component in enumerate(cycles, 1):
-        node_ids = [index_to_node_id[idx] for idx in component if idx in index_to_node_id]
+    for i, node_ids in enumerate(cycles, 1):
         nodes = [graph.get_node(nid) for nid in node_ids]
         nodes = [n for n in nodes if n is not None]
 
@@ -1167,6 +1170,44 @@ def handle_cycles(storage: StorageBackend, min_size: int = 2) -> str:
             lines.append(f"  - {node.name} ({label}) \u2014 {node.file_path}:{node.start_line}")
 
     return "\n".join(lines)
+
+
+@lru_cache(maxsize=2)
+def _cached_scc_groups(
+    storage: StorageBackend, generation: int
+) -> tuple[KnowledgeGraph, list[list[str]]]:
+    """Load the graph and compute SCC node-id groups once per index generation.
+
+    Independent of ``min_size``: every strongly connected component is
+    returned (including singletons), so :func:`handle_cycles` can apply any
+    ``min_size`` filter against the same cached decomposition without
+    re-running ``load_graph`` or the SCC computation.
+
+    Cache key is ``(storage, generation)``. ``storage`` participates via
+    default (identity-based) equality \u2014 distinct backend instances (e.g. a
+    freshly rebuilt database after corruption recovery) never share a stale
+    entry \u2014 and ``generation`` is bumped by
+    :meth:`~synaptiq.core.storage.kuzu_backend.KuzuBackend.initialize`,
+    which ``bulk_load`` calls internally on every full reindex, so a reindex
+    evicts the old entry on the next call. Backends without a ``generation``
+    counter fall back to a constant, caching for the storage object's
+    lifetime (matches the ``personalized_pagerank`` precedent).
+    """
+    graph = storage.load_graph()
+
+    from synaptiq.core.ingestion.community import export_to_igraph
+
+    ig_graph, index_to_node_id = export_to_igraph(graph)
+
+    if ig_graph.vcount() == 0:
+        return graph, []
+
+    sccs = ig_graph.connected_components(mode="strong")
+    groups = [
+        [index_to_node_id[idx] for idx in component if idx in index_to_node_id]
+        for component in sccs
+    ]
+    return graph, groups
 
 
 def handle_test_impact(
