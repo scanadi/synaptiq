@@ -1381,8 +1381,14 @@ class LadybugBackend:
         cost and native-layer risk of a large delete.
 
         Uses COPY FROM for bulk loading nodes and relationships — an in-memory
-        Arrow table when pyarrow is installed, otherwise a temporary CSV —
-        falling back to individual inserts if COPY FROM fails.
+        Arrow table when pyarrow is installed, otherwise a temporary CSV.  The
+        loaders return ``False`` — and this method falls back to individual
+        inserts — ONLY when COPY FROM is unavailable (the first COPY fails
+        before any rows land).  A COPY that fails *after* partial progress
+        RAISES instead (review F2): the ``except BaseException`` below wipes the
+        ``.rebuild`` database and propagates, because re-running the row-by-row
+        fallback over the whole graph would duplicate the already-COPYed
+        relationships (rel inserts are non-idempotent ``CREATE``).
 
         The swap waits for in-flight reads to drain first: a read whose
         dispatch timed out keeps running in its thread after the RW lock
@@ -1533,8 +1539,16 @@ class LadybugBackend:
     def _bulk_load_nodes_csv(self, graph: KnowledgeGraph) -> bool:
         """Load all nodes via temporary CSV files + COPY FROM.
 
-        Returns True on success, False if COPY FROM is not available.
+        Same dispatcher contract as :meth:`_bulk_load_rels_csv` (review F2):
+        return ``False`` ONLY when the first COPY fails before any rows land
+        (COPY unavailable → row-by-row fallback). A failure after any table has
+        been COPYed RAISES so ``bulk_load`` aborts and wipes the ``.rebuild``
+        database. Node inserts use idempotent ``MERGE`` so the fallback alone
+        would not duplicate, but the contract is kept symmetric with the
+        relationship path — aborting a partially-loaded rebuild is cleaner and
+        avoids re-doing the whole graph row-by-row just to mask a real error.
         """
+        mutated = False
         try:
             for table, nodes in self._group_nodes_by_table(graph).items():
                 self._csv_copy(
@@ -1558,10 +1572,17 @@ class LadybugBackend:
                         for node in nodes
                     ],
                 )
+                mutated = True
             return True
         except Exception:
+            if mutated:
+                logger.error(
+                    "Node COPY failed after partial progress; aborting rebuild",
+                    exc_info=True,
+                )
+                raise
             logger.warning(
-                "CSV COPY for nodes failed; falling back to slow row-by-row inserts",
+                "CSV COPY for nodes unavailable; falling back to slow row-by-row inserts",
                 exc_info=True,
             )
             return False
@@ -1572,8 +1593,13 @@ class LadybugBackend:
         Column order and types mirror ``_NODE_PROPERTIES``. Empty strings are
         coerced to ``NULL`` (see :func:`_arrow_str`) so the result is identical
         to the CSV path, whose reader stores an empty field as ``NULL``.
-        Returns ``False`` on failure so the caller falls back to row-by-row.
+
+        Same dispatcher contract as :meth:`_bulk_load_rels_csv` (review F2):
+        ``False`` only when the first COPY fails before any rows land; a failure
+        after any table has been COPYed RAISES so ``bulk_load`` aborts instead
+        of re-loading the whole graph row-by-row.
         """
+        mutated = False
         try:
             for table, nodes in self._group_nodes_by_table(graph).items():
                 arrow_tbl = pa.table(
@@ -1609,10 +1635,17 @@ class LadybugBackend:
                     }
                 )
                 self._arrow_copy(table, arrow_tbl)
+                mutated = True
             return True
         except Exception:
+            if mutated:
+                logger.error(
+                    "Node COPY failed after partial progress; aborting rebuild",
+                    exc_info=True,
+                )
+                raise
             logger.warning(
-                "Arrow COPY for nodes failed; falling back to slow row-by-row inserts",
+                "Arrow COPY for nodes unavailable; falling back to slow row-by-row inserts",
                 exc_info=True,
             )
             return False
@@ -1669,8 +1702,17 @@ class LadybugBackend:
     def _bulk_load_rels_csv(self, graph: KnowledgeGraph) -> bool:
         """Load all relationships via temporary CSV files + COPY FROM.
 
-        Returns True on success, False if COPY FROM is not available.
+        Dispatcher contract (review F2): return ``True`` on success and
+        ``False`` ONLY when the very first COPY fails before any rows land
+        (COPY FROM is unavailable in this environment) — that signals
+        :meth:`bulk_load` to fall back to row-by-row inserts. Once ANY pair has
+        been COPYed, a later failure RAISES instead of returning ``False``:
+        relationship inserts use non-idempotent ``CREATE``, so re-running the
+        row-by-row fallback over the whole graph would DUPLICATE every pair
+        already COPYed. Raising lets ``bulk_load`` abort and wipe the
+        ``.rebuild`` database, leaving the live index untouched (crash-safe).
         """
+        mutated = False
         try:
             for (src_table, dst_table), rels in self._group_rels_by_pair(graph).items():
                 self._csv_copy(
@@ -1690,10 +1732,18 @@ class LadybugBackend:
                         for rel in rels
                     ],
                 )
+                mutated = True
             return True
         except Exception:
+            if mutated:
+                logger.error(
+                    "Relationship COPY failed after partial progress; aborting rebuild "
+                    "to avoid duplicate edges",
+                    exc_info=True,
+                )
+                raise
             logger.warning(
-                "CSV COPY for relationships failed; falling back to slow row-by-row inserts",
+                "CSV COPY for relationships unavailable; falling back to slow row-by-row inserts",
                 exc_info=True,
             )
             return False
@@ -1704,8 +1754,15 @@ class LadybugBackend:
         The first two columns (source/target node ids) are matched positionally
         as the rel FROM/TO; the rest mirror the ``_REL_PROPERTIES`` order and
         types. Property coercion matches the CSV path exactly (empty role/symbols
-        strings become ``NULL``). Returns ``False`` on failure.
+        strings become ``NULL``).
+
+        Same dispatcher contract as :meth:`_bulk_load_rels_csv` (review F2):
+        ``False`` only when the first COPY fails before any rows land; a failure
+        after any pair has been COPYed RAISES so ``bulk_load`` aborts rather than
+        duplicating the already-COPYed edges via the non-idempotent row-by-row
+        fallback.
         """
+        mutated = False
         try:
             for (src_table, dst_table), rels in self._group_rels_by_pair(graph).items():
                 props = [r.properties or {} for r in rels]
@@ -1735,10 +1792,18 @@ class LadybugBackend:
                     }
                 )
                 self._arrow_copy(f"CodeRelation_{src_table}_{dst_table}", arrow_tbl)
+                mutated = True
             return True
         except Exception:
+            if mutated:
+                logger.error(
+                    "Relationship COPY failed after partial progress; aborting rebuild "
+                    "to avoid duplicate edges",
+                    exc_info=True,
+                )
+                raise
             logger.warning(
-                "Arrow COPY for relationships failed; falling back to slow row-by-row inserts",
+                "Arrow COPY for relationships unavailable; falling back to slow row-by-row inserts",
                 exc_info=True,
             )
             return False
@@ -1746,7 +1811,15 @@ class LadybugBackend:
     def _bulk_store_embeddings_csv(self, embeddings: list[NodeEmbedding]) -> bool:
         """Store embeddings via temporary CSV + COPY FROM.
 
-        Returns True on success, False if COPY FROM is not available.
+        Returns ``True`` on success, ``False`` if COPY FROM is not available.
+
+        Dispatcher contract (review F2): unlike the node/relationship paths this
+        is a SINGLE COPY into a freshly DROP+CREATEd table, so there is no
+        "partial progress across multiple COPYs" hazard — and
+        :meth:`store_embeddings`'s row-by-row fallback is idempotent ``MERGE``
+        on the ``node_id`` primary key, into that same recreated table. Both
+        properties mean returning ``False`` on any failure can never duplicate a
+        vector, so this path keeps the plain return-``False``-on-failure form.
         """
         assert self._conn is not None
         try:
@@ -1794,6 +1867,11 @@ class LadybugBackend:
         copied natively — no per-float ``str()`` and no ``[..]`` string parse.
         Recreates the Embedding table at the actual width first, exactly like
         the CSV path. Returns ``False`` on failure.
+
+        Same dispatcher contract as :meth:`_bulk_store_embeddings_csv` (review
+        F2): a single COPY into a freshly recreated table plus an idempotent
+        ``MERGE`` fallback means returning ``False`` on failure can never
+        duplicate a vector.
         """
         assert self._conn is not None
         try:

@@ -597,6 +597,107 @@ class TestRecoveryAndRebuildSafety:
         backend.close()
 
 
+class TestBulkLoadPartialCopyAborts:
+    """review F2: a COPY failure AFTER partial progress aborts the rebuild
+    (raises) instead of falling back to the row-by-row path. The relationship
+    fallback uses non-idempotent CREATE, so re-loading the whole graph after a
+    mid-loop failure would DUPLICATE every pair already COPYed."""
+
+    def test_second_rel_pair_failure_aborts_without_duplicating(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        backend = LadybugBackend()
+        backend.initialize(tmp_path / "test_db")
+        try:
+            # Live index with a known state that must survive untouched.
+            backend.bulk_load(_build_small_graph())
+            edges_before = backend.execute_raw(
+                "MATCH (a)-[r:CodeRelation]->(b) RETURN count(r)"
+            )[0][0]
+            assert edges_before == 1
+
+            # New graph with TWO distinct relationship pairs so _bulk_load_rels
+            # iterates more than once: Function->Function and Class->Function.
+            f1 = _make_node(NodeLabel.FUNCTION, "src/z.py", "a")
+            f2 = _make_node(NodeLabel.FUNCTION, "src/z.py", "b")
+            c1 = _make_node(NodeLabel.CLASS, "src/z.py", "C")
+            new_graph = KnowledgeGraph()
+            for n in (f1, f2, c1):
+                new_graph.add_node(n)
+            new_graph.add_relationship(_make_rel(f1.id, f2.id, RelType.CALLS))
+            new_graph.add_relationship(_make_rel(c1.id, f1.id, RelType.CONTAINS))
+
+            # Fail on the SECOND relationship COPY. The first one really lands
+            # rows in the .rebuild DB — exactly the partial progress the
+            # row-by-row fallback would otherwise duplicate.
+            rel_copies = {"n": 0}
+            real_csv = LadybugBackend._csv_copy
+            real_arrow = LadybugBackend._arrow_copy
+
+            def make_flaky(real):
+                def flaky(self, table, data):
+                    if table.startswith("CodeRelation"):
+                        rel_copies["n"] += 1
+                        if rel_copies["n"] >= 2:
+                            raise RuntimeError("simulated COPY failure on the second rel pair")
+                    return real(self, table, data)
+
+                return flaky
+
+            monkeypatch.setattr(LadybugBackend, "_csv_copy", make_flaky(real_csv))
+            monkeypatch.setattr(LadybugBackend, "_arrow_copy", make_flaky(real_arrow))
+
+            # bulk_load must RAISE, not silently fall back to row-by-row.
+            with pytest.raises(RuntimeError, match="second rel pair"):
+                backend.bulk_load(new_graph)
+
+            assert rel_copies["n"] >= 2  # partial progress really happened
+
+            # Live index untouched: original data intact, new graph never
+            # swapped in, and the edge count UNCHANGED — no duplicates anywhere.
+            caller_id = generate_id(NodeLabel.FUNCTION, "src/a.py", "caller")
+            assert backend.get_node(caller_id) is not None
+            assert backend.get_node(f1.id) is None
+            edges_after = backend.execute_raw(
+                "MATCH (a)-[r:CodeRelation]->(b) RETURN count(r)"
+            )[0][0]
+            assert edges_after == 1
+
+            # The aborted .rebuild database was wiped by bulk_load's handler.
+            assert not (tmp_path / "test_db.rebuild").exists()
+        finally:
+            backend.close()
+
+    def test_total_copy_unavailability_falls_back_to_row_by_row(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When the FIRST COPY fails before any rows land (COPY unavailable),
+        bulk_load still degrades to the row-by-row path and loads the graph
+        correctly with no duplicates."""
+        backend = LadybugBackend()
+        backend.initialize(tmp_path / "test_db")
+        try:
+
+            def always_raise(self, table, data):
+                raise RuntimeError("COPY FROM unavailable in this environment")
+
+            monkeypatch.setattr(LadybugBackend, "_csv_copy", always_raise)
+            monkeypatch.setattr(LadybugBackend, "_arrow_copy", always_raise)
+
+            backend.bulk_load(_build_small_graph())
+
+            caller_id = generate_id(NodeLabel.FUNCTION, "src/a.py", "caller")
+            callee_id = generate_id(NodeLabel.FUNCTION, "src/a.py", "callee")
+            assert backend.get_node(caller_id) is not None
+            assert backend.get_node(callee_id) is not None
+            edges = backend.execute_raw(
+                "MATCH (a)-[r:CodeRelation]->(b) RETURN count(r)"
+            )[0][0]
+            assert edges == 1  # loaded exactly once via row-by-row fallback
+        finally:
+            backend.close()
+
+
 class TestBulkLoadCopyPath:
     """Regression tests: CSV COPY must handle source code with embedded newlines.
 
