@@ -1,9 +1,9 @@
-"""Integration tests: every MCP tool handler against a real KuzuBackend.
+"""Integration tests: every MCP tool handler against a real LadybugBackend.
 
 The unit tests in ``test_tools.py`` use mocked storage, which means the
 Cypher strings inside the handlers are never validated against the real
 schema.  This module seeds a small but complete graph (calls, imports,
-coupling, community, process, heritage, types) into an actual KuzuDB and
+coupling, community, process, heritage, types) into an actual LadybugDB and
 exercises each handler end-to-end.
 """
 
@@ -18,7 +18,7 @@ from synaptiq.core.graph.model import (
     NodeLabel,
     RelType,
 )
-from synaptiq.core.storage.kuzu_backend import KuzuBackend
+from synaptiq.core.storage.ladybug_backend import LadybugBackend
 from synaptiq.mcp.resources import get_dead_code_list, get_overview
 from synaptiq.mcp.tools import (
     handle_call_path,
@@ -138,9 +138,9 @@ def _seed_graph() -> KnowledgeGraph:
 
 
 @pytest.fixture(scope="module")
-def storage(tmp_path_factory: pytest.TempPathFactory) -> KuzuBackend:
+def storage(tmp_path_factory: pytest.TempPathFactory) -> LadybugBackend:
     db_path = tmp_path_factory.mktemp("integration") / "kuzu"
-    backend = KuzuBackend()
+    backend = LadybugBackend()
     backend.initialize(db_path)
     backend.bulk_load(_seed_graph())
     yield backend
@@ -155,94 +155,94 @@ def _no_query_embedding(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-class TestEveryToolAgainstRealKuzu:
-    def test_query(self, storage: KuzuBackend) -> None:
+class TestEveryToolAgainstRealLadybug:
+    def test_query(self, storage: LadybugBackend) -> None:
         result = handle_query(storage, "validate_user")
         assert "validate_user" in result
 
-    def test_context(self, storage: KuzuBackend) -> None:
+    def test_context(self, storage: LadybugBackend) -> None:
         result = handle_context(storage, "validate_user")
         assert "validate_user" in result
         assert "Callers" in result
         assert "test_validate" in result
         assert "Imported by" not in result or "src" in result
 
-    def test_impact(self, storage: KuzuBackend) -> None:
+    def test_impact(self, storage: LadybugBackend) -> None:
         result = handle_impact(storage, "save")
         assert "validate_user" in result
 
-    def test_coupling_from_either_side(self, storage: KuzuBackend) -> None:
+    def test_coupling_from_either_side(self, storage: LadybugBackend) -> None:
         # COUPLED_WITH is stored in one direction — both sides must work.
         for fp in ("src/auth.py", "src/models.py"):
             result = handle_coupling(storage, fp)
             assert "strength: 0.75" in result, result
             assert "rejected" not in result.lower()
 
-    def test_communities_list(self, storage: KuzuBackend) -> None:
+    def test_communities_list(self, storage: LadybugBackend) -> None:
         result = handle_communities(storage)
         assert "Auth" in result
         assert "cohesion: 0.80" in result
         assert "2 symbols" in result
 
-    def test_communities_drill(self, storage: KuzuBackend) -> None:
+    def test_communities_drill(self, storage: LadybugBackend) -> None:
         result = handle_communities(storage, community="Auth")
         assert "validate_user" in result
         assert "save" in result
 
-    def test_explain(self, storage: KuzuBackend) -> None:
+    def test_explain(self, storage: LadybugBackend) -> None:
         result = handle_explain(storage, "validate_user")
         assert "Community: Auth" in result
         assert "Process flows" in result
 
-    def test_file_context(self, storage: KuzuBackend) -> None:
+    def test_file_context(self, storage: LadybugBackend) -> None:
         result = handle_file_context(storage, "src/auth.py")
         assert "validate_user" in result
         assert "src/models.py" in result  # imports + coupling
         assert "Coupled files" in result
 
-    def test_review_risk(self, storage: KuzuBackend) -> None:
+    def test_review_risk(self, storage: LadybugBackend) -> None:
         result = handle_review_risk(storage, SAMPLE_DIFF)
         assert "Risk:" in result
         assert "validate_user" in result
 
-    def test_detect_changes(self, storage: KuzuBackend) -> None:
+    def test_detect_changes(self, storage: LadybugBackend) -> None:
         result = handle_detect_changes(storage, SAMPLE_DIFF)
         assert "validate_user" in result
 
-    def test_test_impact(self, storage: KuzuBackend) -> None:
+    def test_test_impact(self, storage: LadybugBackend) -> None:
         result = handle_test_impact(storage, symbols=["save"])
         assert "tests/test_auth.py" in result
 
-    def test_call_path(self, storage: KuzuBackend) -> None:
+    def test_call_path(self, storage: LadybugBackend) -> None:
         result = handle_call_path(storage, "test_validate", "save")
         assert "Call path" in result
         assert "validate_user" in result
 
-    def test_cycles(self, storage: KuzuBackend) -> None:
+    def test_cycles(self, storage: LadybugBackend) -> None:
         result = handle_cycles(storage)
         assert "Error" not in result
 
-    def test_export(self, storage: KuzuBackend) -> None:
+    def test_export(self, storage: LadybugBackend) -> None:
         result = handle_export(storage, "validate_user")
         assert "=== Symbol: validate_user" in result
         assert "Community: Auth" in result
 
-    def test_cypher(self, storage: KuzuBackend) -> None:
+    def test_cypher(self, storage: LadybugBackend) -> None:
         result = handle_cypher(
             storage, "MATCH (n:Function) RETURN n.name ORDER BY n.name"
         )
         assert "validate_user" in result
 
-    def test_suggest(self, storage: KuzuBackend) -> None:
+    def test_suggest(self, storage: LadybugBackend) -> None:
         result = handle_suggest(storage, "what calls validate_user?")
         assert "Suggested tool calls" in result
 
-    def test_overview_resource(self, storage: KuzuBackend) -> None:
+    def test_overview_resource(self, storage: LadybugBackend) -> None:
         result = get_overview(storage)
         assert "Node counts by type" in result
         assert "Relationship counts by type" in result
         assert "Could not retrieve" not in result
 
-    def test_dead_code_resource(self, storage: KuzuBackend) -> None:
+    def test_dead_code_resource(self, storage: LadybugBackend) -> None:
         result = get_dead_code_list(storage)
         assert "unused_helper" in result

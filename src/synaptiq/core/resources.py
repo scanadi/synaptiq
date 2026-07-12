@@ -4,34 +4,38 @@ Synaptiq runs in two very different modes with opposite resource
 contracts:
 
 - **interactive** — one-shot CLI commands (``analyze``, ``query``, ...)
-  where the user is waiting in the foreground.  Kuzu keeps library
+  where the user is waiting in the foreground.  LadybugDB keeps library
   defaults (all cores, default buffer pool); ONNX embedding threads
   default to a polite ``max(2, cores - 2)`` cap so a foreground index
   doesn't lock up the machine.
 - **server** — long-running ``serve``/``mcp``/``watch`` daemons that sit
   beside the user's real work and must stay polite under concurrent
-  agent query load.  Strict caps on the Kuzu task-scheduler pool, the
+  agent query load.  Strict caps on the LadybugDB task-scheduler pool, the
   buffer pool, and ONNX embedding threads.
 
 Entry points declare their role once via :func:`set_profile` before any
-storage or embedding model is created; :class:`KuzuBackend` and the
+storage or embedding model is created; :class:`LadybugBackend` and the
 embedders read :func:`current_limits` at creation time.
 
 ``synaptiq analyze --jobs N`` layers an explicit, per-invocation cap on
 top of the active profile via :func:`set_jobs`, called before storage or
-embedder creation just like :func:`set_profile`: ``N > 0`` caps Kuzu
+embedder creation just like :func:`set_profile`: ``N > 0`` caps engine
 threads, ONNX embedding threads, and the walk/parse worker pools to
 *N*; ``N = 0`` is an explicit escape hatch back to uncapped
-(all-cores/library-default) Kuzu and embedding threads, overriding even
+(all-cores/library-default) engine and embedding threads, overriding even
 the environment variables below.  Precedence is **flag > environment
 variables > profile defaults**.
 
 Environment overrides (positive integers, applied on top of either
 profile, unless overridden by ``--jobs``):
 
-- ``SYNAPTIQ_KUZU_THREADS`` — Kuzu task-scheduler pool size.
-- ``SYNAPTIQ_KUZU_MEMORY_MB`` — Kuzu buffer pool size in MB.
+- ``SYNAPTIQ_DB_THREADS`` — LadybugDB task-scheduler pool size.
+- ``SYNAPTIQ_DB_MEMORY_MB`` — LadybugDB buffer pool size in MB.
 - ``SYNAPTIQ_EMBED_THREADS`` — ONNX intra-op threads for fastembed.
+
+``SYNAPTIQ_KUZU_THREADS`` / ``SYNAPTIQ_KUZU_MEMORY_MB`` remain accepted as
+deprecated aliases for one release (they log a one-time warning); the
+``DB`` names win when both are set.
 """
 
 from __future__ import annotations
@@ -44,7 +48,7 @@ logger = logging.getLogger(__name__)
 
 _MB = 1024 * 1024
 
-# Buffer pool cap for the server profile.  Kuzu's library default is a
+# Buffer pool cap for the server profile.  LadybugDB's library default is a
 # large fraction of system RAM — fine for a foreground bulk load, not
 # for a sidecar daemon.
 SERVER_BUFFER_POOL_MB = 512
@@ -62,14 +66,14 @@ _VALID_PROFILES = ("interactive", "server")
 class ResourceLimits:
     """Engine resource caps.
 
-    ``0`` means library default for ``kuzu_threads``, ``kuzu_buffer_bytes``,
+    ``0`` means library default for ``db_threads``, ``db_buffer_bytes``,
     and ``embed_threads``.  ``pool_workers`` has no such "library default"
     concept — there's no engine-level auto mode for the walk/parse thread
     pools — so it always resolves to a concrete positive worker count.
     """
 
-    kuzu_threads: int = 0
-    kuzu_buffer_bytes: int = 0
+    db_threads: int = 0
+    db_buffer_bytes: int = 0
     embed_threads: int = 0
     pool_workers: int = _DEFAULT_POOL_WORKERS
 
@@ -87,6 +91,33 @@ def _env_int(name: str) -> int | None:
     return value if value > 0 else None
 
 
+# Deprecated env-var names already warned about, so the warning fires once per
+# process regardless of how often ``resolve_limits`` / ``current_limits`` runs.
+_warned_env_aliases: set[str] = set()
+
+
+def _env_int_aliased(new_name: str, old_name: str) -> int | None:
+    """Read *new_name*, falling back to the deprecated *old_name*.
+
+    The ``SYNAPTIQ_KUZU_*`` variables predate the KuzuDB→LadybugDB swap (W2.7);
+    they keep working for one release as aliases for the ``SYNAPTIQ_DB_*``
+    names but emit a one-time deprecation warning when they are the value that
+    takes effect. The new name wins when both are set.
+    """
+    value = _env_int(new_name)
+    if value is not None:
+        return value
+    legacy = _env_int(old_name)
+    if legacy is not None and old_name not in _warned_env_aliases:
+        _warned_env_aliases.add(old_name)
+        logger.warning(
+            "%s is deprecated and will be removed in a future release; use %s instead.",
+            old_name,
+            new_name,
+        )
+    return legacy
+
+
 def resolve_limits(
     profile: str, cpu_count: int | None = None, jobs: int | None = None
 ) -> ResourceLimits:
@@ -98,11 +129,11 @@ def resolve_limits(
         jobs: Explicit worker/thread cap, e.g. from ``analyze --jobs`` (see
             :func:`set_jobs`).  ``None`` (the default) applies no override —
             environment variables, then profile defaults, resolve as usual.
-            ``0`` is an explicit request for uncapped Kuzu/embedding threads
+            ``0`` is an explicit request for uncapped engine/embedding threads
             (the ``--jobs 0`` escape hatch), taking precedence over
-            environment variables too.  ``N > 0`` caps ``kuzu_threads``,
+            environment variables too.  ``N > 0`` caps ``db_threads``,
             ``embed_threads``, and ``pool_workers`` to *N*.  Never affects
-            ``kuzu_buffer_bytes`` (a memory cap, not a worker/thread count).
+            ``db_buffer_bytes`` (a memory cap, not a worker/thread count).
     """
     cpus = cpu_count or os.cpu_count() or 4
     pool_default = min(_DEFAULT_POOL_WORKERS, cpus)
@@ -110,13 +141,13 @@ def resolve_limits(
     if profile == "server":
         threads = max(2, cpus // 4)
         limits = ResourceLimits(
-            kuzu_threads=threads,
-            kuzu_buffer_bytes=SERVER_BUFFER_POOL_MB * _MB,
+            db_threads=threads,
+            db_buffer_bytes=SERVER_BUFFER_POOL_MB * _MB,
             embed_threads=threads,
             pool_workers=pool_default,
         )
     else:
-        # interactive: Kuzu keeps the library default (0); embedding
+        # interactive: LadybugDB keeps the library default (0); embedding
         # threads get a polite cap so a foreground `analyze` doesn't peg
         # every core, unless overridden by an env var or --jobs below.
         limits = ResourceLimits(
@@ -124,13 +155,13 @@ def resolve_limits(
             pool_workers=pool_default,
         )
 
-    kuzu_threads = _env_int("SYNAPTIQ_KUZU_THREADS")
-    buffer_mb = _env_int("SYNAPTIQ_KUZU_MEMORY_MB")
+    db_threads = _env_int_aliased("SYNAPTIQ_DB_THREADS", "SYNAPTIQ_KUZU_THREADS")
+    buffer_mb = _env_int_aliased("SYNAPTIQ_DB_MEMORY_MB", "SYNAPTIQ_KUZU_MEMORY_MB")
     embed_threads = _env_int("SYNAPTIQ_EMBED_THREADS")
-    if kuzu_threads or buffer_mb or embed_threads:
+    if db_threads or buffer_mb or embed_threads:
         limits = ResourceLimits(
-            kuzu_threads=kuzu_threads or limits.kuzu_threads,
-            kuzu_buffer_bytes=buffer_mb * _MB if buffer_mb else limits.kuzu_buffer_bytes,
+            db_threads=db_threads or limits.db_threads,
+            db_buffer_bytes=buffer_mb * _MB if buffer_mb else limits.db_buffer_bytes,
             embed_threads=embed_threads or limits.embed_threads,
             pool_workers=limits.pool_workers,
         )
@@ -140,18 +171,18 @@ def resolve_limits(
             # Explicit cap: flag wins over both env vars and profile
             # defaults for thread/worker counts (not buffer memory).
             limits = ResourceLimits(
-                kuzu_threads=jobs,
-                kuzu_buffer_bytes=limits.kuzu_buffer_bytes,
+                db_threads=jobs,
+                db_buffer_bytes=limits.db_buffer_bytes,
                 embed_threads=jobs,
                 pool_workers=jobs,
             )
         else:
             # `--jobs 0`: explicit escape hatch back to uncapped
-            # Kuzu/embedding threads, overriding even the polite
+            # engine/embedding threads, overriding even the polite
             # interactive default and any SYNAPTIQ_* env vars.
             limits = ResourceLimits(
-                kuzu_threads=0,
-                kuzu_buffer_bytes=limits.kuzu_buffer_bytes,
+                db_threads=0,
+                db_buffer_bytes=limits.db_buffer_bytes,
                 embed_threads=0,
                 pool_workers=pool_default,
             )
@@ -189,7 +220,7 @@ def set_jobs(jobs: int | None) -> None:
     Args:
         jobs: ``None`` clears the override (env vars, then profile
             defaults, resolve as usual).  ``0`` is an explicit request for
-            uncapped Kuzu/embedding threads.  ``N > 0`` caps Kuzu threads,
+            uncapped engine/embedding threads.  ``N > 0`` caps engine threads,
             embedding threads, and I/O worker pools to *N*.
     """
     global _jobs_override  # noqa: PLW0603

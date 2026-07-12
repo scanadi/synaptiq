@@ -21,7 +21,7 @@ from synaptiq.core.ingestion.dead_code import _is_test_file
 from synaptiq.core.memory import MemoryStore
 from synaptiq.core.search.hybrid import hybrid_search
 from synaptiq.core.storage.base import StorageBackend
-from synaptiq.core.storage.kuzu_backend import deserialize_properties
+from synaptiq.core.storage.ladybug_backend import deserialize_properties
 
 logger = logging.getLogger(__name__)
 
@@ -1133,7 +1133,7 @@ def handle_cycles(storage: StorageBackend, min_size: int = 2) -> str:
 
     The graph load and SCC decomposition only change when the index is
     rebuilt, so the expensive part is memoized per storage *generation*
-    (see :attr:`~synaptiq.core.storage.kuzu_backend.KuzuBackend.generation`)
+    (see :attr:`~synaptiq.core.storage.ladybug_backend.LadybugBackend.generation`)
     \u2014 mirrors the projection cache in ``core/search/pagerank.py``.  Only the
     cheap ``min_size`` filter and text formatting run on every call.
     """
@@ -1187,7 +1187,7 @@ def _cached_scc_groups(
     default (identity-based) equality \u2014 distinct backend instances (e.g. a
     freshly rebuilt database after corruption recovery) never share a stale
     entry \u2014 and ``generation`` is bumped by
-    :meth:`~synaptiq.core.storage.kuzu_backend.KuzuBackend.initialize`,
+    :meth:`~synaptiq.core.storage.ladybug_backend.LadybugBackend.initialize`,
     which ``bulk_load`` calls internally on every full reindex, so a reindex
     evicts the old entry on the next call. Backends without a ``generation``
     counter fall back to a constant, caching for the storage object's

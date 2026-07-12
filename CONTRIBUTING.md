@@ -84,7 +84,7 @@ src/synaptiq/
 │   ├── parsers/      # tree-sitter parsers (Python, JS, TS)
 │   ├── ingestion/    # 11-phase analysis pipeline
 │   ├── graph/        # In-memory knowledge graph
-│   ├── storage/      # KuzuDB backend (+ optional Neo4j)
+│   ├── storage/      # LadybugDB backend (+ optional Neo4j)
 │   ├── search/       # Hybrid search (BM25 + vector + RRF)
 │   ├── embeddings/   # ONNX-based embeddings
 │   └── daemon/       # Multi-instance concurrency (primary/proxy)

@@ -9,7 +9,7 @@ layers:
 2. A **deny-list** of write/DDL/transaction keywords anywhere in the
    query, catching embedded write clauses (``MATCH ... CREATE ...``).
 
-The deny-list alone is insufficient: Kuzu also mutates state via
+The deny-list alone is insufficient: LadybugDB also mutates state via
 ``ALTER``, ``EXPORT DATABASE`` (writes files to disk), ``IMPORT
 DATABASE``, and ``ATTACH`` — none of which contain a classic write
 keyword.

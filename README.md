@@ -84,7 +84,7 @@ Synaptiq doesn't just parse your code — it builds a deep structural understand
 
 Three search strategies fused with Reciprocal Rank Fusion:
 
-- **BM25 full-text search** — fast exact name and keyword matching via KuzuDB FTS
+- **BM25 full-text search** — fast exact name and keyword matching via LadybugDB FTS
 - **Semantic vector search** — conceptual queries via 384-dim embeddings (BAAI/bge-small-en-v1.5)
 - **Fuzzy name search** — Levenshtein fallback for typos and partial matches
 
@@ -253,8 +253,8 @@ synaptiq analyze .
 synaptiq analyze [PATH]          Index a repository (default: current directory)
     --full                       Force full rebuild (skip incremental)
     --no-embeddings              Skip embedding generation for faster indexing
-    --jobs / -j N                Cap Kuzu threads, ONNX embedding threads, and
-                                  walk/parse worker pools to N (0 = explicit
+    --jobs / -j N                Cap LadybugDB threads, ONNX embedding threads,
+                                  and walk/parse worker pools to N (0 = explicit
                                   all-cores). See "CPU usage" below.
 
 synaptiq status                  Show index status for current repo
@@ -292,16 +292,20 @@ synaptiq --version               Print version
 
 ### CPU usage during `analyze`
 
-By default, `analyze` keeps Kuzu at its library default (all cores) but caps
+By default, `analyze` keeps LadybugDB at its library default (all cores) but caps
 ONNX embedding threads to a polite `max(2, cores - 2)`, so a foreground index
 doesn't lock up the rest of the machine. `--jobs N` overrides this:
 
-| Setting | Kuzu threads | ONNX embed threads | Walk/parse pools |
+| Setting | Engine threads | ONNX embed threads | Walk/parse pools |
 |---------|-------------|---------------------|-------------------|
 | default (no flag, no env) | all cores (library default) | `max(2, cores - 2)` | `min(8, cores)` |
-| `SYNAPTIQ_KUZU_THREADS` / `SYNAPTIQ_EMBED_THREADS` env vars | as set | as set | unaffected |
+| `SYNAPTIQ_DB_THREADS` / `SYNAPTIQ_EMBED_THREADS` env vars | as set | as set | unaffected |
 | `--jobs N` (`N > 0`) | `N` | `N` | `N` |
 | `--jobs 0` | all cores (library default) | all cores (library default) | `min(8, cores)` |
+
+`SYNAPTIQ_DB_MEMORY_MB` caps the engine buffer pool. `SYNAPTIQ_KUZU_THREADS` /
+`SYNAPTIQ_KUZU_MEMORY_MB` still work as deprecated aliases (they log a one-time
+warning) for one release.
 
 Precedence is **`--jobs` flag > environment variables > profile defaults**.
 `serve`/`mcp`/`watch` are unaffected — those long-running daemons always use
@@ -444,7 +448,7 @@ flowchart TB
         MCP["📡 MCP Server"]
         FW["👁️ File Watcher<br/>watchfiles"]
         RWL{{"🔒 AsyncRWLock<br/>concurrent reads · exclusive writes"}}
-        DB[(🗄️ KuzuDB + Pool<br/>8 read connections)]
+        DB[(🗄️ LadybugDB + Pool<br/>8 read connections)]
         SOCK["🔌 Unix Socket Server<br/>16 concurrent slots"]
         MCP --> RWL
         FW --> RWL
@@ -491,7 +495,7 @@ flowchart TB
 
 | Layer | Mechanism | Purpose |
 |-------|-----------|---------|
-| **Storage reads** | Connection pool (8 `kuzu.Connection` objects) | Multiple threads query in parallel |
+| **Storage reads** | Connection pool (8 `ladybug.Connection` objects) | Multiple threads query in parallel |
 | **Storage writes** | Dedicated write connection + AsyncRWLock | Exclusive access during index updates |
 | **MCP dispatch** | `AsyncRWLock.reader()` with 120s timeout | Concurrent tool/resource calls |
 | **Socket server** | `asyncio.Semaphore(16)` backpressure | Limits concurrent proxy dispatches |
@@ -574,7 +578,7 @@ flowchart TB
 
     KG(["🧠 KnowledgeGraph<br/>in-memory during build"])
 
-    KUZU[(KuzuDB<br/>graph)]
+    KUZU[(LadybugDB<br/>graph)]
     FTS[(FTS<br/>BM25)]
     VEC[(Vector<br/>HNSW)]
 
@@ -620,7 +624,7 @@ flowchart TB
 | Layer | Technology | Purpose |
 |-------|-----------|---------|
 | Parsing | [tree-sitter](https://tree-sitter.github.io/) | Language-agnostic AST extraction |
-| Graph Storage | [KuzuDB](https://kuzudb.com/) | Embedded graph database with Cypher, FTS, and vector support |
+| Graph Storage | [LadybugDB](https://ladybugdb.com/) | Embedded graph database (KuzuDB successor) with Cypher, FTS, and vector support |
 | Graph Algorithms | [igraph](https://igraph.org/) + [leidenalg](https://leidenalg.readthedocs.io/) | Leiden community detection |
 | Embeddings | [fastembed](https://github.com/qdrant/fastembed) | ONNX-based 384-dim vectors (~100MB, no PyTorch) |
 | MCP Protocol | [mcp SDK](https://modelcontextprotocol.io/) | AI agent communication via stdio and HTTP |
@@ -635,14 +639,16 @@ Everything lives locally in your repo:
 ```
 your-project/
 +-- .synaptiq/
-    +-- kuzu/          # KuzuDB graph database (graph + FTS + vectors)
+    +-- kuzu           # LadybugDB database (graph + FTS + vectors); the path
+    |                  # name is retained so an index from the former KuzuDB
+    |                  # backend is detected on open and rebuilt in place
     +-- meta.json      # Index metadata and stats
     +-- synaptiq.lock  # Process lock (present while serve is running)
 ```
 
 Add `.synaptiq/` to your `.gitignore`.
 
-The storage layer is abstracted behind a `StorageBackend` Protocol — KuzuDB is the default, with an optional Neo4j backend available via `pip install synaptiq[neo4j]`.
+The storage layer is abstracted behind a `StorageBackend` Protocol — LadybugDB (the actively-maintained KuzuDB successor) is the default, with an optional Neo4j backend available via `pip install synaptiq[neo4j]`.
 
 ---
 
@@ -769,7 +775,7 @@ src/synaptiq/
 |   |   +-- watcher.py             # File watcher with split parse/write
 |   +-- storage/
 |   |   +-- base.py                # StorageBackend protocol
-|   |   +-- kuzu_backend.py        # KuzuDB implementation + connection pool
+|   |   +-- ladybug_backend.py     # LadybugDB implementation + connection pool
 |   +-- daemon/
 |   |   +-- rwlock.py              # Write-preferring AsyncRWLock
 |   |   +-- lock.py                # fcntl.flock() based process lock

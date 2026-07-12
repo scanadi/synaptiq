@@ -440,18 +440,18 @@ class TestProtocolConformance:
 
         # Concrete class structurally conforming (has both methods)
         _add_symbol_node(
-            g, NodeLabel.CLASS, "src/impl.py", "KuzuBackend"
+            g, NodeLabel.CLASS, "src/impl.py", "LadybugBackend"
         )
         impl_init_id = _add_symbol_node(
             g, NodeLabel.METHOD, "src/impl.py", "initialize",
-            class_name="KuzuBackend",
+            class_name="LadybugBackend",
         )
         impl_close_id = _add_symbol_node(
             g, NodeLabel.METHOD, "src/impl.py", "close",
-            class_name="KuzuBackend",
+            class_name="LadybugBackend",
         )
 
-        # A caller calls StorageBackend.initialize (not KuzuBackend)
+        # A caller calls StorageBackend.initialize (not LadybugBackend)
         caller_id = _add_symbol_node(
             g, NodeLabel.FUNCTION, "src/main.py", "main",
             is_entry_point=True,

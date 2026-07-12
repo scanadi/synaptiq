@@ -44,7 +44,7 @@ def personalized_pagerank(
     ----------
     storage:
         An initialised storage backend.  Backends exposing a
-        ``generation`` counter (e.g. :class:`KuzuBackend`) get correct
+        ``generation`` counter (e.g. :class:`LadybugBackend`) get correct
         cache invalidation across reindexes; others fall back to
         caching for the lifetime of the storage object.
     focus_files:

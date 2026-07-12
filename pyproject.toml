@@ -28,7 +28,11 @@ dependencies = [
     "tree-sitter-javascript>=0.23.0",
     "tree-sitter-typescript>=0.23.0",
     "tree-sitter-ruby>=0.23.0",
-    "kuzu==0.11.3",  # upstream archived 2025-10; pin final release (see docs/plans/2026-07-12-*.md W1.8)
+    # LadybugDB: the actively-maintained KuzuDB successor (MIT). Replaced kuzu
+    # entirely in W2.7 — see docs/plans/2026-07-12-storage-successor-evaluation.md.
+    # API drop-in; floor-pinned to the evaluation-tested release with a <1.0
+    # ceiling (live upstream, ~monthly cadence).
+    "ladybug>=0.18.1,<1.0",
     "igraph>=1.0.0",
     "leidenalg>=0.11.0",
     "fastembed>=0.7.0",

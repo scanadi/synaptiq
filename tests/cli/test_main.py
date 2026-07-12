@@ -184,7 +184,7 @@ class TestAnalyzeJobsFlag:
         result = runner.invoke(app, ["analyze", "--jobs", "2", "--no-embeddings"])
 
         assert result.exit_code == 0, result.output
-        assert captured["limits"].kuzu_threads == 2
+        assert captured["limits"].db_threads == 2
         assert captured["limits"].embed_threads == 2
         assert captured["limits"].pool_workers == 2
 

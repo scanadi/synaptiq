@@ -73,7 +73,7 @@ def embed_graph(
             ``"BAAI/bge-small-en-v1.5"``.
         batch_size: Number of texts to encode per batch.  Defaults to 64.
         previous: ``{node_id: (text_sha, vector)}`` from the prior index
-            (see ``KuzuBackend.load_embeddings``).  ``None`` or ``{}``
+            (see ``LadybugBackend.load_embeddings``).  ``None`` or ``{}``
             encodes everything.
 
     Returns:
