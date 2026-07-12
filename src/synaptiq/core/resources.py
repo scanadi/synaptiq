@@ -11,7 +11,9 @@ contracts:
 - **server** — long-running ``serve``/``mcp``/``watch`` daemons that sit
   beside the user's real work and must stay polite under concurrent
   agent query load.  Strict caps on the LadybugDB task-scheduler pool, the
-  buffer pool, and ONNX embedding threads.
+  buffer pool, ONNX embedding threads, and the walk/parse worker pool (all
+  capped to ``max(2, cores//4)`` rather than the interactive
+  ``min(8, cores)``).
 
 Entry points declare their role once via :func:`set_profile` before any
 storage or embedding model is created; :class:`LadybugBackend` and the
@@ -69,7 +71,9 @@ class ResourceLimits:
     ``0`` means library default for ``db_threads``, ``db_buffer_bytes``,
     and ``embed_threads``.  ``pool_workers`` has no such "library default"
     concept — there's no engine-level auto mode for the walk/parse thread
-    pools — so it always resolves to a concrete positive worker count.
+    pools — so it always resolves to a concrete positive worker count
+    (``min(8, cores)`` interactive; capped to ``max(2, cores//4)`` under the
+    server profile so a sidecar daemon's parsing stays polite — review F3).
     """
 
     db_threads: int = 0
@@ -144,7 +148,11 @@ def resolve_limits(
             db_threads=threads,
             db_buffer_bytes=SERVER_BUFFER_POOL_MB * _MB,
             embed_threads=threads,
-            pool_workers=pool_default,
+            # A sidecar daemon must stay polite under concurrent agent load, so
+            # the walk/parse worker pool is capped to the same max(2, cores//4)
+            # as the engine/embedding threads — not the interactive
+            # min(8, cores) default (review F3).
+            pool_workers=threads,
         )
     else:
         # interactive: LadybugDB keeps the library default (0); embedding
