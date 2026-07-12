@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
@@ -501,3 +503,324 @@ class TestProcessParsingWorkerCount:
         process_parsing(files, graph)
 
         assert captured["max_workers"] == 4
+
+
+# ---------------------------------------------------------------------------
+# W2.1: process-parallel parsing — fan-out selection, fallback, equivalence
+# ---------------------------------------------------------------------------
+
+
+# Curated multi-language snippets to exercise the ParseResult fields that a
+# plain Python corpus under-covers: TS/JS symbols, type_refs, variable_types,
+# heritage "extends" *and* Ruby "mixin", exports.  (endpoints/http_calls are
+# populated by the later rest_linking phase, not by parse_file, so they stay
+# empty here — the equivalence check still compares them, i.e. empty==empty.)
+_FASTAPI_PY = '''\
+import requests
+from fastapi import FastAPI
+
+app = FastAPI()
+
+__all__ = ["get_item", "Client"]
+
+
+class Base:
+    pass
+
+
+class Client(Base):
+    def fetch(self, item_id: int) -> dict:
+        resp = requests.get(f"https://api.test/items/{item_id}")
+        return resp.json()
+
+
+@app.get("/items/{item_id}")
+def get_item(item_id: int) -> dict:
+    client = Client()
+    return client.fetch(item_id)
+'''
+
+_AXIOS_TS = '''\
+import axios from "axios";
+
+export interface Item {
+    id: number;
+    name: string;
+}
+
+class Widget extends BaseWidget {
+    render(item: Item): void {
+        renderThing();
+    }
+}
+
+export function loadItem(id: number): void {
+    const w = new Widget();
+    axios.get(`/items/${id}`);
+    w.render({ id, name: "x" });
+}
+'''
+
+_RUBY = '''\
+require "httparty"
+
+module Greetable
+  def greet
+    "hi"
+  end
+end
+
+class Animal
+end
+
+class Dog < Animal
+  include Greetable
+
+  def fetch_remote(id)
+    HTTParty.get("https://api.test/dogs/#{id}")
+  end
+end
+'''
+
+_JS = '''\
+function add(a, b) {
+    return a + b;
+}
+
+class Calc {
+    sum(xs) {
+        return xs.reduce(add, 0);
+    }
+}
+'''
+
+
+def _curated_multi_language_corpus() -> list[FileEntry]:
+    return [
+        _make_file_entry("svc/api.py", _FASTAPI_PY, "python"),
+        _make_file_entry("web/item.ts", _AXIOS_TS, "typescript"),
+        _make_file_entry("lib/dog.rb", _RUBY, "ruby"),
+        _make_file_entry("web/calc.js", _JS, "javascript"),
+    ]
+
+
+def _repo_python_corpus(limit: int | None = None) -> list[FileEntry]:
+    """Real in-repo Python source files as FileEntry objects (sorted by path)."""
+    pkg_dir = Path(parser_phase_module.__file__).resolve().parents[2]
+    paths = sorted(pkg_dir.rglob("*.py"))
+    if limit is not None:
+        paths = paths[:limit]
+    entries: list[FileEntry] = []
+    for p in paths:
+        try:
+            content = p.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        if content:
+            entries.append(_make_file_entry(str(p), content, "python"))
+    return entries
+
+
+def _many_trivial_files(n: int) -> list[FileEntry]:
+    return [
+        _make_file_entry(f"src/mod_{i}.py", f"def f_{i}():\n    return {i}\n", "python")
+        for i in range(n)
+    ]
+
+
+def _assert_parse_data_equal(
+    threads: list[FileParseData], processes: list[FileParseData]
+) -> None:
+    """Assert two FileParseData lists are byte-identical, field by field.
+
+    Comparison is order-sensitive within each file (list ``==``), which is
+    the W2.1 equivalence contract.
+    """
+    assert len(threads) == len(processes)
+    for a, b in zip(threads, processes):
+        assert a.file_path == b.file_path
+        assert a.language == b.language
+        assert a.content == b.content
+        ra, rb = a.parse_result, b.parse_result
+        assert ra.symbols == rb.symbols, a.file_path
+        assert ra.imports == rb.imports, a.file_path
+        assert ra.calls == rb.calls, a.file_path
+        assert ra.heritage == rb.heritage, a.file_path
+        assert ra.type_refs == rb.type_refs, a.file_path
+        assert ra.exports == rb.exports, a.file_path
+        assert ra.endpoints == rb.endpoints, a.file_path
+        assert ra.http_calls == rb.http_calls, a.file_path
+    # Whole-object equality (also covers variable_types) as a backstop.
+    assert threads == processes
+
+
+class TestFanOutSelection:
+    """_should_use_process_pool gates the process pool on file count + workers."""
+
+    def test_uses_processes_at_threshold_with_workers(self) -> None:
+        n = parser_phase_module._PROCESS_POOL_MIN_FILES
+        assert parser_phase_module._should_use_process_pool(n, 8) is True
+
+    def test_below_threshold_returns_false(self) -> None:
+        n = parser_phase_module._PROCESS_POOL_MIN_FILES - 1
+        assert parser_phase_module._should_use_process_pool(n, 8) is False
+
+    def test_single_worker_returns_false(self) -> None:
+        n = parser_phase_module._PROCESS_POOL_MIN_FILES + 100
+        assert parser_phase_module._should_use_process_pool(n, 1) is False
+
+    def test_zero_files_returns_false(self) -> None:
+        assert parser_phase_module._should_use_process_pool(0, 8) is False
+
+
+class TestFanOutFallback:
+    """_parse_files falls back to threads on the documented triggers."""
+
+    def test_below_threshold_stays_on_threads(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[int] = []
+
+        def spy(files, max_workers):
+            calls.append(len(files))
+            return []
+
+        monkeypatch.setattr(parser_phase_module, "_parse_with_processes", spy)
+        files = _many_trivial_files(parser_phase_module._PROCESS_POOL_MIN_FILES - 1)
+
+        result = parser_phase_module._parse_files(files, max_workers=8)
+
+        assert calls == []  # process pool never consulted
+        assert len(result) == len(files)
+        assert all(isinstance(d, FileParseData) for d in result)
+
+    def test_single_worker_stays_on_threads(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[int] = []
+
+        def spy(files, max_workers):
+            calls.append(len(files))
+            return []
+
+        monkeypatch.setattr(parser_phase_module, "_parse_with_processes", spy)
+        files = _many_trivial_files(parser_phase_module._PROCESS_POOL_MIN_FILES + 5)
+
+        result = parser_phase_module._parse_files(files, max_workers=1)
+
+        assert calls == []  # single worker -> threads, despite the file count
+        assert len(result) == len(files)
+
+    def test_process_pool_failure_falls_back_to_threads(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        def boom(files, max_workers):
+            raise RuntimeError("subprocesses forbidden here")
+
+        monkeypatch.setattr(parser_phase_module, "_parse_with_processes", boom)
+        files = _many_trivial_files(parser_phase_module._PROCESS_POOL_MIN_FILES)
+
+        with caplog.at_level(
+            logging.WARNING, logger="synaptiq.core.ingestion.parser_phase"
+        ):
+            result = parser_phase_module._parse_files(files, max_workers=2)
+
+        expected = parser_phase_module._parse_with_threads(files, max_workers=2)
+        assert result == expected  # thread fallback produced the full, correct result
+        assert "falling back to thread pool" in caplog.text
+
+
+class TestParseFanOutEquivalence:
+    """The process-pool and thread-pool paths produce identical parse data."""
+
+    def test_repo_corpus_equivalent_across_paths(self) -> None:
+        files = _repo_python_corpus() + _curated_multi_language_corpus()
+        # Guard: a meaningful corpus, not a trivial one.
+        assert len(files) > 50
+
+        threads = parser_phase_module._parse_with_threads(files, max_workers=4)
+        processes = parser_phase_module._parse_with_processes(files, max_workers=4)
+
+        _assert_parse_data_equal(threads, processes)
+
+    def test_curated_corpus_exercises_key_fields(self) -> None:
+        """The curated corpus actually populates the fields the equivalence
+        test compares, so a future parser change can't silently gut coverage."""
+        parsed = parser_phase_module._parse_with_threads(
+            _curated_multi_language_corpus(), max_workers=2
+        )
+        by_path = {d.file_path: d.parse_result for d in parsed}
+
+        py = by_path["svc/api.py"]
+        assert py.symbols and py.imports and py.calls and py.exports
+        assert any(kind == "extends" for _, kind, _ in py.heritage)
+
+        ts = by_path["web/item.ts"]
+        assert ts.symbols and ts.type_refs and ts.variable_types and ts.exports
+        assert any(kind == "extends" for _, kind, _ in ts.heritage)
+
+        rb = by_path["lib/dog.rb"]
+        assert rb.symbols and rb.imports and rb.calls
+        assert {"extends", "mixin"} <= {kind for _, kind, _ in rb.heritage}
+
+
+class TestProcessParsingBothPaths:
+    """process_parsing builds an identical graph whether Phase 1 fans out to
+    threads or to processes (the graph-mutation phase is path-agnostic)."""
+
+    @staticmethod
+    def _add_file_nodes(graph: KnowledgeGraph, files: list[FileEntry]) -> None:
+        for fe in files:
+            graph.add_node(
+                GraphNode(
+                    id=generate_id(NodeLabel.FILE, fe.path),
+                    label=NodeLabel.FILE,
+                    name=Path(fe.path).name,
+                    file_path=fe.path,
+                    language=fe.language,
+                )
+            )
+
+    @staticmethod
+    def _canonical(graph: KnowledgeGraph):
+        nodes = sorted(
+            (
+                n.id,
+                n.label.value,
+                n.name,
+                n.start_line,
+                n.end_line,
+                n.content,
+                n.signature,
+                n.class_name,
+                n.is_exported,
+                n.language,
+                repr(sorted((n.properties or {}).items())),
+            )
+            for n in graph.iter_nodes()
+        )
+        defines = sorted(
+            (r.source, r.target, r.id)
+            for r in graph.get_relationships_by_type(RelType.DEFINES)
+        )
+        return nodes, defines
+
+    def test_graph_identical_threads_vs_processes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        files = _repo_python_corpus(limit=40) + _curated_multi_language_corpus()
+
+        # Thread path: default threshold (100) keeps this ~44-file batch on
+        # threads.
+        g_threads = KnowledgeGraph()
+        self._add_file_nodes(g_threads, files)
+        process_parsing(files, g_threads, max_workers=2)
+
+        # Process path: drop the threshold so the same batch fans out to
+        # worker processes.
+        monkeypatch.setattr(parser_phase_module, "_PROCESS_POOL_MIN_FILES", 1)
+        g_procs = KnowledgeGraph()
+        self._add_file_nodes(g_procs, files)
+        process_parsing(files, g_procs, max_workers=2)
+
+        assert self._canonical(g_threads) == self._canonical(g_procs)
