@@ -35,3 +35,17 @@
 4. Comparison directive: every perf package's "after" must be measured with the same commands on the same machine, quiet, ≥3 runs (embeddings runs may stay at 1 — variance is low relative to magnitude).
 
 Raw JSON: session task output `bpzm9odjy` (numbers transcribed above verbatim).
+
+---
+
+# After Wave 1 (same machine, quiet, same commands, main @ W1.2 merge)
+
+| Metric | Baseline | After W1 | Δ |
+|---|---|---|---|
+| Total, no embeddings (median of 3) | 6.37s | 5.20s | **-18%** |
+| Loading to storage (median) | 5.99s | 4.83s | **-19%** (W1.3: 6 fewer FTS builds per bulk_load) |
+| Total, with embeddings (1 run) | 55.7s | 61.5s | +10% |
+| Generating embeddings (1 run) | 49.2s | 56.2s | **+14% by design** (W1.4 polite default: cores-2 ONNX threads; `--jobs 0` restores all-cores) |
+| Parsing code | 0.151s | 0.167s | noise |
+
+**Not visible in a full-index benchmark (the actual Wave-1 targets):** watcher continuous-rebuild loop → single rebuild after 30s quiescence with 600s ceiling and skip-if-clean (W1.1); per-save cost drops from O(corpus) FTS rebuild to O(file) (W1.2); incremental insert path ~47× via transactions + prepared statements, 13.9s → 0.29s per 1k nodes (W1.6, agent micro-benchmark); rest_linking phase 16-43× at scale (W1.5, agent synthetic benchmark at N=300/1000); MCP `cycles` now cached per index generation (B2).
