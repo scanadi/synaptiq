@@ -51,6 +51,17 @@ class FileParseData:
     language: str
     parse_result: ParseResult
     content: str = ""
+    # Populated by process_parsing's Phase 2 (graph mutation, parent
+    # process) with the same node IDs assign_symbol_ids just computed while
+    # creating the symbol nodes -- lets later phases (e.g. calls.py's
+    # decorator-edge resolution) reuse them instead of recomputing via
+    # assign_symbol_ids a second time over every symbol in the repo.
+    # Stays ``None`` for FileParseData built outside process_parsing (direct
+    # construction in tests, diff.py's scoped-diff path); a plain list of
+    # str/None is picklable, and Phase 1 workers never set this field, so it
+    # crosses the process boundary unset and is only populated afterwards in
+    # the parent.
+    symbol_ids: list[str | None] | None = None
 
 # Parser instances are cached per (thread, language).  tree-sitter parser
 # objects are stateful and documented as single-thread-at-a-time, so the
@@ -323,6 +334,9 @@ def process_parsing(
         file_id = generate_id(NodeLabel.FILE, file_entry.path)
         exported_names: set[str] = set(parse_data.parse_result.exports)
         symbol_ids = assign_symbol_ids(parse_data.parse_result.symbols, file_entry.path)
+        # Carry the computed IDs forward on the returned FileParseData (see
+        # the field docstring) so calls.py doesn't have to recompute them.
+        parse_data.symbol_ids = symbol_ids
 
         # Build class -> base class names for storing on class nodes.
         class_bases: dict[str, list[str]] = {}
