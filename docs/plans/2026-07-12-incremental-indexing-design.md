@@ -649,3 +649,7 @@ throughout.
 ---
 
 *End W3.1. Implementation (W3.2) must not begin until this design is approved by the owner (plan §8 gate).*
+
+## Approval (2026-07-12, lead as owner-delegate per blanket execution instruction)
+
+APPROVED with conditions: leaner design accepted (D1); all recommendations D2-D10 accepted as written; spikes D3 (in-DB manifest vs .rebuild swap) and D6 (MERGE-on-rel-property support) must complete before interface freeze; the two latent apply_reindex bugs (inbound-edge deletion, duplicate CONTAINS on re-emit) are P0 inside W3.2d. Owner may overrule before release.
