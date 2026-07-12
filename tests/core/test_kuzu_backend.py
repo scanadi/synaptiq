@@ -753,3 +753,64 @@ class TestTransactionalBatchInserts:
         assert b._prepared  # populated
         b.close()
         assert b._prepared == {}  # cleared with the connection
+
+
+class TestBulkLoadSkipsEmptyFtsBuild:
+    """W2.3b: the .rebuild schema skips the (empty) FTS build; rebuild_fts_indexes
+    builds them over the populated tables, and the query path stays safe."""
+
+    def _searchable(self) -> KnowledgeGraph:
+        g = KnowledgeGraph()
+        g.add_node(
+            GraphNode(
+                id="function:src/a.py:findmez9",
+                label=NodeLabel.FUNCTION,
+                name="findmez9",
+                file_path="src/a.py",
+                content="def findmez9():\n    return 1",
+            )
+        )
+        return g
+
+    def test_builder_skips_fts_yet_search_works_after_bulk_load(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen_flags: list[bool] = []
+        orig = KuzuBackend._create_schema
+
+        def spy(self, *, build_fts: bool = True):
+            seen_flags.append(build_fts)
+            return orig(self, build_fts=build_fts)
+
+        monkeypatch.setattr(KuzuBackend, "_create_schema", spy)
+
+        backend = KuzuBackend()
+        backend.initialize(tmp_path / "fts_db")
+        try:
+            backend.bulk_load(self._searchable())
+            # The bulk_load builder created its schema without FTS indexes.
+            assert False in seen_flags
+            # ...but the populated FTS index built by rebuild_fts_indexes works.
+            results = backend.fts_search("findmez9", limit=5)
+            assert any(r.node_id == "function:src/a.py:findmez9" for r in results)
+        finally:
+            backend.close()
+
+    def test_fts_search_tolerates_missing_indexes(self, tmp_path: Path) -> None:
+        # A DB whose FTS indexes were never built must not crash on search.
+        backend = KuzuBackend()
+        backend.initialize(tmp_path / "nofts_db", _build_fts_indexes=False)
+        try:
+            backend.add_nodes(
+                [
+                    GraphNode(
+                        id="function:src/a.py:x",
+                        label=NodeLabel.FUNCTION,
+                        name="x",
+                        file_path="src/a.py",
+                    )
+                ]
+            )
+            assert backend.fts_search("x", limit=5) == []
+        finally:
+            backend.close()

@@ -246,7 +246,9 @@ class KuzuBackend:
         """
         return self._generation
 
-    def initialize(self, path: Path, *, read_only: bool = False) -> None:
+    def initialize(
+        self, path: Path, *, read_only: bool = False, _build_fts_indexes: bool = True
+    ) -> None:
         """Open or create the KuzuDB database at *path* and set up the schema.
 
         Args:
@@ -258,6 +260,14 @@ class KuzuBackend:
                 schema is verified so a database created by an older
                 synaptiq fails loudly instead of silently returning
                 empty results for every query.
+            _build_fts_indexes: Internal. When ``False``, skip building the
+                (empty) FTS indexes during schema creation — used by
+                :meth:`bulk_load` for its ``.rebuild`` database, which calls
+                :meth:`rebuild_fts_indexes` right after the COPY to build them
+                over the populated tables. Building them on empty tables first
+                is pure waste (~25% of the storage-load time). The default
+                ``True`` preserves behaviour for every other caller, so a
+                database queried before any bulk_load still has its indexes.
         """
         from synaptiq.core.resources import current_limits
 
@@ -278,7 +288,7 @@ class KuzuBackend:
         with self._pool_lock:
             self._generation += 1
         if not read_only:
-            self._create_schema()
+            self._create_schema(build_fts=_build_fts_indexes)
         else:
             self._verify_schema()
 
@@ -1244,7 +1254,10 @@ class KuzuBackend:
 
         self._remove_db_files(tmp_path)
         builder = KuzuBackend()
-        builder.initialize(tmp_path)
+        # Skip building FTS indexes on the empty schema — rebuild_fts_indexes()
+        # below builds them over the populated tables right after the COPY, so
+        # the empty-table build would be pure waste (~25% of storage-load time).
+        builder.initialize(tmp_path, _build_fts_indexes=False)
         try:
             if not builder._bulk_load_nodes_csv(graph):
                 builder.add_nodes(list(graph.iter_nodes()))
@@ -1475,8 +1488,13 @@ class KuzuBackend:
             )
             return False
 
-    def _create_schema(self) -> None:
-        """Create node/rel/embedding tables and the FTS extension."""
+    def _create_schema(self, *, build_fts: bool = True) -> None:
+        """Create node/rel/embedding tables and the FTS extension.
+
+        When ``build_fts`` is ``False`` the (empty) FTS indexes are not built —
+        see :meth:`initialize`'s ``_build_fts_indexes`` for why the bulk_load
+        rebuild path skips them.
+        """
         assert self._conn is not None
 
         try:
@@ -1518,7 +1536,8 @@ class KuzuBackend:
         except Exception:
             logger.debug("REL TABLE GROUP creation skipped", exc_info=True)
 
-        self._create_fts_indexes()
+        if build_fts:
+            self._create_fts_indexes()
 
     def _create_fts_indexes(self) -> None:
         """Create FTS indexes for every searchable node table (idempotent).
