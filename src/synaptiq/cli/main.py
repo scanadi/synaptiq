@@ -245,9 +245,13 @@ def analyze(
 ) -> None:
     """Index a repository into a knowledge graph."""
     from synaptiq.core.daemon.lock import LockManager
-    from synaptiq.core.embeddings.embedder import embeddable_node_count
+    from synaptiq.core.embeddings.embedder import embeddable_node_count, partition_embeddings
     from synaptiq.core.embeddings.lazy_worker import spawn_lazy_worker
-    from synaptiq.core.ingestion.pipeline import PipelineResult, run_pipeline
+    from synaptiq.core.ingestion.pipeline import (
+        PipelineResult,
+        load_previous_embeddings,
+        run_pipeline,
+    )
     from synaptiq.core.resources import set_jobs
     from synaptiq.core.storage.ladybug_backend import open_with_recovery
 
@@ -317,6 +321,16 @@ def analyze(
         # on this initial open would be pure waste (~2s on LadybugDB).
         storage = open_with_recovery(db_path, data_dir / "meta.json", build_fts_indexes=False)
 
+        # Lazy mode: snapshot whatever embeddings the PREVIOUS index holds
+        # before run_pipeline's bulk_load wipes the Embedding table — mirrors
+        # the ordering run_pipeline itself uses for sync mode (see
+        # pipeline.run_pipeline's "Snapshot before bulk_load" comment). Stays
+        # {} on the very first analyze (nothing stored yet) and for non-lazy
+        # modes, which handle their own snapshot inside run_pipeline.
+        previous_embeddings: dict = {}
+        if mode is EmbeddingsMode.lazy:
+            previous_embeddings = load_previous_embeddings(storage)
+
         result: PipelineResult | None = None
         with Progress(
             SpinnerColumn(),
@@ -337,10 +351,29 @@ def analyze(
                 skip_embeddings=skip_inline_embeddings,
             )
 
-        _write_meta(data_dir, repo_path, result)
+        # Lazy mode: split into vectors we can reuse immediately (unchanged
+        # text_sha) vs. a pending delta a background worker must still
+        # encode, then store the reused ones right now — a fast COPY, no
+        # model load — so cross-rebuild reuse works in lazy mode too instead
+        # of the background worker re-encoding the full set every time (the
+        # bulk_load above just wiped the Embedding table). When
+        # previous_embeddings is still empty (first-ever analyze) the
+        # partition would find nothing to reuse anyway, so skip straight to
+        # the cheap node count — zero added overhead on the cold path.
+        reused_embeddings: list = []
+        pending_embeddings = 0
+        if mode is EmbeddingsMode.lazy:
+            if previous_embeddings:
+                reused_embeddings, pending_embeddings = partition_embeddings(
+                    graph, previous_embeddings
+                )
+                if reused_embeddings:
+                    storage.store_embeddings(reused_embeddings)
+                    result.embeddings = len(reused_embeddings)
+            else:
+                pending_embeddings = embeddable_node_count(graph)
 
-        # How many symbols the background worker will encode (lazy mode only).
-        pending_embeddings = embeddable_node_count(graph) if mode is EmbeddingsMode.lazy else 0
+        _write_meta(data_dir, repo_path, result)
 
         console.print()
         if mode is EmbeddingsMode.lazy:
@@ -370,20 +403,36 @@ def analyze(
         # (to load the graph) never collides with this process's write handle.
         storage.close()
 
-        if mode is EmbeddingsMode.lazy and pending_embeddings > 0:
-            pid = spawn_lazy_worker(repo_path)
-            console.print()
-            if pid is not None:
+        if mode is EmbeddingsMode.lazy:
+            if pending_embeddings > 0:
+                pid = spawn_lazy_worker(repo_path)
+                console.print()
+                if pid is not None:
+                    if reused_embeddings:
+                        console.print(
+                            f"[cyan]{len(reused_embeddings):,} vectors reused; encoding "
+                            f"{pending_embeddings:,} in the background[/cyan] (PID {pid}) "
+                            "— run [bold]synaptiq status[/bold] to check progress."
+                        )
+                    else:
+                        console.print(
+                            f"[cyan]Encoding {pending_embeddings:,} embeddings in the "
+                            f"background[/cyan] (PID {pid}) — run "
+                            "[bold]synaptiq status[/bold] to check progress."
+                        )
+                else:
+                    _stderr_console.print(
+                        "[yellow]Warning:[/yellow] could not start the background "
+                        "embedding worker; run `synaptiq analyze --embeddings sync` "
+                        "to encode vectors."
+                    )
+            elif reused_embeddings:
+                # Every embeddable node's text_sha matched the previous index —
+                # nothing to encode, so there is no delta to spawn a worker for.
+                console.print()
                 console.print(
-                    f"[cyan]Encoding {pending_embeddings:,} embeddings in the "
-                    f"background[/cyan] (PID {pid}) — run "
-                    "[bold]synaptiq status[/bold] to check progress."
-                )
-            else:
-                _stderr_console.print(
-                    "[yellow]Warning:[/yellow] could not start the background "
-                    "embedding worker; run `synaptiq analyze --embeddings sync` "
-                    "to encode vectors."
+                    f"[cyan]All {len(reused_embeddings):,} vectors reused[/cyan] — "
+                    "nothing to encode."
                 )
     finally:
         lock_mgr.release()

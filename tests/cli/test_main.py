@@ -305,6 +305,149 @@ class TestAnalyzeEmbeddingsFlag:
         assert meta["stats"]["embeddings"] == 0
 
 
+class TestAnalyzeLazyReuse:
+    """`analyze --embeddings lazy` reuses vectors across rebuilds (W4.1b).
+
+    Uses the deterministic `_FakeEmbedModel` (no ONNX, no subprocess) so these
+    stay fast and race-free — the real detached-worker path is covered
+    end-to-end in tests/e2e/test_lazy_embeddings.py.
+    """
+
+    @staticmethod
+    def _repo_with_two_files(repo: Path) -> None:
+        src = repo / "src"
+        src.mkdir(parents=True)
+        (src / "main.py").write_text(
+            "def main():\n    return helper()\n\n\ndef helper():\n    return 42\n",
+            encoding="utf-8",
+        )
+        (src / "util.py").write_text(
+            "def format_name(name):\n    return name.strip().title()\n",
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _seed_with_sync_analyze(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Populate a full embedding table quickly via the fake model — no
+        ONNX, no lazy worker involved."""
+        monkeypatch.setattr(
+            "synaptiq.core.embeddings.embedder._get_model",
+            lambda *a, **k: _FakeEmbedModel(),
+        )
+        result = runner.invoke(app, ["analyze", str(repo), "--embeddings", "sync"])
+        assert result.exit_code == 0, result.output
+
+    def test_unchanged_repo_reuses_everything_and_skips_worker(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from synaptiq.core.storage.ladybug_backend import LadybugBackend
+
+        repo = tmp_path / "repo"
+        self._repo_with_two_files(repo)
+        self._seed_with_sync_analyze(repo, monkeypatch)
+
+        before = LadybugBackend()
+        before.initialize(repo / ".synaptiq" / "kuzu", read_only=True)
+        try:
+            stored_before = before.load_embeddings()
+        finally:
+            before.close()
+        assert stored_before  # sanity: the sync run actually stored vectors
+
+        monkeypatch.chdir(repo)
+        spawned = {"n": 0}
+        monkeypatch.setattr(
+            "synaptiq.core.embeddings.lazy_worker.spawn_lazy_worker",
+            lambda rp: spawned.__setitem__("n", spawned["n"] + 1),
+        )
+
+        result = runner.invoke(app, ["analyze"])  # lazy is the default, repo unchanged
+        assert result.exit_code == 0, result.output
+        assert "Index ready" in result.output
+        assert "vectors reused" in result.output
+        assert "in the background" not in result.output  # nothing pending
+        assert spawned["n"] == 0  # zero-change analyze must not spawn a no-op worker
+
+        after = LadybugBackend()
+        after.initialize(repo / ".synaptiq" / "kuzu", read_only=True)
+        try:
+            stored_after = after.load_embeddings()
+        finally:
+            after.close()
+        assert len(stored_after) == len(stored_before)
+
+        meta = json.loads((repo / ".synaptiq" / "meta.json").read_text())
+        assert meta["stats"]["embeddings"] == len(stored_before)
+
+    def test_partial_change_stores_reused_synchronously_before_spawning_worker(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from synaptiq.core.storage.ladybug_backend import LadybugBackend
+
+        repo = tmp_path / "repo"
+        self._repo_with_two_files(repo)
+        self._seed_with_sync_analyze(repo, monkeypatch)
+
+        before = LadybugBackend()
+        before.initialize(repo / ".synaptiq" / "kuzu", read_only=True)
+        try:
+            total_before = len(before.load_embeddings())
+        finally:
+            before.close()
+
+        # Touch ONE file: append a brand-new, self-contained function. Its own
+        # text is new (no previous entry -> pending) and it changes util.py's
+        # FILE node `defines:` text -> that FILE node also goes pending.
+        # Nothing calls or is called by it, so every other symbol's generated
+        # text — and therefore its text_sha — is untouched: exactly 2 of the
+        # (total_before + 1) embeddable nodes should end up pending.
+        (repo / "src" / "util.py").write_text(
+            "def format_name(name):\n    return name.strip().title()\n\n\n"
+            "def extra():\n    return 1\n",
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(repo)
+
+        call_order: list[str] = []
+        original_store = LadybugBackend.store_embeddings
+
+        def _spy_store(self, embeddings):
+            call_order.append(f"store:{len(embeddings)}")
+            return original_store(self, embeddings)
+
+        monkeypatch.setattr(LadybugBackend, "store_embeddings", _spy_store)
+
+        spawned: dict = {}
+
+        def _spy_spawn(rp):
+            call_order.append("spawn")
+            spawned["repo"] = rp
+            return 4242
+
+        monkeypatch.setattr("synaptiq.core.embeddings.lazy_worker.spawn_lazy_worker", _spy_spawn)
+
+        result = runner.invoke(app, ["analyze"])  # lazy is the default
+        assert result.exit_code == 0, result.output
+        assert "Index ready" in result.output
+        assert "vectors reused" in result.output
+        assert "in the background" in result.output
+        assert spawned.get("repo") == repo.resolve()
+
+        # Reused vectors are stored synchronously, BEFORE the worker spawns.
+        assert call_order == [f"store:{total_before - 1}", "spawn"]
+
+        # The worker never actually ran (spawn is mocked to a no-op), so the
+        # DB must hold EXACTLY the reused set right now — strictly less than
+        # the full node count, proving the store above was partial, not full.
+        after = LadybugBackend()
+        after.initialize(repo / ".synaptiq" / "kuzu", read_only=True)
+        try:
+            stored_after = after.load_embeddings()
+        finally:
+            after.close()
+        assert len(stored_after) == total_before - 1
+
+
 class TestStatus:
     """Tests for the status command."""
 
