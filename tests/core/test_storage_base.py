@@ -95,6 +95,9 @@ class TestStorageBackend:
             def remove_nodes_by_file(self, file_path):
                 return 0
 
+            def remove_nodes_by_id(self, node_ids):
+                return 0
+
             def get_node(self, node_id):
                 return None
 
@@ -129,6 +132,9 @@ class TestStorageBackend:
                 return {}
 
             def bulk_load(self, graph):
+                pass
+
+            def apply_graph_delta(self, delta):
                 pass
 
             def traverse_with_depth(self, start_id, depth, direction="callers"):

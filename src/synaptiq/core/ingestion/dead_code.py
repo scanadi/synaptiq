@@ -289,6 +289,21 @@ def _is_exempt(
         or _is_framework_entry_file(file_path)
     )
 
+
+def is_symbol_exempt_from_dead_code(
+    name: str, is_entry_point: bool, is_exported: bool, file_path: str = ""
+) -> bool:
+    """Public reuse hook: the exact exemption predicate used by dead-code flagging.
+
+    Exposed (W3.2d) so the storage layer's scoped ``is_dead`` recount on the
+    incremental delta path can decide deadness with the *same* logic instead of
+    forking it. Delegates verbatim to the internal :func:`_is_exempt`, which
+    :func:`process_dead_code` also uses. A symbol with zero incoming CALLS is
+    dead iff this predicate returns ``False``.
+    """
+    return _is_exempt(name, is_entry_point, is_exported, file_path)
+
+
 def _clear_override_false_positives(graph: KnowledgeGraph) -> int:
     """Un-flag methods that override a non-dead base class method.
 

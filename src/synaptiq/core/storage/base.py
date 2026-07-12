@@ -39,6 +39,54 @@ class NodeEmbedding:
     embedding: list[float] = field(default_factory=list)
     text_sha: str = ""
 
+
+@dataclass
+class EdgeRef:
+    """A relationship addressed by its endpoints and logical kind.
+
+    The delete key for an incremental delta. The rel-table group stores the
+    logical kind in the ``rel_type`` property (not as a label), so an edge is
+    identified by the ``(rel_type, source, target)`` triple.
+    """
+
+    rel_type: str
+    source: str
+    target: str
+
+
+@dataclass
+class GraphDelta:
+    """A surgical, scoped change set applied to storage in one transaction.
+
+    Produced by the incremental resolver (W3.2c) and consumed by
+    :meth:`StorageBackend.apply_graph_delta` (W3.2d). This is a **frozen
+    interface** — other sub-packages build against these field names and types
+    (incremental-indexing design §5.5).
+
+    Fields:
+
+    * ``nodes_upsert`` — added / body-only-changed / identity-changed nodes,
+      applied as an idempotent ``MERGE`` upsert (a body-only edit becomes a
+      property refresh with no edge impact).
+    * ``nodes_remove`` — ids of genuinely-removed symbols (and deleted-file
+      symbols). Removed surgically by id so surviving symbols keep their
+      inbound edges; removing a symbol cascades only its own dangling edges.
+    * ``edges_add`` — freshly resolved edges, inserted idempotently (``MERGE``).
+    * ``edges_remove`` — edges the re-resolved files previously contributed,
+      deleted before re-insert so the apply is idempotent without a global
+      ``DETACH DELETE``.
+    * ``dead_recount`` — symbol ids whose incoming-CALLS in-degree may have
+      crossed zero (targets of added/removed CALLS plus upserted/removed
+      nodes); ``is_dead`` is recomputed locally for each.
+    """
+
+    nodes_upsert: list[GraphNode] = field(default_factory=list)
+    nodes_remove: list[str] = field(default_factory=list)
+    edges_add: list[GraphRelationship] = field(default_factory=list)
+    edges_remove: list[EdgeRef] = field(default_factory=list)
+    dead_recount: set[str] = field(default_factory=set)
+
+
 @runtime_checkable
 class StorageBackend(Protocol):
     """Protocol that every Synaptiq storage backend must implement.
@@ -69,6 +117,18 @@ class StorageBackend(Protocol):
 
         Returns:
             The number of nodes removed.
+        """
+        ...
+
+    def remove_nodes_by_id(self, node_ids: list[str]) -> int:
+        """Surgically remove only the nodes with the given ids.
+
+        Unlike :meth:`remove_nodes_by_file`, this leaves other symbols from the
+        same file — and their inbound edges from unchanged files — in place. It
+        is the scoped-removal primitive used by the incremental delta path.
+
+        Returns:
+            The number of nodes actually removed.
         """
         ...
 
@@ -147,4 +207,15 @@ class StorageBackend(Protocol):
 
     def bulk_load(self, graph: KnowledgeGraph) -> None:
         """Replace the entire store contents with *graph*."""
+        ...
+
+    def apply_graph_delta(self, delta: GraphDelta) -> None:
+        """Apply a scoped :class:`GraphDelta` atomically in one transaction.
+
+        Applies, in order: ``edges_remove``, ``nodes_remove``, ``nodes_upsert``,
+        ``edges_add``, then the scoped ``is_dead`` recount over ``dead_recount``.
+        A mid-delta failure rolls the whole change set back. Global artifacts
+        (full-text index, vector index, communities, processes) are left stale
+        and reconciled later at consolidation — no rebuild happens here.
+        """
         ...
