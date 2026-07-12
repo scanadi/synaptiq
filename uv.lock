@@ -1697,6 +1697,7 @@ dependencies = [
     { name = "leidenalg" },
     { name = "mcp" },
     { name = "pathspec" },
+    { name = "pyarrow" },
     { name = "rich" },
     { name = "tree-sitter" },
     { name = "tree-sitter-javascript" },
@@ -1709,14 +1710,10 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
-    { name = "pyarrow" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
     { name = "ruff" },
-]
-fast-load = [
-    { name = "pyarrow" },
 ]
 neo4j = [
     { name = "neo4j" },
@@ -1731,8 +1728,7 @@ requires-dist = [
     { name = "mcp", specifier = ">=1.0.0" },
     { name = "neo4j", marker = "extra == 'neo4j'", specifier = ">=5.0.0" },
     { name = "pathspec", specifier = ">=1.0.4" },
-    { name = "pyarrow", marker = "extra == 'dev'", specifier = ">=17.0.0" },
-    { name = "pyarrow", marker = "extra == 'fast-load'", specifier = ">=17.0.0" },
+    { name = "pyarrow", specifier = ">=17.0.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=6.0.0" },
