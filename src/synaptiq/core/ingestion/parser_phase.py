@@ -238,7 +238,11 @@ def _parse_with_processes(files: list[FileEntry], max_workers: int) -> list[File
 
     Uses an explicit ``spawn`` context: ``fork`` is unsafe once the parent
     has ever started threads (prior pools leave locks in an unknown state
-    in the child), and ``spawn`` is macOS's default regardless.  Only
+    in the child), and ``spawn`` is macOS's default regardless.  This is not
+    hypothetical here — ``run_pipeline`` submits coupling's git-log collect to
+    a ``ThreadPoolExecutor`` right after the walk, so that worker thread can
+    still be alive when this pool spins up; the ``spawn`` start method must be
+    kept for that reason (see ``pipeline.run_pipeline``).  Only
     picklable primitives — the path/content/language strings — cross the
     process boundary; :func:`parse_file` is a module-level function
     re-imported inside each worker, and the returned :class:`FileParseData`

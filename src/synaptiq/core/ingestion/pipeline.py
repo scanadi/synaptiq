@@ -22,9 +22,9 @@ from __future__ import annotations
 
 import json
 import logging
-import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -36,7 +36,6 @@ from synaptiq.core.graph.model import NodeLabel
 from synaptiq.core.ingestion.calls import process_calls
 from synaptiq.core.ingestion.community import process_communities
 from synaptiq.core.ingestion.coupling import (
-    GitCollectionResult,
     collect_coupling_commits,
     process_coupling,
 )
@@ -139,104 +138,99 @@ def run_pipeline(
             result.phase_timings[phase] = time.monotonic() - t0
             report(phase, 1.0)
 
-    git_log_outcome: list[GitCollectionResult] = []
+    # W2.4 (G11): coupling's `git log` is a single GIL-releasing subprocess
+    # that otherwise sits serially at the tail of the pipeline. Run its
+    # "collect" half on a dedicated single-use worker thread so the wait
+    # overlaps with every CPU phase between the walk and "Analyzing git
+    # history". A concurrent.futures Future gives a clean lifecycle plus native
+    # error propagation: Future.result() re-raises the worker's exception with
+    # its original traceback (no error box, no masked-empty branch — F4b), and
+    # the try/finally below guarantees the executor is shut down on ANY phase
+    # failure so the worker thread is never orphaned.
+    #
+    # Fork-safety: this thread can be alive while process_parsing fans parsing
+    # out to a process pool, so that pool MUST stay on the 'spawn' start method
+    # — forking after a live thread leaves locks in an unknown state in the
+    # child. See parser_phase._parse_with_processes.
+    git_log_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="synaptiq-gitlog")
+    git_future: Future[list[list[str]]] | None = None
+    try:
+        with timed_phase("Walking files"):
+            gitignore = load_gitignore(repo_path)
+            files = walk_repo(repo_path, gitignore)
+            result.files = len(files)
 
-    def _collect_git_history(graph_files: set[str]) -> None:
-        git_log_outcome.append(collect_coupling_commits(repo_path, graph_files))
+            # graph_files reproduces the filter process_coupling applies today
+            # (`{n.file_path for n in graph.get_nodes_by_label(NodeLabel.FILE)}`)
+            # without waiting for "Processing structure" to run: structure.py
+            # creates exactly one File node per walked FileEntry, unfiltered and
+            # undeduplicated, so the two sets are always identical. Snapshot and
+            # submit inside this timed block so thread-creation overhead lands
+            # in "Walking files" instead of an untimed gap. The worker only runs
+            # collect_coupling_commits (pure subprocess + str parsing); it never
+            # touches `graph`, which has no internal locking.
+            graph_files = {f.path for f in files}
+            git_future = git_log_executor.submit(
+                collect_coupling_commits, repo_path, graph_files
+            )
 
-    with timed_phase("Walking files"):
-        gitignore = load_gitignore(repo_path)
-        files = walk_repo(repo_path, gitignore)
-        result.files = len(files)
+        graph = KnowledgeGraph()
 
-        # W2.4 (G11): coupling's `git log` is a single GIL-releasing
-        # subprocess that otherwise sits serially at the tail of the
-        # pipeline. Kick off its "collect" half now, in a background
-        # thread, so the wait overlaps with every CPU phase between here
-        # and "Analyzing git history" below. This thread never touches
-        # `graph` -- KnowledgeGraph has no internal locking and is not safe
-        # to read/write concurrently -- so it is only allowed to run
-        # collect_coupling_commits (pure subprocess + str parsing).
-        # Started inside this timed block (rather than right after it) so
-        # thread-creation overhead is accounted for in "Walking files"
-        # instead of leaking into an untimed gap.
-        #
-        # graph_files reproduces the filter process_coupling applies today
-        # (`{n.file_path for n in graph.get_nodes_by_label(NodeLabel.FILE)}`)
-        # without waiting for "Processing structure" to run: structure.py
-        # creates exactly one File node per walked FileEntry, unfiltered and
-        # undeduplicated, so the two sets are always identical.
-        graph_files = {f.path for f in files}
-        git_log_thread = threading.Thread(
-            target=_collect_git_history,
-            args=(graph_files,),
-            name="synaptiq-coupling-git-log",
-            daemon=True,
-        )
-        git_log_thread.start()
+        with timed_phase("Processing structure"):
+            process_structure(files, graph)
 
-    graph = KnowledgeGraph()
+        with timed_phase("Parsing code"):
+            parse_data = process_parsing(files, graph)
 
-    with timed_phase("Processing structure"):
-        process_structure(files, graph)
+        with timed_phase("Resolving imports"):
+            process_imports(parse_data, graph)
 
-    with timed_phase("Parsing code"):
-        parse_data = process_parsing(files, graph)
+        with timed_phase("Tracing calls"):
+            process_calls(parse_data, graph)
 
-    with timed_phase("Resolving imports"):
-        process_imports(parse_data, graph)
+        with timed_phase("Linking REST endpoints"):
+            result.rest_links = process_rest_linking(parse_data, graph)
 
-    with timed_phase("Tracing calls"):
-        process_calls(parse_data, graph)
+        with timed_phase("Extracting heritage"):
+            process_heritage(parse_data, graph)
 
-    with timed_phase("Linking REST endpoints"):
-        result.rest_links = process_rest_linking(parse_data, graph)
+        with timed_phase("Analyzing types"):
+            process_types(parse_data, graph)
 
-    with timed_phase("Extracting heritage"):
-        process_heritage(parse_data, graph)
+        with timed_phase("Detecting communities"):
+            result.clusters = process_communities(graph)
 
-    with timed_phase("Analyzing types"):
-        process_types(parse_data, graph)
+        with timed_phase("Detecting execution flows"):
+            result.processes = process_processes(graph)
 
-    with timed_phase("Detecting communities"):
-        result.clusters = process_communities(graph)
+        with timed_phase("Finding dead code"):
+            result.dead_code = process_dead_code(graph)
 
-    with timed_phase("Detecting execution flows"):
-        result.processes = process_processes(graph)
-
-    with timed_phase("Finding dead code"):
-        result.dead_code = process_dead_code(graph)
-
-    with timed_phase("Analyzing git history"):
-        # Join the background collector -- see the "Walking files" block
-        # above. This phase's recorded time is exactly the join wait (0 if
-        # the git-log subprocess already finished during the CPU phases
-        # above) plus process_coupling's apply cost, so phase_timings stays
-        # honest: it still sums to ~duration_seconds, just smaller overall
-        # because the subprocess wait is no longer serial.
-        join_start = time.monotonic()
-        git_log_thread.join()
-        join_wait = time.monotonic() - join_start
-
-        git_data = git_log_outcome[0] if git_log_outcome else GitCollectionResult()
-        if git_data.error is not None:
-            # Re-raise the exact object (with its original traceback) so an
-            # unexpected collection failure crashes run_pipeline exactly as
-            # it did when process_coupling called parse_git_log inline. The
-            # common "not a git repo" case never reaches here -- it's caught
-            # inside parse_git_log itself and yields commits=[] instead.
-            raise git_data.error
-
-        hidden = max(0.0, git_data.duration - join_wait)
-        logger.debug(
-            "Coupling git-log collection took %.3fs total; %.3fs of that "
-            "overlapped with CPU phases (visible join wait %.3fs)",
-            git_data.duration,
-            hidden,
-            join_wait,
-        )
-
-        result.coupled_pairs = process_coupling(graph, repo_path, commits=git_data.commits)
+        with timed_phase("Analyzing git history"):
+            # Join the background collector (see the "Walking files" block).
+            # Future.result() blocks until the git-log subprocess finishes (0
+            # extra wait if it already completed during the CPU phases above)
+            # and re-raises any UNEXPECTED collection failure with its original
+            # traceback. The common "not a git repo" case never reaches here --
+            # parse_git_log catches it and yields commits=[] instead. This
+            # phase's recorded time is that (usually already-elapsed) wait plus
+            # process_coupling's apply cost, so phase_timings stays honest: it
+            # still sums to ~duration_seconds, just smaller overall because the
+            # subprocess wait is no longer serial.
+            commits = git_future.result()
+            result.coupled_pairs = process_coupling(graph, repo_path, commits=commits)
+    finally:
+        # Reap the single-use executor. On the happy path the future is already
+        # done, so this is cheap. On a phase failure the collect may still be
+        # running: cancel the (possibly not-yet-started) future and shut down
+        # WITHOUT blocking — shutdown(wait=False) lets the finite git-log
+        # subprocess finish in the background, and because the executor is
+        # per-invocation (one worker, not one per failure) nothing accumulates
+        # unboundedly: the Future is dropped and the executor reaped when that
+        # worker ends.
+        if git_future is not None:
+            git_future.cancel()
+        git_log_executor.shutdown(wait=False, cancel_futures=True)
 
     if storage is not None:
         # Snapshot before bulk_load — it resets the whole database,
