@@ -50,7 +50,10 @@ class PythonParser(LanguageParser):
         """Parse Python source and return structured information."""
         tree = self._parser.parse(bytes(content, "utf8"))
         result = ParseResult()
-        self._walk(tree.root_node, content, result, class_name="")
+        root = tree.root_node
+        self._walk(root, content, result, class_name="")
+        # Extract module-level calls (e.g. ``setup()`` at the top of a script).
+        self._extract_calls_recursive(root, result)
         return result
 
     def _walk(
@@ -60,50 +63,30 @@ class PythonParser(LanguageParser):
         result: ParseResult,
         class_name: str,
     ) -> None:
-        """Walk the tree once, extracting definitions, annotations, and calls.
+        """Recursively walk the AST to extract definitions and annotations.
 
-        Every node is visited exactly once: the extractors never recurse back
-        into ``_walk`` — only the single child loop at the bottom does (the
-        TypeScript parser's structure).  Call and exception-class references
-        are pulled at *every* node, so ``result.calls`` is byte-identical to
-        the previous dedicated full-tree pass and every call is attributed
-        exactly once.
-
-        ``class_name`` is the enclosing class used for method attribution: it
-        resets to ``""`` inside a function body (nested defs are standalone
-        functions) and becomes the class name inside a class body; otherwise it
-        propagates down unchanged.
+        Call extraction is handled separately via ``_extract_calls_recursive``
+        at each scope boundary (module, class, function) to avoid
+        double-counting.
         """
-        ntype = node.type
-
-        # Calls and exception-class references — collected at every node.
-        if ntype == "call":
-            self._extract_call(node, result)
-        elif ntype == "except_clause":
-            self._extract_except_clause(node, result)
-        elif ntype == "raise_statement":
-            self._extract_raise_statement(node, result)
-
-        # Definitions, imports, and annotations.
-        child_class_name = class_name
-        if ntype == "function_definition":
-            self._extract_function(node, content, result, class_name)
-            # Nested functions/classes inside a function body are standalone
-            # symbols, so their scope carries no class name.
-            child_class_name = ""
-        elif ntype == "class_definition":
-            new_name = self._extract_class(node, content, result)
-            if new_name:
-                child_class_name = new_name
-        elif ntype == "import_statement":
-            self._extract_import(node, result)
-        elif ntype == "import_from_statement":
-            self._extract_import_from(node, result)
-        elif ntype == "expression_statement":
-            self._extract_annotations_from_expression(node, result)
-
         for child in node.children:
-            self._walk(child, content, result, child_class_name)
+            match child.type:
+                case "function_definition":
+                    self._extract_function(child, content, result, class_name)
+                case "class_definition":
+                    self._extract_class(child, content, result)
+                case "import_statement":
+                    self._extract_import(child, result)
+                case "import_from_statement":
+                    self._extract_import_from(child, result)
+                case "decorated_definition":
+                    self._extract_decorated(child, content, result, class_name)
+                case "expression_statement":
+                    # Only extract variable annotations here; calls are
+                    # handled by the scope-level _extract_calls_recursive.
+                    self._extract_annotations_from_expression(child, result)
+                case _:
+                    self._walk(child, content, result, class_name)
 
     def _extract_function(
         self,
@@ -127,19 +110,17 @@ class PythonParser(LanguageParser):
         kind = "method" if class_name else "function"
         signature = self._build_signature(node, content)
 
-        symbol = SymbolInfo(
-            name=name,
-            kind=kind,
-            start_line=start_line,
-            end_line=end_line,
-            content=node_content,
-            signature=signature,
-            class_name=class_name,
+        result.symbols.append(
+            SymbolInfo(
+                name=name,
+                kind=kind,
+                start_line=start_line,
+                end_line=end_line,
+                content=node_content,
+                signature=signature,
+                class_name=class_name,
+            )
         )
-        result.symbols.append(symbol)
-        decorators = self._decorators_from_parent(node)
-        if decorators:
-            symbol.decorators = decorators
 
         self._extract_param_types(node, result)
 
@@ -154,7 +135,13 @@ class PythonParser(LanguageParser):
                         line=return_type.start_point[0] + 1,
                     )
                 )
-        # The body (nested defs and calls) is visited by the unified _walk.
+
+        # Call extraction is handled once at module level by parse().
+        body = node.child_by_field_name("body")
+        if body is not None:
+            # Nested functions/classes inside a function are not methods,
+            # so we pass class_name="" to keep them as standalone symbols.
+            self._walk(body, content, result, class_name="")
 
     def _build_signature(self, func_node: Node, content: str) -> str:
         """Build a human-readable signature string for a function."""
@@ -174,25 +161,42 @@ class PythonParser(LanguageParser):
 
         return sig
 
-    def _decorators_from_parent(self, node: Node) -> list[str]:
-        """Return decorator names if *node* is the inner def of a decoration.
+    def _extract_decorated(
+        self,
+        node: Node,
+        content: str,
+        result: ParseResult,
+        class_name: str,
+    ) -> None:
+        """Extract a decorated function or class, capturing decorator names.
 
         Tree-sitter wraps decorated definitions in a ``decorated_definition``
-        node whose children are one or more ``decorator`` nodes followed by the
-        actual ``function_definition`` / ``class_definition``.  The unified
-        walk reaches that inner def directly, so decorators are recovered by
-        looking one level up rather than dispatching the wrapper.
+        node whose children are one or more ``decorator`` nodes followed by
+        the actual ``function_definition`` or ``class_definition``.
         """
-        parent = node.parent
-        if parent is None or parent.type != "decorated_definition":
-            return []
         decorators: list[str] = []
-        for child in parent.children:
+        definition_node: Node | None = None
+
+        for child in node.children:
             if child.type == "decorator":
                 dec_name = self._extract_decorator_name(child)
                 if dec_name:
                     decorators.append(dec_name)
-        return decorators
+            elif child.type in ("function_definition", "class_definition"):
+                definition_node = child
+
+        if definition_node is None:
+            return
+
+        count_before = len(result.symbols)
+
+        if definition_node.type == "function_definition":
+            self._extract_function(definition_node, content, result, class_name)
+        else:
+            self._extract_class(definition_node, content, result)
+
+        if count_before < len(result.symbols):
+            result.symbols[count_before].decorators = decorators
 
     def _extract_decorator_name(self, decorator_node: Node) -> str:
         """Extract the dotted name from a decorator node.
@@ -254,33 +258,26 @@ class PythonParser(LanguageParser):
         node: Node,
         content: str,
         result: ParseResult,
-    ) -> str:
-        """Extract a class definition; return its name for scope threading.
-
-        The class body (its members and calls) is visited by the unified
-        ``_walk``; this records only the class symbol and its heritage.
-        Returns ``""`` for an unnamed (malformed) class.
-        """
+    ) -> None:
+        """Extract a class definition and its contents."""
         name_node = node.child_by_field_name("name")
         if name_node is None:
-            return ""
+            return
 
         class_name = name_node.text.decode("utf8")
         start_line = node.start_point[0] + 1
         end_line = node.end_point[0] + 1
         node_content = node.text.decode("utf8")
 
-        symbol = SymbolInfo(
-            name=class_name,
-            kind="class",
-            start_line=start_line,
-            end_line=end_line,
-            content=node_content,
+        result.symbols.append(
+            SymbolInfo(
+                name=class_name,
+                kind="class",
+                start_line=start_line,
+                end_line=end_line,
+                content=node_content,
+            )
         )
-        result.symbols.append(symbol)
-        decorators = self._decorators_from_parent(node)
-        if decorators:
-            symbol.decorators = decorators
 
         superclasses = node.child_by_field_name("superclasses")
         if superclasses is not None:
@@ -300,8 +297,10 @@ class PythonParser(LanguageParser):
                     if base is not None:
                         parent_name = base.text.decode("utf8")
                         result.heritage.append((class_name, "extends", parent_name))
-        # The class body is visited by the unified _walk.
-        return class_name
+
+        body = node.child_by_field_name("body")
+        if body is not None:
+            self._walk(body, content, result, class_name=class_name)
 
     def _extract_import(self, node: Node, result: ParseResult) -> None:
         """Extract a plain ``import X`` statement."""
@@ -422,67 +421,69 @@ class PythonParser(LanguageParser):
                 if text:
                     result.exports.append(text)
 
-    def _extract_except_clause(self, node: Node, result: ParseResult) -> None:
-        """Extract exception-class references from an ``except`` clause.
+    def _extract_calls_recursive(self, node: Node, result: ParseResult) -> None:
+        """Recursively find and extract all call nodes and exception references."""
+        if node.type == "call":
+            self._extract_call(node, result)
+            for child in node.children:
+                self._extract_calls_recursive(child, result)
+            return
 
-        ``except SomeError:`` references the exception class; the same applies
-        to tuple forms and ``as`` bindings.  Descent into the clause body (for
-        the calls it contains) is handled by the unified ``_walk``.
-        """
-        for child in node.children:
-            if child.type == "identifier":
-                result.calls.append(
-                    CallInfo(
-                        name=child.text.decode("utf8"),
-                        line=child.start_point[0] + 1,
+        # except SomeError: — reference to the exception class.
+        if node.type == "except_clause":
+            for child in node.children:
+                if child.type == "identifier":
+                    result.calls.append(
+                        CallInfo(
+                            name=child.text.decode("utf8"),
+                            line=child.start_point[0] + 1,
+                        )
                     )
-                )
-            elif child.type == "tuple":
-                # except (ErrorA, ErrorB): — extract each exception type.
-                for elem in child.children:
-                    if elem.type == "identifier":
-                        result.calls.append(
-                            CallInfo(
-                                name=elem.text.decode("utf8"),
-                                line=elem.start_point[0] + 1,
-                            )
-                        )
-            elif child.type == "as_pattern":
-                # except ErrorA as e  OR  except (ErrorA, ErrorB) as e
-                for sub in child.children:
-                    if sub.type == "identifier":
-                        result.calls.append(
-                            CallInfo(
-                                name=sub.text.decode("utf8"),
-                                line=sub.start_point[0] + 1,
-                            )
-                        )
-                        break
-                    if sub.type == "tuple":
-                        for elem in sub.children:
-                            if elem.type == "identifier":
-                                result.calls.append(
-                                    CallInfo(
-                                        name=elem.text.decode("utf8"),
-                                        line=elem.start_point[0] + 1,
-                                    )
+                elif child.type == "tuple":
+                    # except (ErrorA, ErrorB): — extract each exception type.
+                    for elem in child.children:
+                        if elem.type == "identifier":
+                            result.calls.append(
+                                CallInfo(
+                                    name=elem.text.decode("utf8"),
+                                    line=elem.start_point[0] + 1,
                                 )
-                        break
+                            )
+                elif child.type == "as_pattern":
+                    # except ErrorA as e  OR  except (ErrorA, ErrorB) as e
+                    for sub in child.children:
+                        if sub.type == "identifier":
+                            result.calls.append(
+                                CallInfo(
+                                    name=sub.text.decode("utf8"),
+                                    line=sub.start_point[0] + 1,
+                                )
+                            )
+                            break
+                        if sub.type == "tuple":
+                            for elem in sub.children:
+                                if elem.type == "identifier":
+                                    result.calls.append(
+                                        CallInfo(
+                                            name=elem.text.decode("utf8"),
+                                            line=elem.start_point[0] + 1,
+                                        )
+                                    )
+                            break
 
-    def _extract_raise_statement(self, node: Node, result: ParseResult) -> None:
-        """Extract a bare ``raise SomeError`` exception-class reference.
-
-        ``raise SomeError(...)`` is handled as a normal call node during the
-        walk; only the paren-less form needs explicit handling here.
-        """
-        for child in node.children:
-            if child.type == "identifier":
-                result.calls.append(
-                    CallInfo(
-                        name=child.text.decode("utf8"),
-                        line=child.start_point[0] + 1,
+        # raise SomeError (without parens) — reference to the exception class.
+        if node.type == "raise_statement":
+            for child in node.children:
+                if child.type == "identifier":
+                    result.calls.append(
+                        CallInfo(
+                            name=child.text.decode("utf8"),
+                            line=child.start_point[0] + 1,
+                        )
                     )
-                )
+
+        for child in node.children:
+            self._extract_calls_recursive(child, result)
 
     def _extract_call(self, call_node: Node, result: ParseResult) -> None:
         """Extract a single call node into a CallInfo."""
