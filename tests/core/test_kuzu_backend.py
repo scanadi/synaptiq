@@ -441,17 +441,19 @@ class TestRecoveryAndRebuildSafety:
         class BoomError(Exception):
             pass
 
-        original = KuzuBackend._bulk_load_nodes_csv
+        # Patch the loader dispatcher so the failure is injected regardless of
+        # which COPY path (Arrow or CSV) bulk_load selects.
+        original = KuzuBackend._bulk_load_nodes
 
         def exploding(self, graph):
             raise BoomError("simulated mid-rebuild failure")
 
-        KuzuBackend._bulk_load_nodes_csv = exploding
+        KuzuBackend._bulk_load_nodes = exploding
         try:
             with pytest.raises(BoomError):
                 backend.bulk_load(KnowledgeGraph())
         finally:
-            KuzuBackend._bulk_load_nodes_csv = original
+            KuzuBackend._bulk_load_nodes = original
 
         # Old data still served; no .rebuild leftovers.
         assert backend.get_node(node.id) is not None
@@ -591,9 +593,7 @@ class TestTransactionalBatchInserts:
         )
         assert [row[0] for row in rows] == ["calls", "contains"]
 
-    def test_prepared_statements_cached_per_label_and_pair(
-        self, backend: KuzuBackend
-    ) -> None:
+    def test_prepared_statements_cached_per_label_and_pair(self, backend: KuzuBackend) -> None:
         fn = _make_node(label=NodeLabel.FUNCTION, name="f", file_path="src/p.py")
         cls = _make_node(label=NodeLabel.CLASS, name="C", file_path="src/p.py")
         meth = GraphNode(
@@ -619,9 +619,7 @@ class TestTransactionalBatchInserts:
 
         # Adding more Function nodes reuses the SAME prepared statement object.
         cached = backend._prepared["node:Function"]
-        backend.add_nodes(
-            [_make_node(label=NodeLabel.FUNCTION, name="g", file_path="src/p.py")]
-        )
+        backend.add_nodes([_make_node(label=NodeLabel.FUNCTION, name="g", file_path="src/p.py")])
         assert backend._prepared["node:Function"] is cached
 
     def test_node_batch_runs_in_a_single_transaction(self, backend: KuzuBackend) -> None:
@@ -675,9 +673,7 @@ class TestTransactionalBatchInserts:
         backend.add_nodes([_make_node(name="later", file_path="src/a.py")])
         assert backend.execute_raw("MATCH (n:Function) RETURN count(n)")[0][0] == before + 1
 
-    def test_reinserting_existing_node_upserts_idempotently(
-        self, backend: KuzuBackend
-    ) -> None:
+    def test_reinserting_existing_node_upserts_idempotently(self, backend: KuzuBackend) -> None:
         # Mirrors the incremental re-index path: a persistent structural node
         # (e.g. an ancestor Folder) is re-inserted on every rebuild and must
         # upsert via MERGE, not raise a duplicate-primary-key error.
@@ -753,6 +749,279 @@ class TestTransactionalBatchInserts:
         assert b._prepared  # populated
         b.close()
         assert b._prepared == {}  # cleared with the connection
+
+
+# ---------------------------------------------------------------------------
+# Arrow / Parquet bulk COPY with CSV fallback (W2.3)
+# ---------------------------------------------------------------------------
+
+
+def _rich_graph() -> KnowledgeGraph:
+    """A graph exercising every bulk-load edge case: multiple labels, empty and
+    non-empty strings, unicode + embedded newlines, node properties, every rel
+    property, and duplicate node/rel ids (to check dedup parity)."""
+    from synaptiq.core.graph.model import generate_id as gid
+
+    g = KnowledgeGraph()
+
+    folder = GraphNode(id=gid(NodeLabel.FOLDER, "src", ""), label=NodeLabel.FOLDER, name="src")
+    file_a = GraphNode(
+        id=gid(NodeLabel.FILE, "src/a.py", ""),
+        label=NodeLabel.FILE,
+        name="a.py",
+        file_path="src/a.py",
+        language="python",
+    )
+    # Rich content: unicode, newlines, quotes, commas — all CSV hazards.
+    rich = GraphNode(
+        id=gid(NodeLabel.FUNCTION, "src/a.py", "café"),
+        label=NodeLabel.FUNCTION,
+        name="café",
+        file_path="src/a.py",
+        start_line=1,
+        end_line=9,
+        content='def café(x):\n    """doc, with "quotes"\n    and, commas"""\n    return x  # ☕',
+        signature="def café(x)",
+        language="python",
+        is_dead=True,
+        is_entry_point=True,
+        is_exported=True,
+        properties={"decorators": ["staticmethod"], "count": 3},
+    )
+    # Empty content/signature/class_name -> must land as NULL, like CSV.
+    empty = GraphNode(
+        id=gid(NodeLabel.FUNCTION, "src/a.py", "bare"),
+        label=NodeLabel.FUNCTION,
+        name="bare",
+        file_path="src/a.py",
+        content="",
+        signature="",
+        class_name="",
+    )
+    klass = GraphNode(
+        id=gid(NodeLabel.CLASS, "src/a.py", "Widget"),
+        label=NodeLabel.CLASS,
+        name="Widget",
+        file_path="src/a.py",
+        content="class Widget:\n    pass",
+    )
+    method = GraphNode(
+        id=gid(NodeLabel.METHOD, "src/a.py", "Widget.save"),
+        label=NodeLabel.METHOD,
+        name="save",
+        file_path="src/a.py",
+        class_name="Widget",
+    )
+    module = GraphNode(
+        id=gid(NodeLabel.MODULE, "src/a.rb", "Helpers"),
+        label=NodeLabel.MODULE,
+        name="Helpers",
+        file_path="src/a.rb",
+        language="ruby",
+    )
+    for n in (folder, file_a, rich, empty, klass, method, module):
+        g.add_node(n)
+    # Duplicate id with different content — dedup must keep the last occurrence
+    # identically in both paths.
+    g.add_node(
+        GraphNode(
+            id=rich.id,
+            label=NodeLabel.FUNCTION,
+            name="café",
+            file_path="src/a.py",
+            content="LAST WINS\nsecond line",
+            signature="def café(x)",
+        )
+    )
+
+    # Relationships covering every property and an empty-property edge.
+    g.add_relationship(
+        GraphRelationship(
+            id="r-calls",
+            type=RelType.CALLS,
+            source=rich.id,
+            target=method.id,
+            properties={"confidence": 0.8, "role": "receiver"},
+        )
+    )
+    g.add_relationship(
+        GraphRelationship(
+            id="r-contains", type=RelType.CONTAINS, source=folder.id, target=file_a.id
+        )
+    )
+    g.add_relationship(
+        GraphRelationship(
+            id="r-step",
+            type=RelType.STEP_IN_PROCESS,
+            source=rich.id,
+            target=empty.id,
+            properties={"step_number": 2, "role": "entry"},
+        )
+    )
+    g.add_relationship(
+        GraphRelationship(
+            id="r-coupled",
+            type=RelType.COUPLED_WITH,
+            source=file_a.id,
+            target=module.id,
+            properties={"strength": 0.5, "co_changes": 4, "symbols": "a,b,c"},
+        )
+    )
+    g.add_relationship(
+        GraphRelationship(id="r-defines", type=RelType.DEFINES, source=klass.id, target=method.id)
+    )
+    # Duplicate edge identity — dedup must collapse identically in both paths.
+    g.add_relationship(
+        GraphRelationship(
+            id="r-calls-dup",
+            type=RelType.CALLS,
+            source=rich.id,
+            target=method.id,
+            properties={"confidence": 0.8, "role": "receiver"},
+        )
+    )
+    return g
+
+
+class TestArrowCsvEquivalence:
+    """The Arrow and CSV bulk paths must produce byte-identical databases."""
+
+    def _load(self, backend: KuzuBackend, graph: KnowledgeGraph, *, arrow: bool) -> None:
+        if arrow:
+            assert backend._bulk_load_nodes_arrow(graph) is True
+            assert backend._bulk_load_rels_arrow(graph) is True
+        else:
+            assert backend._bulk_load_nodes_csv(graph) is True
+            assert backend._bulk_load_rels_csv(graph) is True
+
+    def _dump_nodes(self, backend: KuzuBackend, table: str) -> list[list[object]]:
+        from synaptiq.core.storage.kuzu_backend import _node_columns
+
+        return backend.execute_raw(f"MATCH (n:{table}) RETURN {_node_columns('n')} ORDER BY n.id")
+
+    def _dump_rels(self, backend: KuzuBackend) -> list[list[object]]:
+        return backend.execute_raw(
+            "MATCH (a)-[r:CodeRelation]->(b) "
+            "RETURN a.id, b.id, r.rel_type, r.confidence, r.role, r.step_number, "
+            "r.strength, r.co_changes, r.symbols "
+            "ORDER BY a.id, b.id, r.rel_type, r.role, r.step_number"
+        )
+
+    def test_nodes_and_rels_identical(self, tmp_path: Path) -> None:
+        pytest.importorskip("pyarrow")
+        from synaptiq.core.storage.kuzu_backend import _NODE_TABLE_NAMES
+
+        graph = _rich_graph()
+
+        arrow_be = KuzuBackend()
+        arrow_be.initialize(tmp_path / "arrow_db")
+        csv_be = KuzuBackend()
+        csv_be.initialize(tmp_path / "csv_db")
+        try:
+            self._load(arrow_be, graph, arrow=True)
+            self._load(csv_be, graph, arrow=False)
+
+            for table in _NODE_TABLE_NAMES:
+                arrow_rows = self._dump_nodes(arrow_be, table)
+                csv_rows = self._dump_nodes(csv_be, table)
+                assert arrow_rows == csv_rows, f"node table {table} differs"
+
+            # Sanity: the dedup'd rich function kept the last content in both.
+            fn_rows = self._dump_nodes(arrow_be, "Function")
+            contents = [r[5] for r in fn_rows]
+            assert "LAST WINS\nsecond line" in contents
+            # Empty strings landed as NULL (None), matching CSV's reader.
+            assert any(r[6] is None for r in fn_rows)  # bare's empty signature
+
+            assert self._dump_rels(arrow_be) == self._dump_rels(csv_be)
+        finally:
+            arrow_be.close()
+            csv_be.close()
+
+    def test_embeddings_identical(self, tmp_path: Path) -> None:
+        pytest.importorskip("pyarrow")
+        from synaptiq.core.storage.base import NodeEmbedding
+
+        dim = 8
+        embs = [
+            NodeEmbedding(
+                node_id=f"function:src/a.py:f{i}",
+                embedding=[float(i) - 3.5 + j * 0.1 for j in range(dim)],
+                text_sha=f"sha{i}",
+            )
+            for i in range(5)
+        ]
+
+        arrow_be = KuzuBackend()
+        arrow_be.initialize(tmp_path / "arrow_emb")
+        csv_be = KuzuBackend()
+        csv_be.initialize(tmp_path / "csv_emb")
+        try:
+            assert arrow_be._bulk_store_embeddings_arrow(embs) is True
+            assert csv_be._bulk_store_embeddings_csv(embs) is True
+
+            q = "MATCH (e:Embedding) RETURN e.node_id, e.vec, e.text_sha ORDER BY e.node_id"
+            arrow_rows = arrow_be.execute_raw(q)
+            csv_rows = csv_be.execute_raw(q)
+            assert len(arrow_rows) == len(embs)
+            assert arrow_rows == csv_rows
+        finally:
+            arrow_be.close()
+            csv_be.close()
+
+
+class TestArrowBulkPath:
+    """End-to-end bulk_load on the Arrow path (pyarrow installed)."""
+
+    def test_dispatch_prefers_arrow_when_available(self) -> None:
+        pytest.importorskip("pyarrow")
+        import synaptiq.core.storage.kuzu_backend as kb
+
+        assert kb._HAS_PYARROW is True
+
+    def test_bulk_load_roundtrips_gnarly_content(self, backend: KuzuBackend) -> None:
+        graph = _rich_graph()
+        backend.bulk_load(graph)
+        stored = backend.get_node("function:src/a.py:café")
+        assert stored is not None
+        assert stored.content == "LAST WINS\nsecond line"
+        # Relationship survived with its properties.
+        rows = backend.execute_raw(
+            "MATCH (a)-[r:CodeRelation]->(b) WHERE r.rel_type = 'coupled_with' "
+            "RETURN r.strength, r.co_changes, r.symbols"
+        )
+        assert rows == [[0.5, 4, "a,b,c"]]
+
+
+class TestCsvFallbackWithoutPyarrow:
+    """With pyarrow force-disabled, bulk_load must transparently use CSV."""
+
+    def test_bulk_load_uses_csv_when_pyarrow_absent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import synaptiq.core.storage.kuzu_backend as kb
+
+        monkeypatch.setattr(kb, "_HAS_PYARROW", False)
+
+        called: dict[str, bool] = {}
+        orig_csv = KuzuBackend._bulk_load_nodes_csv
+
+        def spy(self, graph):
+            called["csv"] = True
+            return orig_csv(self, graph)
+
+        monkeypatch.setattr(KuzuBackend, "_bulk_load_nodes_csv", spy)
+
+        backend = KuzuBackend()
+        backend.initialize(tmp_path / "csv_only_db")
+        try:
+            backend.bulk_load(_rich_graph())
+            assert called.get("csv") is True
+            stored = backend.get_node("function:src/a.py:café")
+            assert stored is not None
+            assert stored.content == "LAST WINS\nsecond line"
+        finally:
+            backend.close()
 
 
 class TestBulkLoadSkipsEmptyFtsBuild:
