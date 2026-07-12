@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
 
+from synaptiq.config.ignore import load_gitignore
+from synaptiq.core.graph.graph import KnowledgeGraph
+from synaptiq.core.graph.model import NodeLabel, RelType, generate_id
+from synaptiq.core.ingestion.coupling import process_coupling
 from synaptiq.core.ingestion.pipeline import (
     PipelineResult,
     apply_reindex,
@@ -14,8 +19,19 @@ from synaptiq.core.ingestion.pipeline import (
     parse_files,
     run_pipeline,
 )
-from synaptiq.core.ingestion.walker import FileEntry
+from synaptiq.core.ingestion.structure import process_structure
+from synaptiq.core.ingestion.walker import FileEntry, walk_repo
 from synaptiq.core.storage.kuzu_backend import KuzuBackend
+
+
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-c", "user.name=test", "-c", "user.email=test@test", *args],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -577,3 +593,178 @@ class TestApplyReindexFtsStaleness:
         assert storage.get_node("function:src/auth.py:validate") is None
         stale_node_id = "function:src/auth.py:validate"
         assert all(r.node_id != stale_node_id for r in storage.fts_search("validate", limit=10))
+
+
+# ---------------------------------------------------------------------------
+# W2.4: overlap coupling's git-log subprocess with the CPU phases
+#
+# run_pipeline now starts coupling's "collect" half (collect_coupling_commits
+# -- a single GIL-releasing `git log` subprocess, G11) in a background thread
+# right after "Walking files", and joins it inside "Analyzing git history"
+# (its unchanged pipeline position) before calling process_coupling's
+# unchanged "apply" half. These tests verify the overlap is transparent:
+# identical coupling edges, identical failure behavior, and phase_timings
+# that still sum to ~duration_seconds.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def coupled_git_repo(tmp_path: Path) -> Path:
+    """A git repo whose history gives main.py/auth.py coupling strength 1.0.
+
+    main.py and auth.py change together in every one of 4 commits (the
+    initial commit plus 3 follow-ups); utils.py changes in the initial
+    commit and once more alone. Expected math (mirrors
+    TestProcessCoupling.test_process_coupling_creates_relationships):
+
+        total_changes: auth.py=4, main.py=4, utils.py=2
+        co-changes:    (auth.py, main.py)=4, (auth.py, utils.py)=1,
+                        (main.py, utils.py)=1
+        strengths:      auth/main=4/4=1.0 (>=0.3 -> coupled)
+                         auth/utils=1/4=0.25, main/utils=1/4=0.25 (both <0.3)
+
+    So exactly one COUPLED_WITH edge is expected: src/auth.py <-> src/main.py.
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+
+    _git(tmp_path, "init", "-b", "main")
+
+    def write(name: str, body: str) -> None:
+        (src / name).write_text(body, encoding="utf-8")
+
+    def commit(message: str) -> None:
+        _git(tmp_path, "add", "-A")
+        _git(tmp_path, "commit", "-m", message)
+
+    write("main.py", "def main():\n    pass\n")
+    write("auth.py", "def validate():\n    pass\n")
+    write("utils.py", "def helper():\n    pass\n")
+    commit("initial")
+
+    for i in range(3):
+        write("main.py", f"def main():\n    pass  # rev {i}\n")
+        write("auth.py", f"def validate():\n    pass  # rev {i}\n")
+        commit(f"touch main+auth {i}")
+
+    write("utils.py", "def helper():\n    pass  # solo change\n")
+    commit("touch utils alone")
+
+    return tmp_path
+
+
+class TestRunPipelineCouplingOverlap:
+    """The overlapped git-log collection yields identical coupling results."""
+
+    def test_coupled_pairs_match_expected_math(self, coupled_git_repo: Path) -> None:
+        graph, result = run_pipeline(coupled_git_repo)
+
+        assert result.coupled_pairs == 1
+
+        coupled_rels = graph.get_relationships_by_type(RelType.COUPLED_WITH)
+        assert len(coupled_rels) == 1
+
+        rel = coupled_rels[0]
+        assert rel.properties["strength"] == pytest.approx(1.0)
+        assert rel.properties["co_changes"] == 4
+
+        auth_id = generate_id(NodeLabel.FILE, "src/auth.py")
+        main_id = generate_id(NodeLabel.FILE, "src/main.py")
+        assert {rel.source, rel.target} == {auth_id, main_id}
+
+    def test_matches_direct_synchronous_process_coupling_call(
+        self, coupled_git_repo: Path
+    ) -> None:
+        """Cross-check against calling process_coupling directly the old
+        (pre-W2.4) synchronous way -- process_coupling and parse_git_log are
+        both unchanged, so this proves the overlap refactor changed only
+        scheduling, never results."""
+        graph, result = run_pipeline(coupled_git_repo)
+
+        gitignore = load_gitignore(coupled_git_repo)
+        files = walk_repo(coupled_git_repo, gitignore)
+        baseline_graph = KnowledgeGraph()
+        process_structure(files, baseline_graph)
+        baseline_count = process_coupling(baseline_graph, coupled_git_repo)
+
+        assert result.coupled_pairs == baseline_count
+
+        def rel_set(g: KnowledgeGraph) -> set[tuple[str, str, float, int]]:
+            return {
+                (r.source, r.target, r.properties["strength"], r.properties["co_changes"])
+                for r in g.get_relationships_by_type(RelType.COUPLED_WITH)
+            }
+
+        assert rel_set(graph) == rel_set(baseline_graph)
+
+    def test_phase_timings_sum_with_real_git_history(self, coupled_git_repo: Path) -> None:
+        """phase_timings (W0.1) stays honest even with real coupling work to
+        overlap and then apply -- see _assert_timings_sum_close."""
+        _, result = run_pipeline(coupled_git_repo)
+
+        _assert_timings_sum_close(result.phase_timings, result.duration_seconds)
+
+
+class TestRunPipelineCouplingFailureContainment:
+    """Moving the git-log call to a background thread preserves today's
+    failure semantics: a git subprocess failure still degrades coupling to
+    zero and the pipeline still completes; anything parse_git_log doesn't
+    already treat as an expected failure still crashes the pipeline."""
+
+    def test_git_failure_is_contained(
+        self, tmp_repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """CalledProcessError is the failure parse_git_log has always caught
+        internally (the common "not a git repo" case). Confirm the pipeline
+        still completes with coupled_pairs == 0 now that the git-log call
+        happens on a background thread.
+
+        Only the coupling phase's ``git log`` invocation is faked --
+        ``walk_repo`` also shells out to git (``git ls-files``, for file
+        discovery) and must keep working normally, or this would stop
+        testing coupling's containment and start testing an unrelated
+        walker failure instead.
+        """
+        real_run = subprocess.run
+
+        def fake_run(cmd, *args, **kwargs):
+            if "log" in cmd:
+                raise subprocess.CalledProcessError(128, cmd)
+            return real_run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        graph, result = run_pipeline(tmp_repo)
+
+        assert result.coupled_pairs == 0
+        assert graph.get_relationships_by_type(RelType.COUPLED_WITH) == []
+
+    def test_unexpected_exception_still_propagates(
+        self, tmp_repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An exception type parse_git_log does NOT already catch must still
+        crash run_pipeline, exactly as it did when process_coupling called
+        parse_git_log synchronously -- the background thread captures it and
+        run_pipeline re-raises it after join() rather than silently
+        swallowing an unexpected bug.
+
+        Only the coupling phase's ``git log`` invocation is faked, for the
+        same reason as ``test_git_failure_is_contained`` above: ``git
+        ls-files`` (file discovery) must keep working so this test actually
+        exercises coupling's re-raise path and not an unrelated walker
+        failure that happens to raise the same exception type.
+        """
+        real_run = subprocess.run
+
+        class _BoomError(RuntimeError):
+            pass
+
+        def fake_run(cmd, *args, **kwargs):
+            if "log" in cmd:
+                raise _BoomError("simulated unexpected subprocess failure")
+            return real_run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        with pytest.raises(_BoomError):
+            run_pipeline(tmp_repo)
