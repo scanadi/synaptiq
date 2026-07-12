@@ -71,13 +71,23 @@ def test_server_profile_caps_scale_with_cores():
     assert limits.db_threads == 4
     assert limits.embed_threads == 4
     assert limits.db_buffer_bytes == SERVER_BUFFER_POOL_MB * _MB
-    assert limits.pool_workers == 8
+    # F3: the walk/parse pool is capped to max(2, cores//4) under the server
+    # profile, NOT the interactive min(8, cores).
+    assert limits.pool_workers == 4
+
+
+def test_server_profile_caps_pool_workers_below_eight():
+    """A 10-core sidecar caps parse/walk workers at 2, not 8 (review F3)."""
+    assert resolve_limits("server", cpu_count=10).pool_workers == 2
+    # Interactive keeps the min(8, cores) default for the same machine.
+    assert resolve_limits("interactive", cpu_count=10).pool_workers == 8
 
 
 def test_server_profile_floor_of_two_threads():
     limits = resolve_limits("server", cpu_count=2)
     assert limits.db_threads == 2
     assert limits.embed_threads == 2
+    assert limits.pool_workers == 2
 
 
 def test_env_overrides_take_precedence(monkeypatch):

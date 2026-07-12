@@ -27,9 +27,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
-import time
 from collections import defaultdict
-from dataclasses import dataclass, field
 from itertools import combinations
 from pathlib import Path
 
@@ -107,58 +105,30 @@ def parse_git_log(
 
     return commits
 
-@dataclass
-class GitCollectionResult:
-    """Outcome of a background :func:`collect_coupling_commits` run.
-
-    ``commits`` and ``error`` are mutually informative: a normal run
-    (including the "not a git repo" case, which ``parse_git_log`` already
-    handles internally) leaves ``error`` as ``None`` and populates
-    ``commits`` (possibly ``[]``).  A run that hits an exception
-    ``parse_git_log`` does *not* already catch leaves ``commits`` as ``[]``
-    and records the exception here instead of raising -- so this always
-    returns normally and is safe to call from a background thread.  The
-    caller re-raises ``error`` (if set) once back on the main thread, which
-    reproduces today's synchronous failure semantics exactly (same
-    exception, same traceback, same crash point relative to the rest of the
-    pipeline).
-    """
-
-    commits: list[list[str]] = field(default_factory=list)
-    error: BaseException | None = None
-    duration: float = 0.0
-
 def collect_coupling_commits(
     repo_path: Path,
     graph_files: set[str] | None = None,
     since_months: int = 6,
-) -> GitCollectionResult:
+) -> list[list[str]]:
     """Run the git-log subprocess and return raw commit data (the "collect" half).
 
-    This wraps :func:`parse_git_log` for use from a background thread: it
-    never reads or writes a :class:`KnowledgeGraph`, so it can safely run
-    concurrently with the CPU-bound phases in ``run_pipeline`` while they
-    operate on the graph.  ``process_coupling`` (or its ``commits=`` fast
-    path) is the "apply" half -- it must stay on the thread that owns the
-    graph.
+    This wraps :func:`parse_git_log` for use from a background worker: it never
+    reads or writes a :class:`KnowledgeGraph`, so it can safely run concurrently
+    with the CPU-bound phases in ``run_pipeline`` while they operate on the
+    graph.  ``process_coupling`` (or its ``commits=`` fast path) is the "apply"
+    half -- it must stay on the thread that owns the graph.
 
-    Any exception -- including ones ``parse_git_log`` doesn't already catch
-    internally (it only catches ``CalledProcessError``/``FileNotFoundError``
-    for the common "not a git repo" case) -- is captured on the returned
-    result instead of propagating, so a thread running this function always
-    returns normally rather than dying with an unhandled exception.
+    Graceful degradation for git-unavailable is inherited from
+    :func:`parse_git_log`, which catches the common "not a git repo" case
+    (``CalledProcessError`` / ``FileNotFoundError``) and returns ``[]``.  Any
+    OTHER, unexpected exception propagates unchanged: ``run_pipeline`` submits
+    this on a :class:`~concurrent.futures.ThreadPoolExecutor`, so the worker's
+    exception is captured on the Future and re-raised -- with its original
+    traceback -- by ``Future.result()``. The pipeline then crashes exactly as a
+    synchronous ``parse_git_log`` call would, instead of silently swallowing a
+    real bug (review F4b).
     """
-    outcome = GitCollectionResult()
-    t0 = time.monotonic()
-    try:
-        outcome.commits = parse_git_log(
-            repo_path, since_months=since_months, graph_files=graph_files
-        )
-    except Exception as exc:  # defensive containment for the background thread
-        outcome.error = exc
-    finally:
-        outcome.duration = time.monotonic() - t0
-    return outcome
+    return parse_git_log(repo_path, since_months=since_months, graph_files=graph_files)
 
 def build_cochange_matrix(
     commits: list[list[str]],

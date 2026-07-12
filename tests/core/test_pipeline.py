@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -706,7 +708,7 @@ class TestRunPipelineCouplingOverlap:
 
 
 class TestRunPipelineCouplingFailureContainment:
-    """Moving the git-log call to a background thread preserves today's
+    """Moving the git-log call to a background Future preserves today's
     failure semantics: a git subprocess failure still degrades coupling to
     zero and the pipeline still completes; anything parse_git_log doesn't
     already treat as an expected failure still crashes the pipeline."""
@@ -717,7 +719,7 @@ class TestRunPipelineCouplingFailureContainment:
         """CalledProcessError is the failure parse_git_log has always caught
         internally (the common "not a git repo" case). Confirm the pipeline
         still completes with coupled_pairs == 0 now that the git-log call
-        happens on a background thread.
+        happens on a background worker.
 
         Only the coupling phase's ``git log`` invocation is faked --
         ``walk_repo`` also shells out to git (``git ls-files``, for file
@@ -744,9 +746,9 @@ class TestRunPipelineCouplingFailureContainment:
     ) -> None:
         """An exception type parse_git_log does NOT already catch must still
         crash run_pipeline, exactly as it did when process_coupling called
-        parse_git_log synchronously -- the background thread captures it and
-        run_pipeline re-raises it after join() rather than silently
-        swallowing an unexpected bug.
+        parse_git_log synchronously -- the Future captures it and
+        ``future.result()`` re-raises it in "Analyzing git history" rather than
+        silently swallowing an unexpected bug.
 
         Only the coupling phase's ``git log`` invocation is faked, for the
         same reason as ``test_git_failure_is_contained`` above: ``git
@@ -768,3 +770,37 @@ class TestRunPipelineCouplingFailureContainment:
 
         with pytest.raises(_BoomError):
             run_pipeline(tmp_repo)
+
+    def test_intermediate_phase_failure_shuts_down_executor(
+        self, tmp_repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A crash in a CPU phase (before the git-log join) must still propagate
+        AND leave no orphaned git-log worker thread — the try/finally shuts the
+        single-use executor down so a non-daemon worker can't linger and block
+        interpreter exit (review F4/F12)."""
+        import synaptiq.core.ingestion.pipeline as pipeline_module
+
+        class _PhaseBoomError(RuntimeError):
+            pass
+
+        def boom(_graph):
+            raise _PhaseBoomError("simulated community-detection failure")
+
+        # Fail an intermediate phase that runs AFTER the git-log future is
+        # submitted but is otherwise unrelated to coupling.
+        monkeypatch.setattr(pipeline_module, "process_communities", boom)
+
+        with pytest.raises(_PhaseBoomError):
+            run_pipeline(tmp_repo)
+
+        # The finite git-log subprocess finishes and, with the executor shut
+        # down (wait=False), its worker exits shortly after. Poll until no
+        # synaptiq-gitlog thread remains: a lingering one would mean the
+        # executor was never reaped.
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if not any(t.name.startswith("synaptiq-gitlog") for t in threading.enumerate()):
+                break
+            time.sleep(0.02)
+        lingering = [t.name for t in threading.enumerate() if t.name.startswith("synaptiq-gitlog")]
+        assert lingering == [], f"orphaned git-log worker thread(s): {lingering}"

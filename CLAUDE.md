@@ -92,7 +92,7 @@ Data stored in `.synaptiq/` directory within each indexed repo. The on-disk inde
 
 ### Resource Profiles
 
-`src/synaptiq/core/resources.py` defines role-aware engine limits. Long-running daemons (`serve`, `mcp`, `watch`) call `set_profile("server")` at entry and get strict caps: LadybugDB task-scheduler threads `max(2, cores//4)`, 512 MB buffer pool, capped ONNX embedding threads. One-shot CLI commands (`analyze`, `query`, ...) keep library defaults (all cores, LadybugDB's default buffer pool). `LadybugBackend.initialize()` and the embedders read `current_limits()` at creation time — set the profile before creating either. Env overrides: `SYNAPTIQ_DB_THREADS`, `SYNAPTIQ_DB_MEMORY_MB`, `SYNAPTIQ_EMBED_THREADS` (the former `SYNAPTIQ_KUZU_THREADS` / `SYNAPTIQ_KUZU_MEMORY_MB` still work as deprecated aliases for one release, logging a one-time warning).
+`src/synaptiq/core/resources.py` defines role-aware engine limits. Long-running daemons (`serve`, `mcp`, `watch`) call `set_profile("server")` at entry and get strict caps: LadybugDB task-scheduler threads `max(2, cores//4)`, 512 MB buffer pool, capped ONNX embedding threads, and the walk/parse worker pool also capped to `max(2, cores//4)` (vs. the interactive `min(8, cores)`). One-shot CLI commands (`analyze`, `query`, ...) keep library defaults (all cores, LadybugDB's default buffer pool). `LadybugBackend.initialize()` and the embedders read `current_limits()` at creation time — set the profile before creating either. Env overrides: `SYNAPTIQ_DB_THREADS`, `SYNAPTIQ_DB_MEMORY_MB`, `SYNAPTIQ_EMBED_THREADS` (the former `SYNAPTIQ_KUZU_THREADS` / `SYNAPTIQ_KUZU_MEMORY_MB` still work as deprecated aliases for one release, logging a one-time warning).
 
 ### Multi-Instance Concurrency
 

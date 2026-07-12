@@ -192,6 +192,22 @@ def parse_file(file_path: str, content: str, language: str) -> FileParseData:
     )
 
 
+def _parse_file_drop_content(file_path: str, content: str, language: str) -> FileParseData:
+    """``parse_file`` for the process pool: return the result with ``content=""``.
+
+    The worker already receives ``content`` as an argument, so echoing it back
+    on the returned :class:`FileParseData` would ship every file's source across
+    the process boundary a SECOND time (F11). The parent reattaches it from the
+    original :class:`FileEntry` right after collection (see
+    :func:`_parse_with_processes`), so consumers still see ``fpd.content``
+    populated — only the redundant return trip is dropped. The thread path,
+    which shares parent memory, keeps calling :func:`parse_file` directly.
+    """
+    fpd = parse_file(file_path, content, language)
+    fpd.content = ""
+    return fpd
+
+
 # Files handed to each process-pool task.  Chunking amortizes the per-task
 # pickling/IPC overhead of shipping work to workers; a value in the 16-32
 # range keeps chunks large enough to matter without starving workers on
@@ -238,29 +254,41 @@ def _parse_with_processes(files: list[FileEntry], max_workers: int) -> list[File
 
     Uses an explicit ``spawn`` context: ``fork`` is unsafe once the parent
     has ever started threads (prior pools leave locks in an unknown state
-    in the child), and ``spawn`` is macOS's default regardless.  Only
+    in the child), and ``spawn`` is macOS's default regardless.  This is not
+    hypothetical here — ``run_pipeline`` submits coupling's git-log collect to
+    a ``ThreadPoolExecutor`` right after the walk, so that worker thread can
+    still be alive when this pool spins up; the ``spawn`` start method must be
+    kept for that reason (see ``pipeline.run_pipeline``).  Only
     picklable primitives — the path/content/language strings — cross the
-    process boundary; :func:`parse_file` is a module-level function
-    re-imported inside each worker, and the returned :class:`FileParseData`
-    is a tree of plain, picklable dataclasses.  Files are chunked
-    (:data:`_PARSE_CHUNKSIZE`) to amortize per-task IPC.  ``executor.map``
-    yields results in submission order, so the returned list lines up with
-    *files* exactly as the thread path does.
+    process boundary; the module-level :func:`_parse_file_drop_content` wrapper
+    runs :func:`parse_file` inside each worker and returns the result with
+    ``content`` blanked so file source is not shipped BACK (F11), and the
+    returned :class:`FileParseData` is otherwise a tree of plain, picklable
+    dataclasses.  Files are chunked (:data:`_PARSE_CHUNKSIZE`) to amortize
+    per-task IPC.  ``executor.map`` yields results in submission order, so the
+    returned list lines up with *files* exactly as the thread path does — which
+    is also what lets the parent reattach each ``content`` by position below.
     """
     ctx = mp.get_context("spawn")
     paths = [f.path for f in files]
     contents = [f.content for f in files]
     languages = [f.language for f in files]
     with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as executor:
-        return list(
+        results = list(
             executor.map(
-                parse_file,
+                _parse_file_drop_content,
                 paths,
                 contents,
                 languages,
                 chunksize=_PARSE_CHUNKSIZE,
             )
         )
+    # Reattach content in the PARENT: the worker returned it empty to avoid a
+    # redundant round-trip across the process boundary (F11). executor.map
+    # preserves submission order, so results line up with `files` one-to-one.
+    for fpd, entry in zip(results, files):
+        fpd.content = entry.content
+    return results
 
 
 def _parse_files(files: list[FileEntry], max_workers: int) -> list[FileParseData]:

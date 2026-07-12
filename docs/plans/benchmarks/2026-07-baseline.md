@@ -63,3 +63,5 @@ Raw JSON: session task output `bpzm9odjy` (numbers transcribed above verbatim).
 | Generating embeddings (1 run) | 49.2s | 56.2s | 70.2s | ⚠ unexplained +25% vs W1 — same model/threads; suspected thermal/load artifact after hours of agent activity; **re-measure on cool machine before reading anything into it** |
 
 **Not visible here (Wave-2 wins at scale):** process-parallel parsing 6.36× on a 500-file corpus (W2.1, threshold-gated); single-pass walks ~1.2× on extraction (W2.2, honest below-estimate result — old symbol walk was already light); calls-phase symbol-ID reuse + O(1) same-file resolution (W2.5c); flow-dedup and Ruby-import quadratic fixes (W2.5ab). The real `analyze` CLI additionally skips ~1.9s of empty-FTS build on open (W2.7) that this bench's timed phases don't include.
+
+**Caveat — these numbers were measured WITH pyarrow installed** (the `fast-load` / dev extra). A default `pip install synaptiq` has no pyarrow and takes the CSV COPY path, so the "Loading to storage" numbers above will be **higher** until pyarrow is installed or promoted to a core dependency (owner decision pending).
