@@ -11,6 +11,7 @@ from typing import Optional
 import typer
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.table import Table
 
 from synaptiq import __version__
 
@@ -23,6 +24,19 @@ def _write_meta(data_dir: Path, repo_path: Path, result: object) -> None:
     from synaptiq.core.ingestion.pipeline import write_meta
 
     write_meta(data_dir, repo_path, result)
+
+
+def _print_phase_timing_table(phase_timings: dict, total_seconds: float) -> None:
+    """Print a rich table of per-phase wall time (``analyze --profile``)."""
+    table = Table(title="Phase timings")
+    table.add_column("Phase")
+    table.add_column("Seconds", justify="right")
+    table.add_column("% of total", justify="right")
+    for phase, seconds in phase_timings.items():
+        pct = (seconds / total_seconds * 100) if total_seconds else 0.0
+        table.add_row(phase, f"{seconds:.2f}", f"{pct:.1f}%")
+    table.add_row("Total", f"{total_seconds:.2f}", "100.0%", style="bold")
+    console.print(table)
 
 
 def _load_storage(repo_path: Path | None = None) -> "KuzuBackend":  # noqa: F821
@@ -168,6 +182,9 @@ def analyze(
     no_embeddings: bool = typer.Option(
         False, "--no-embeddings", help="Skip embedding generation for faster indexing."
     ),
+    profile: bool = typer.Option(
+        False, "--profile", help="Print a per-phase timing breakdown after indexing."
+    ),
 ) -> None:
     """Index a repository into a knowledge graph."""
     from synaptiq.core.daemon.lock import LockManager
@@ -192,7 +209,9 @@ def analyze(
             console.print(
                 f"[bold]Server running (PID {existing.pid}), requesting reindex...[/bold]"
             )
-            _reindex_via_server(existing.socket, full=full, skip_embeddings=no_embeddings)
+            _reindex_via_server(
+                existing.socket, full=full, skip_embeddings=no_embeddings, profile=profile
+            )
             return
         # Stale lock — clean up and retry.
         lock_mgr.force_cleanup()
@@ -247,6 +266,10 @@ def analyze(
         if result.embeddings > 0:
             console.print(f"  Embeddings:     {result.embeddings}")
         console.print(f"  Duration:       {result.duration_seconds:.2f}s")
+
+        if profile and result.phase_timings:
+            console.print()
+            _print_phase_timing_table(result.phase_timings, result.duration_seconds)
 
         storage.close()
     finally:
@@ -610,7 +633,7 @@ def _init_storage_with_index(repo_path: Path, data_dir: Path, *, output=console)
 
 
 def _reindex_via_server(
-    socket_path: str, *, full: bool = True, skip_embeddings: bool = False
+    socket_path: str, *, full: bool = True, skip_embeddings: bool = False, profile: bool = False
 ) -> None:
     """Send a reindex request to a running synaptiq server via its Unix socket."""
     import asyncio
@@ -653,6 +676,12 @@ def _reindex_via_server(
     if "duration" in result:
         console.print(f"  {'Duration:':<16}{result['duration']:.2f}s")
 
+    if profile:
+        phase_timings = result.get("phase_timings")
+        if phase_timings:
+            console.print()
+            _print_phase_timing_table(phase_timings, result.get("duration", 0.0))
+
 
 def _reindex_stats_json(result, duration: float) -> str:
     return json.dumps(
@@ -667,6 +696,7 @@ def _reindex_stats_json(result, duration: float) -> str:
                 "coupled_pairs": result.coupled_pairs,
             },
             "duration": round(duration, 2),
+            "phase_timings": result.phase_timings,
         }
     )
 

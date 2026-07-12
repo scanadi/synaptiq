@@ -291,6 +291,94 @@ class TestRunPipelineFullPhases:
 
 
 # ---------------------------------------------------------------------------
+# test_run_pipeline_phase_timings
+# ---------------------------------------------------------------------------
+
+# Phases that always run, regardless of storage/embeddings (see run_pipeline).
+_CORE_PHASES = (
+    "Walking files",
+    "Processing structure",
+    "Parsing code",
+    "Resolving imports",
+    "Tracing calls",
+    "Linking REST endpoints",
+    "Extracting heritage",
+    "Analyzing types",
+    "Detecting communities",
+    "Detecting execution flows",
+    "Finding dead code",
+    "Analyzing git history",
+)
+
+
+def _assert_timings_sum_close(
+    phase_timings: dict[str, float], duration_seconds: float, tolerance: float = 0.2
+) -> None:
+    """Assert phase_timings sums to approximately duration_seconds.
+
+    Each phase is timed as a non-overlapping sub-interval of the pipeline's
+    total wall-clock run, so the sum can never legitimately exceed the total
+    (a tiny epsilon absorbs float rounding). The lower bound is generous
+    because a little bit of work (e.g. the final symbol-counting pass, the
+    pre-bulk_load embedding snapshot) is intentionally left untimed.
+    """
+    total_timed = sum(phase_timings.values())
+    assert total_timed <= duration_seconds + 1e-3, (
+        f"timed phases ({total_timed}) exceed duration_seconds ({duration_seconds})"
+    )
+    assert total_timed >= duration_seconds * (1 - tolerance), (
+        f"timed phases ({total_timed}) too far below duration_seconds ({duration_seconds})"
+    )
+
+
+class TestRunPipelinePhaseTimingsWithStorage:
+    """phase_timings is populated for every phase, including storage/embeddings."""
+
+    def test_run_pipeline_phase_timings_with_storage(
+        self, rich_repo: Path, rich_storage: KuzuBackend
+    ) -> None:
+        _, result = run_pipeline(rich_repo, rich_storage)
+
+        assert isinstance(result.phase_timings, dict)
+
+        expected_phases = {*_CORE_PHASES, "Loading to storage", "Generating embeddings"}
+        assert expected_phases.issubset(result.phase_timings.keys())
+
+        for phase, seconds in result.phase_timings.items():
+            assert isinstance(seconds, float)
+            assert seconds >= 0.0, f"{phase} has a negative duration"
+
+        _assert_timings_sum_close(result.phase_timings, result.duration_seconds)
+
+
+class TestRunPipelinePhaseTimingsNoStorage:
+    """Without a storage backend, only the 12 core phases are timed."""
+
+    def test_run_pipeline_phase_timings_no_storage(self, rich_repo: Path) -> None:
+        _, result = run_pipeline(rich_repo)
+
+        assert set(_CORE_PHASES).issubset(result.phase_timings.keys())
+        assert "Loading to storage" not in result.phase_timings
+        assert "Generating embeddings" not in result.phase_timings
+
+        _assert_timings_sum_close(result.phase_timings, result.duration_seconds)
+
+
+class TestRunPipelinePhaseTimingsSkipEmbeddings:
+    """skip_embeddings=True omits the embeddings phase but keeps storage load."""
+
+    def test_run_pipeline_phase_timings_skip_embeddings(
+        self, rich_repo: Path, rich_storage: KuzuBackend
+    ) -> None:
+        _, result = run_pipeline(rich_repo, rich_storage, skip_embeddings=True)
+
+        assert "Loading to storage" in result.phase_timings
+        assert "Generating embeddings" not in result.phase_timings
+
+        _assert_timings_sum_close(result.phase_timings, result.duration_seconds)
+
+
+# ---------------------------------------------------------------------------
 # test_run_pipeline_progress_includes_new_phases
 # ---------------------------------------------------------------------------
 
