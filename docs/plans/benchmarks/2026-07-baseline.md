@@ -49,3 +49,17 @@ Raw JSON: session task output `bpzm9odjy` (numbers transcribed above verbatim).
 | Parsing code | 0.151s | 0.167s | noise |
 
 **Not visible in a full-index benchmark (the actual Wave-1 targets):** watcher continuous-rebuild loop → single rebuild after 30s quiescence with 600s ceiling and skip-if-clean (W1.1); per-save cost drops from O(corpus) FTS rebuild to O(file) (W1.2); incremental insert path ~47× via transactions + prepared statements, 13.9s → 0.29s per 1k nodes (W1.6, agent micro-benchmark); rest_linking phase 16-43× at scale (W1.5, agent synthetic benchmark at N=300/1000); MCP `cycles` now cached per index generation (B2).
+
+---
+
+# After Wave 2 (same machine, quiet, same commands, main @ W2.7 merge — now on LadybugDB)
+
+| Metric | Baseline | After W1 | After W2 | Δ vs baseline |
+|---|---|---|---|---|
+| Total, no embeddings (median of 3) | 6.37s | 5.20s | **3.02s** | **-53%** |
+| Loading to storage | 5.99s | 4.83s | **2.58s** | **-57%** (W2.3 Arrow COPY + FTS-on-empty skip + W2.7 LadybugDB) |
+| Analyzing git history (visible) | 0.048s | — | **0.001s** | fully overlapped (W2.4) |
+| Parsing code | 0.151s | 0.167s | 0.255s | small repo stays on thread path (process pool gated ≥100 files); Δ within load noise |
+| Generating embeddings (1 run) | 49.2s | 56.2s | 70.2s | ⚠ unexplained +25% vs W1 — same model/threads; suspected thermal/load artifact after hours of agent activity; **re-measure on cool machine before reading anything into it** |
+
+**Not visible here (Wave-2 wins at scale):** process-parallel parsing 6.36× on a 500-file corpus (W2.1, threshold-gated); single-pass walks ~1.2× on extraction (W2.2, honest below-estimate result — old symbol walk was already light); calls-phase symbol-ID reuse + O(1) same-file resolution (W2.5c); flow-dedup and Ruby-import quadratic fixes (W2.5ab). The real `analyze` CLI additionally skips ~1.9s of empty-FTS build on open (W2.7) that this bench's timed phases don't include.
