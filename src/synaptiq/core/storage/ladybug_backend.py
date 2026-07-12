@@ -1,9 +1,12 @@
-"""KuzuDB storage backend for Synaptiq.
+"""LadybugDB storage backend for Synaptiq.
 
-Implements the :class:`StorageBackend` protocol using KuzuDB, an embedded
-graph database that speaks Cypher. Each :class:`NodeLabel` maps to a
-separate node table, and a single ``CodeRelation`` relationship table group
-covers all source-to-target combinations.
+Implements the :class:`StorageBackend` protocol using LadybugDB, the
+actively-maintained embedded successor to the archived KuzuDB (owner
+decision W2.7 — see ``docs/plans/2026-07-12-storage-successor-evaluation.md``).
+LadybugDB is API drop-in for the former ``kuzu`` bindings and speaks the same
+Cypher dialect. Each :class:`NodeLabel` maps to a separate node table, and a
+single ``CodeRelation`` relationship table group covers all source-to-target
+combinations.
 
 Concurrency
 -----------
@@ -27,17 +30,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-import kuzu
+import ladybug
 
 try:
-    # kuzu 0.11.3's replacement scan (``COPY <table> FROM <in-memory object>``)
-    # references ``importlib.util`` without importing it, so the very first COPY
-    # raises ``AttributeError: module 'importlib' has no attribute 'util'``.
-    # Importing it here (stdlib, cheap, idempotent) makes the attribute
-    # resolvable for kuzu's native loader — kept next to the pyarrow import so it
-    # is present exactly when the Arrow bulk path can run.
-    import importlib.util  # noqa: F401
-
+    # LadybugDB's Arrow replacement scan (``COPY <table> FROM <local pa.Table>``)
+    # resolves modules via ``importlib.import_module`` (see ladybug/_backend.py),
+    # which is always available once ``importlib`` is imported — so the
+    # ``import importlib.util`` shim that kuzu 0.11.3's native loader required is
+    # unnecessary here and was dropped in W2.7 (verified against the engine).
     import pyarrow as pa
 
     _HAS_PYARROW = True
@@ -82,7 +82,7 @@ _NODE_PROPERTIES = (
 
 # Column order used by every node SELECT — must match _NODE_PROPERTIES.
 # Explicit column lists (instead of ``RETURN n.*``) keep row decoding
-# independent of Kuzu's internal property ordering.
+# independent of the engine's internal property ordering.
 _NODE_COLUMN_NAMES: tuple[str, ...] = (
     "id",
     "name",
@@ -119,7 +119,7 @@ _REL_PROPERTIES = (
 def _escape(value: str) -> str:
     """Escape a string for inclusion in a Cypher literal.
 
-    Internal only — used for FTS/fuzzy search literals that Kuzu cannot
+    Internal only — used for FTS/fuzzy search literals that the engine cannot
     parameterize. Everything else must use parameterized queries.
     """
     return value.replace("\\", "\\\\").replace("'", "\\'")
@@ -144,8 +144,8 @@ def _serialize_properties(properties: dict[str, Any] | None) -> str:
 def _arrow_str(value: str | None) -> str | None:
     """Coerce empty/``None`` strings to ``None`` for the Arrow COPY path.
 
-    Kuzu's CSV reader stores an empty field as ``NULL``, so the CSV bulk path
-    already persists ``""`` as ``NULL``. Mirroring that here keeps the Arrow and
+    LadybugDB's CSV reader stores an empty field as ``NULL``, so the CSV bulk
+    path already persists ``""`` as ``NULL``. Mirroring that here keeps the Arrow and
     CSV loaders byte-identical: a non-empty string is stored verbatim, while
     ``""``/``None`` land as ``NULL`` in both paths.
     """
@@ -167,7 +167,7 @@ def deserialize_properties(raw: Any) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-# Embedding vectors use a fixed-dimension FLOAT column so Kuzu's HNSW
+# Embedding vectors use a fixed-dimension FLOAT column so LadybugDB's HNSW
 # vector index can be built on them; 384 matches BAAI/bge-small-en-v1.5.
 # The bulk store path recreates the table from the actual embedding width,
 # so this constant only shapes the empty table created at schema time.
@@ -194,48 +194,69 @@ def open_with_recovery(
     meta_path: Path | None = None,
     *,
     read_only: bool = False,
-) -> KuzuBackend:
-    """Open a KuzuBackend at *db_path*, rebuilding on corruption.
+    build_fts_indexes: bool = True,
+) -> LadybugBackend:
+    """Open a LadybugBackend at *db_path*, rebuilding an unreadable index.
 
-    A corrupted database (e.g. duplicate primary key from a mid-write kill)
-    is deleted along with *meta_path* so the next index run rebuilds
-    cleanly.  In read-write mode the empty database is re-initialised; in
-    read-only mode a bare (uninitialised) backend is returned since there
-    is nothing left to open.
+    The ``.synaptiq`` index is a rebuildable derived artifact, so any index
+    that cannot be opened is deleted (along with *meta_path*) and the next
+    ``synaptiq analyze`` rebuilds it from source.  This covers:
 
-    Non-corruption errors (e.g. the database is locked by another
-    process) propagate unchanged.
+    * corruption from a mid-write kill (duplicate primary key, partial file),
+    * a stale-WAL / partially written read (``unordered_map::at`` → IndexError),
+    * an index directory left behind by the former **KuzuDB** backend —
+      LadybugDB uses a single-file on-disk format and rejects a directory path
+      with "Database path cannot be a directory", so an upgraded install
+      transparently reindexes instead of crashing.
+
+    In read-write mode the empty database is re-initialised; in read-only mode
+    a bare (uninitialised) backend is returned since there is nothing left to
+    open.
+
+    A **lock conflict** (another process holds the database) is not corruption:
+    it propagates unchanged so the caller's lock handling and the daemon
+    primary/proxy hand-off still work.
+
+    Args:
+        build_fts_indexes: Forwarded to :meth:`LadybugBackend.initialize` for
+            the read-write path.  ``analyze`` passes ``False`` because it
+            immediately ``bulk_load``s — which builds the FTS indexes over the
+            populated tables and swaps the fresh database in — making the
+            empty-schema FTS build the live open would otherwise do pure waste
+            (~2s on this engine).
     """
-    storage = KuzuBackend()
+    storage = LadybugBackend()
     try:
-        storage.initialize(db_path, read_only=read_only)
+        storage.initialize(db_path, read_only=read_only, _build_fts_indexes=build_fts_indexes)
         return storage
     except (RuntimeError, IndexError) as exc:
-        # "unordered_map::at" surfaces as IndexError from the native layer
-        # when kuzu replays a stale WAL or reads a partially written file.
-        msg = str(exc).lower()
-        recoverable = "primary key" in msg or "corrupt" in msg or "unordered_map" in msg
-        if not recoverable:
+        # Any open failure is recoverable by wiping + rebuilding (the index is
+        # derived), EXCEPT a lock conflict — that means another live process
+        # owns the database and it must be left untouched.  Verified LadybugDB
+        # messages: stale kuzu-format dir → "Database path cannot be a
+        # directory"; corrupt/partial file → "not a valid Lbug database file";
+        # lock conflict → "Could not set lock on file ... Lock is held by PID".
+        if "lock" in str(exc).lower():
             raise
 
-    logger.warning("Corrupted index detected, removing %s", db_path)
+    logger.warning("Unreadable index at %s — removing it and scheduling a rebuild", db_path)
     storage.close()
-    KuzuBackend._remove_db_files(db_path)
+    LadybugBackend._remove_db_files(db_path)
     if meta_path is not None:
         meta_path.unlink(missing_ok=True)
 
-    storage = KuzuBackend()
+    storage = LadybugBackend()
     if not read_only:
-        storage.initialize(db_path)
+        storage.initialize(db_path, _build_fts_indexes=build_fts_indexes)
     return storage
 
 
-class KuzuBackend:
-    """StorageBackend implementation backed by KuzuDB.
+class LadybugBackend:
+    """StorageBackend implementation backed by LadybugDB.
 
     Usage::
 
-        backend = KuzuBackend()
+        backend = LadybugBackend()
         backend.initialize(Path("/tmp/synaptiq_db"))
         backend.bulk_load(graph)
         node = backend.get_node("function:src/app.py:main")
@@ -243,8 +264,8 @@ class KuzuBackend:
     """
 
     def __init__(self) -> None:
-        self._db: kuzu.Database | None = None
-        self._conn: kuzu.Connection | None = None
+        self._db: ladybug.Database | None = None
+        self._conn: ladybug.Connection | None = None
         # Prepared statements for the write connection, keyed by node label
         # or source/target rel-table pair. Reused across the rows of a batch
         # so each INSERT is planned once instead of re-planned per row. Bound
@@ -256,7 +277,7 @@ class KuzuBackend:
         # generation they were created against.  The generation increments
         # on every (re)initialize so connections bound to a closed/deleted
         # database are never handed out again.
-        self._read_pool: list[tuple[int, kuzu.Connection]] = []
+        self._read_pool: list[tuple[int, ladybug.Connection]] = []
         self._pool_lock = threading.Lock()
         self._generation = 0
         # In-flight read tracking so destructive operations (the bulk_load swap)
@@ -276,10 +297,13 @@ class KuzuBackend:
     def initialize(
         self, path: Path, *, read_only: bool = False, _build_fts_indexes: bool = True
     ) -> None:
-        """Open or create the KuzuDB database at *path* and set up the schema.
+        """Open or create the LadybugDB database at *path* and set up the schema.
 
         Args:
-            path: Filesystem path to the KuzuDB database directory.
+            path: Filesystem path to the LadybugDB database file (LadybugDB
+                uses a single-file on-disk format, unlike the former KuzuDB
+                directory layout — :func:`open_with_recovery` transparently
+                rebuilds an index left behind by the old directory format).
             read_only: If ``True``, open the database in read-only mode.
                 This allows multiple concurrent readers (e.g. MCP server
                 instances) without lock conflicts.  Schema creation is
@@ -300,15 +324,15 @@ class KuzuBackend:
 
         limits = current_limits()
         self._db_path = path
-        # 0 for either cap means Kuzu's library default (all cores /
+        # 0 for either cap means the engine's library default (all cores /
         # default buffer pool) — the interactive profile resolves to that.
-        self._db = kuzu.Database(
+        self._db = ladybug.Database(
             str(path),
             read_only=read_only,
-            max_num_threads=limits.kuzu_threads,
-            buffer_pool_size=limits.kuzu_buffer_bytes,
+            max_num_threads=limits.db_threads,
+            buffer_pool_size=limits.db_buffer_bytes,
         )
-        self._conn = kuzu.Connection(self._db)
+        self._conn = ladybug.Connection(self._db)
         # Fresh write connection — any statements prepared against a prior
         # one are invalid, so start with an empty cache.
         self._prepared = {}
@@ -363,7 +387,7 @@ class KuzuBackend:
 
     @staticmethod
     def _close_quietly(obj: object) -> None:
-        """Call ``close()`` on a Kuzu object, ignoring errors."""
+        """Call ``close()`` on a LadybugDB object, ignoring errors."""
         try:
             obj.close()  # type: ignore[attr-defined]
         except Exception:
@@ -372,7 +396,7 @@ class KuzuBackend:
     def close(self) -> None:
         """Release all connections and the database handle.
 
-        Uses the explicit ``close()`` methods on Kuzu connections and the
+        Uses the explicit ``close()`` methods on LadybugDB connections and the
         database so file locks are released and data is flushed
         deterministically (not at GC time).
         """
@@ -396,7 +420,7 @@ class KuzuBackend:
     # Connection pool for concurrent reads
     # ------------------------------------------------------------------
 
-    def _acquire_read_conn(self) -> tuple[int, kuzu.Connection]:
+    def _acquire_read_conn(self) -> tuple[int, ladybug.Connection]:
         """Get a pooled connection or create a new one (thread-safe).
 
         Returns ``(generation, connection)``; the generation is passed back
@@ -415,9 +439,9 @@ class KuzuBackend:
                 "No database open — the index is missing or was removed. "
                 "Run `synaptiq analyze` first."
             )
-        return gen, kuzu.Connection(db)
+        return gen, ladybug.Connection(db)
 
-    def _release_read_conn(self, gen: int, conn: kuzu.Connection) -> None:
+    def _release_read_conn(self, gen: int, conn: ladybug.Connection) -> None:
         """Return a connection to the pool, or close it if stale."""
         with self._pool_lock:
             if gen == self._generation and len(self._read_pool) < _MAX_POOL_SIZE:
@@ -426,7 +450,7 @@ class KuzuBackend:
         self._close_quietly(conn)
 
     @contextmanager
-    def _read_conn(self) -> Iterator[kuzu.Connection]:
+    def _read_conn(self) -> Iterator[ladybug.Connection]:
         """Context manager for read connections from the pool.
 
         Tracks in-flight reads so the ``bulk_load`` swap can wait for
@@ -539,9 +563,14 @@ class KuzuBackend:
     def _rollback_quietly(self) -> None:
         """Roll back the active write transaction, tolerating its absence.
 
-        A statement error inside a transaction auto-aborts it in Kuzu, so an
-        explicit ``ROLLBACK`` afterwards raises "No active transaction". That
-        is expected — the database is already reverted — so it is swallowed.
+        On LadybugDB a statement error inside a transaction leaves the
+        transaction open (it does not auto-abort), so this explicit
+        ``ROLLBACK`` succeeds and reverts the batch — verified against the
+        engine. The ``except`` still guards the case where there is no active
+        transaction (e.g. the failure happened before ``BEGIN``), and it also
+        absorbs the former KuzuDB behaviour where a statement error auto-aborted
+        the transaction and ``ROLLBACK`` then raised "No active transaction".
+        Either way the database ends up consistent.
         """
         if self._conn is None:
             return
@@ -679,7 +708,7 @@ class KuzuBackend:
 
     def _get_neighbors_batch(
         self,
-        conn: kuzu.Connection,
+        conn: ladybug.Connection,
         node_ids: list[str],
         direction: str,
     ) -> list[GraphNode]:
@@ -937,7 +966,7 @@ class KuzuBackend:
         return candidates[:limit]
 
     def fts_search(self, query: str, limit: int) -> list[SearchResult]:
-        """BM25 full-text search using KuzuDB's native FTS extension.
+        """BM25 full-text search using LadybugDB's native FTS extension.
 
         Searches across all node tables using pre-built FTS indexes on
         ``name``, ``content``, and ``signature`` fields.  Results are
@@ -1136,9 +1165,9 @@ class KuzuBackend:
         with node tables to fetch metadata in a single query.
         """
         limit = max(1, int(limit))
-        # Vector literals must be inlined — KuzuDB cannot bind a parameter
-        # in the index-function argument position, nor distinguish DOUBLE[]
-        # from LIST for array_cosine_similarity.
+        # Vector literals must be inlined — the engine cannot bind a parameter
+        # in the index-function argument position, nor distinguish a plain LIST
+        # from a fixed-width FLOAT[] for array_cosine_similarity.
         vec_literal = "[" + ", ".join(str(float(v)) for v in vector) + "]"
         dim = len(vector)
 
@@ -1189,7 +1218,7 @@ class KuzuBackend:
 
     @classmethod
     def _vector_index_query(
-        cls, conn: kuzu.Connection, vec_literal: str, dim: int, limit: int
+        cls, conn: ladybug.Connection, vec_literal: str, dim: int, limit: int
     ) -> list[tuple[str, float]] | None:
         """K-nearest via the HNSW index; ``None`` when the index is unavailable.
 
@@ -1210,7 +1239,7 @@ class KuzuBackend:
 
     @classmethod
     def _vector_scan_query(
-        cls, conn: kuzu.Connection, vec_literal: str, dim: int, limit: int
+        cls, conn: ladybug.Connection, vec_literal: str, dim: int, limit: int
     ) -> list[tuple[str, float]]:
         """Full-scan cosine similarity over all embeddings.
 
@@ -1249,13 +1278,20 @@ class KuzuBackend:
 
     @staticmethod
     def _remove_db_files(db_path: Path) -> None:
-        """Delete a database file/dir and its WAL/shadow siblings."""
+        """Delete a database and its sibling artifacts.
+
+        LadybugDB stores a database as a single file plus a transient ``.wal``.
+        The ``is_dir`` branch also cleans up an index *directory* written by the
+        former KuzuDB backend, so :func:`open_with_recovery` heals an upgraded
+        install in place. ``.shadow`` is a no-op for LadybugDB (kept as a
+        harmless legacy sibling).
+        """
         if db_path.is_dir():
             shutil.rmtree(db_path, ignore_errors=True)
         else:
             db_path.unlink(missing_ok=True)
         # str-concat, not with_suffix: the path may already carry a suffix
-        # (e.g. ``kuzu.rebuild``) that with_suffix would replace.
+        # (e.g. a ``.rebuild`` swap file) that with_suffix would replace.
         for suffix in (".wal", ".shadow"):
             Path(str(db_path) + suffix).unlink(missing_ok=True)
 
@@ -1265,8 +1301,8 @@ class KuzuBackend:
         Builds into a sibling ``.rebuild`` database first and swaps it in
         only after the load fully succeeds — a failed build (or a crash
         mid-build) leaves the live index untouched.  Rebuilding from
-        scratch rather than ``MATCH (n) DETACH DELETE n`` also avoids a
-        Kuzu native segfault on large deletes.
+        scratch rather than ``MATCH (n) DETACH DELETE n`` also sidesteps the
+        cost and native-layer risk of a large delete.
 
         Uses COPY FROM for bulk loading nodes and relationships — an in-memory
         Arrow table when pyarrow is installed, otherwise a temporary CSV —
@@ -1275,14 +1311,14 @@ class KuzuBackend:
         The swap waits for in-flight reads to drain first: a read whose
         dispatch timed out keeps running in its thread after the RW lock
         is released, and moving database files under a live native query
-        risks a crash in Kuzu's native layer.
+        risks a crash in the engine's native layer.
         """
         assert self._db_path is not None
         live_path = self._db_path
         tmp_path = live_path.with_name(live_path.name + ".rebuild")
 
         self._remove_db_files(tmp_path)
-        builder = KuzuBackend()
+        builder = LadybugBackend()
         # Skip building FTS indexes on the empty schema — rebuild_fts_indexes()
         # below builds them over the populated tables right after the COPY, so
         # the empty-table build would be pure waste (~25% of storage-load time).
@@ -1354,11 +1390,12 @@ class KuzuBackend:
                 writer = csv.writer(f)
                 writer.writerows(rows)
                 csv_path = f.name
-            # PARALLEL=false is required: node ``content``/``signature`` and
-            # relationship properties carry source code with embedded newlines,
-            # and Kuzu's parallel CSV reader rejects quoted newlines ("Quoted
-            # newlines are not supported in parallel CSV reader"). Without this
-            # every COPY of real code silently fails and bulk_load falls back to
+            # PARALLEL=false is required (verified against LadybugDB): node
+            # ``content``/``signature`` and relationship properties carry source
+            # code with embedded newlines, and the parallel CSV reader rejects
+            # quoted newlines ("Quoted newlines are not supported in parallel CSV
+            # reader. Please specify PARALLEL=FALSE in the options."). Without
+            # this every COPY of real code fails and bulk_load falls back to
             # row-by-row inserts — ~50x slower on large repos.
             self._conn.execute(f'COPY {table} FROM "{csv_path}" (HEADER=false, PARALLEL=false)')
         finally:
@@ -1368,12 +1405,14 @@ class KuzuBackend:
     def _arrow_copy(self, table: str, arrow_tbl: pa.Table) -> None:
         """COPY an in-memory pyarrow Table into *table*.
 
-        Kuzu resolves the source object via a replacement scan that inspects
-        this frame's local variables, so ``arrow_tbl`` MUST stay the name both
-        of the parameter and of the identifier in the query — do not rename one
-        without the other. A typed Arrow table carries multiline strings and
-        ``FLOAT[dim]`` vectors natively, so no ``PARALLEL=false`` flag, temp
-        file, or per-value stringification is needed.
+        LadybugDB resolves the source object via a replacement scan that
+        inspects this frame's local variables, so ``arrow_tbl`` MUST stay the
+        name both of the parameter and of the identifier in the query — do not
+        rename one without the other. A typed Arrow table carries multiline
+        strings and ``FLOAT[dim]`` vectors natively, so no ``PARALLEL=false``
+        flag, temp file, or per-value stringification is needed. (Unlike kuzu
+        0.11.3, LadybugDB's loader needs no ``importlib.util`` shim — see the
+        module-level pyarrow import.)
         """
         assert self._conn is not None
         self._conn.execute(f"COPY {table} FROM arrow_tbl")
@@ -1790,13 +1829,13 @@ class KuzuBackend:
         assert self._conn is not None
         stmt = self._prepared.get(key)
         if stmt is None:
-            # Kuzu 0.11.3 (final release — upstream is archived) warns that the
-            # separate prepare()+execute() API is deprecated in favour of a
-            # single execute() call. We deliberately prepare once and reuse the
-            # statement across a batch's rows, which is the whole point of this
-            # fast path, and the API will never be removed. Silence the
-            # unactionable warning at the call site (reads never prepare, so
-            # this narrow window cannot suppress other threads' warnings).
+            # LadybugDB (like kuzu before it — verified against 0.18.1) emits a
+            # DeprecationWarning that the separate prepare()+execute() API is
+            # deprecated in favour of a single execute() call. We deliberately
+            # prepare once and reuse the statement across a batch's rows, which
+            # is the whole point of this fast path. Silence the unactionable
+            # warning at the call site (reads never prepare, so this narrow
+            # window cannot suppress other threads' warnings).
             with warnings.catch_warnings():
                 warnings.filterwarnings(
                     "ignore",

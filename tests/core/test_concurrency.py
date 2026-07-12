@@ -14,7 +14,7 @@ import pytest
 
 from synaptiq.core.daemon.rwlock import AsyncRWLock
 from synaptiq.core.ingestion.pipeline import run_pipeline
-from synaptiq.core.storage.kuzu_backend import KuzuBackend
+from synaptiq.core.storage.ladybug_backend import LadybugBackend
 
 # ======================================================================
 # Fixtures
@@ -22,7 +22,7 @@ from synaptiq.core.storage.kuzu_backend import KuzuBackend
 
 
 @pytest.fixture()
-def indexed_repo(tmp_path: Path) -> tuple[Path, KuzuBackend]:
+def indexed_repo(tmp_path: Path) -> tuple[Path, LadybugBackend]:
     """Create a small indexed repo for concurrency tests."""
     src = tmp_path / "repo" / "src"
     src.mkdir(parents=True)
@@ -44,7 +44,7 @@ def indexed_repo(tmp_path: Path) -> tuple[Path, KuzuBackend]:
 
     repo_path = tmp_path / "repo"
     db_path = tmp_path / "test_db"
-    backend = KuzuBackend()
+    backend = LadybugBackend()
     backend.initialize(db_path)
     run_pipeline(repo_path, backend)
 
@@ -61,7 +61,7 @@ class TestConcurrentReads:
     """Multiple read operations running in parallel."""
 
     async def test_parallel_get_node(
-        self, indexed_repo: tuple[Path, KuzuBackend]
+        self, indexed_repo: tuple[Path, LadybugBackend]
     ) -> None:
         """Multiple get_node calls succeed concurrently."""
         _, storage = indexed_repo
@@ -79,7 +79,7 @@ class TestConcurrentReads:
         assert all(results)
 
     async def test_parallel_fts_search(
-        self, indexed_repo: tuple[Path, KuzuBackend]
+        self, indexed_repo: tuple[Path, LadybugBackend]
     ) -> None:
         """Multiple FTS search calls succeed concurrently."""
         _, storage = indexed_repo
@@ -96,7 +96,7 @@ class TestConcurrentReads:
             assert isinstance(result, list)
 
     async def test_many_concurrent_reads(
-        self, indexed_repo: tuple[Path, KuzuBackend]
+        self, indexed_repo: tuple[Path, LadybugBackend]
     ) -> None:
         """Stress test: 20 concurrent read operations."""
         _, storage = indexed_repo
@@ -125,7 +125,7 @@ class TestReadWriteCoordination:
     """Simulate agents reading while watcher writes."""
 
     async def test_reads_during_write(
-        self, indexed_repo: tuple[Path, KuzuBackend]
+        self, indexed_repo: tuple[Path, LadybugBackend]
     ) -> None:
         """Reads complete before a write acquires exclusive access."""
         _, storage = indexed_repo
@@ -155,7 +155,7 @@ class TestReadWriteCoordination:
         assert write_completed.is_set()
 
     async def test_write_blocks_subsequent_reads(
-        self, indexed_repo: tuple[Path, KuzuBackend]
+        self, indexed_repo: tuple[Path, LadybugBackend]
     ) -> None:
         """While writer holds lock, new readers must wait."""
         _, storage = indexed_repo
@@ -195,10 +195,10 @@ class TestReadWriteCoordination:
 
 
 class TestConnectionPool:
-    """Verify the KuzuBackend connection pool handles contention."""
+    """Verify the LadybugBackend connection pool handles contention."""
 
     async def test_pool_returns_connections(
-        self, indexed_repo: tuple[Path, KuzuBackend]
+        self, indexed_repo: tuple[Path, LadybugBackend]
     ) -> None:
         """Connections are returned to pool after use."""
         _, storage = indexed_repo
@@ -211,7 +211,7 @@ class TestConnectionPool:
         assert len(storage._read_pool) >= initial_pool_size
 
     async def test_pool_handles_burst(
-        self, indexed_repo: tuple[Path, KuzuBackend]
+        self, indexed_repo: tuple[Path, LadybugBackend]
     ) -> None:
         """Pool creates connections as needed under burst load."""
         _, storage = indexed_repo
@@ -227,7 +227,7 @@ class TestConnectionPool:
         assert all(results)
 
     async def test_execute_raw_concurrent(
-        self, indexed_repo: tuple[Path, KuzuBackend]
+        self, indexed_repo: tuple[Path, LadybugBackend]
     ) -> None:
         """execute_raw uses read pool for concurrent queries."""
         _, storage = indexed_repo

@@ -2,7 +2,7 @@
 
 The MCP SDK's server.run() neither returns on stdin EOF nor honours task
 cancellation, so without the stdin sentinel + shutdown watchdog a serve
-process wedges forever while holding the kuzu lock.  These tests run the
+process wedges forever while holding the database lock.  These tests run the
 real CLI in a subprocess and assert bounded shutdown.
 """
 

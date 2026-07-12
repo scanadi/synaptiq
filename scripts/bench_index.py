@@ -3,7 +3,7 @@
 
 Runs :func:`synaptiq.core.ingestion.pipeline.run_pipeline` against a target
 repository ``--runs`` times (default 3), each time against a fresh, throwaway
-KuzuDB in a temporary directory so that per-run numbers are not skewed by
+LadybugDB in a temporary directory so that per-run numbers are not skewed by
 incremental-embedding reuse or warm FTS/HNSW state.  Storage is real (not
 ``None``) so the "Loading to storage" phase (COPY + FTS) is included, per the
 W0.1 spec.
@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any
 
 from synaptiq.core.ingestion.pipeline import run_pipeline
-from synaptiq.core.storage.kuzu_backend import KuzuBackend
+from synaptiq.core.storage.ladybug_backend import LadybugBackend
 
 
 def run_once(repo_path: Path, *, skip_embeddings: bool) -> dict[str, Any]:
@@ -44,7 +44,7 @@ def run_once(repo_path: Path, *, skip_embeddings: bool) -> dict[str, Any]:
     a few headline counts (files/symbols/relationships) for context.
     """
     with tempfile.TemporaryDirectory(prefix="synaptiq-bench-") as tmp_dir:
-        storage = KuzuBackend()
+        storage = LadybugBackend()
         storage.initialize(Path(tmp_dir) / "kuzu")
         try:
             _, result = run_pipeline(

@@ -34,7 +34,7 @@ from synaptiq.core.memory import MemoryStore
 from synaptiq.core.parsers.base import ImportInfo
 from synaptiq.core.parsers.python_lang import PythonParser
 from synaptiq.core.storage.base import NodeEmbedding
-from synaptiq.core.storage.kuzu_backend import KuzuBackend
+from synaptiq.core.storage.ladybug_backend import LadybugBackend
 
 
 class TestPythonParserNonAscii:
@@ -127,10 +127,10 @@ class TestContainmentLookup:
 
 
 @pytest.fixture(scope="module")
-def kuzu(tmp_path_factory: pytest.TempPathFactory) -> KuzuBackend:
+def kuzu(tmp_path_factory: pytest.TempPathFactory) -> LadybugBackend:
     # Module-scoped: every test below starts with bulk_load, which resets
     # the database anyway — per-test schema creation would only add ~3s each.
-    backend = KuzuBackend()
+    backend = LadybugBackend()
     backend.initialize(tmp_path_factory.mktemp("regressions") / "kuzu")
     yield backend
     backend.close()
@@ -160,7 +160,7 @@ def _two_role_graph() -> KnowledgeGraph:
 
 
 class TestKuzuRegressionFixes:
-    def test_uses_type_roles_both_persisted(self, kuzu: KuzuBackend) -> None:
+    def test_uses_type_roles_both_persisted(self, kuzu: LadybugBackend) -> None:
         kuzu.bulk_load(_two_role_graph())
         rows = kuzu.execute_raw(
             "MATCH (a)-[r:CodeRelation]->(b) "
@@ -168,7 +168,7 @@ class TestKuzuRegressionFixes:
         )
         assert [r[0] for r in rows] == ["param", "return"]
 
-    def test_node_properties_round_trip(self, kuzu: KuzuBackend) -> None:
+    def test_node_properties_round_trip(self, kuzu: LadybugBackend) -> None:
         g = KnowledgeGraph()
         g.add_node(GraphNode(
             id="community:community_0:", label=NodeLabel.COMMUNITY, name="Core",
@@ -180,7 +180,7 @@ class TestKuzuRegressionFixes:
         assert node.properties.get("cohesion") == 0.5
         assert node.properties.get("symbol_count") == 3
 
-    def test_vector_search_skips_orphaned_embeddings(self, kuzu: KuzuBackend) -> None:
+    def test_vector_search_skips_orphaned_embeddings(self, kuzu: LadybugBackend) -> None:
         g = KnowledgeGraph()
         g.add_node(GraphNode(
             id="function:a.py:f", label=NodeLabel.FUNCTION, name="f",
@@ -196,7 +196,7 @@ class TestKuzuRegressionFixes:
         assert "function:a.py:f" in ids
         assert "function:gone.py:ghost" not in ids
 
-    def test_remove_nodes_by_file_removes_embeddings(self, kuzu: KuzuBackend) -> None:
+    def test_remove_nodes_by_file_removes_embeddings(self, kuzu: LadybugBackend) -> None:
         g = KnowledgeGraph()
         g.add_node(GraphNode(
             id="function:a.py:f", label=NodeLabel.FUNCTION, name="f",
@@ -210,7 +210,7 @@ class TestKuzuRegressionFixes:
         rows = kuzu.execute_raw("MATCH (e:Embedding) RETURN count(e)")
         assert rows[0][0] == 0
 
-    def test_global_phase_commit_preserves_embeddings(self, kuzu: KuzuBackend) -> None:
+    def test_global_phase_commit_preserves_embeddings(self, kuzu: LadybugBackend) -> None:
         """bulk_load resets the whole DB — the shared commit step must
         re-store embeddings or vector search silently dies in watch mode."""
         g = _two_role_graph()
@@ -248,7 +248,7 @@ class TestSchemaMigration:
         """A database created before the properties_json column must be
         migrated on open — without it every node SELECT binder-errors and
         is swallowed, so all lookups silently return nothing."""
-        import kuzu as kuzu_lib
+        import ladybug as engine
 
         db_path = tmp_path / "kuzu"
         # Simulate a pre-upgrade database: old 12-column schema, one row.
@@ -258,8 +258,8 @@ class TestSchemaMigration:
             "class_name STRING, is_dead BOOL, is_entry_point BOOL, "
             "is_exported BOOL, PRIMARY KEY (id)"
         )
-        db = kuzu_lib.Database(str(db_path))
-        conn = kuzu_lib.Connection(db)
+        db = engine.Database(str(db_path))
+        conn = engine.Connection(db)
         conn.execute(f"CREATE NODE TABLE Function({old_props})")
         conn.execute(
             "CREATE (:Function {id: 'function:a.py:f', name: 'f', "
@@ -268,7 +268,7 @@ class TestSchemaMigration:
         conn.close()
         db.close()
 
-        backend = KuzuBackend()
+        backend = LadybugBackend()
         backend.initialize(db_path)
         try:
             node = backend.get_node("function:a.py:f")

@@ -21,7 +21,7 @@ from synaptiq.core.ingestion.pipeline import (
 )
 from synaptiq.core.ingestion.structure import process_structure
 from synaptiq.core.ingestion.walker import FileEntry, walk_repo
-from synaptiq.core.storage.kuzu_backend import KuzuBackend
+from synaptiq.core.storage.ladybug_backend import LadybugBackend
 
 
 def _git(repo: Path, *args: str) -> None:
@@ -79,10 +79,10 @@ def tmp_repo(tmp_path: Path) -> Path:
 
 
 @pytest.fixture()
-def storage(tmp_path: Path) -> KuzuBackend:
-    """Provide an initialised KuzuBackend for testing."""
+def storage(tmp_path: Path) -> LadybugBackend:
+    """Provide an initialised LadybugBackend for testing."""
     db_path = tmp_path / "test_db"
-    backend = KuzuBackend()
+    backend = LadybugBackend()
     backend.initialize(db_path)
     yield backend
     backend.close()
@@ -97,7 +97,7 @@ class TestRunPipelineBasic:
     """run_pipeline completes without error and returns a PipelineResult."""
 
     def test_run_pipeline_basic(
-        self, tmp_repo: Path, storage: KuzuBackend
+        self, tmp_repo: Path, storage: LadybugBackend
     ) -> None:
         _, result = run_pipeline(tmp_repo, storage)
 
@@ -114,7 +114,7 @@ class TestRunPipelineFileCount:
     """The result reports exactly 3 files from the fixture repo."""
 
     def test_run_pipeline_file_count(
-        self, tmp_repo: Path, storage: KuzuBackend
+        self, tmp_repo: Path, storage: LadybugBackend
     ) -> None:
         _, result = run_pipeline(tmp_repo, storage)
 
@@ -130,7 +130,7 @@ class TestRunPipelineFindsSymbols:
     """At least 3 symbols are discovered (main, validate, helper)."""
 
     def test_run_pipeline_finds_symbols(
-        self, tmp_repo: Path, storage: KuzuBackend
+        self, tmp_repo: Path, storage: LadybugBackend
     ) -> None:
         _, result = run_pipeline(tmp_repo, storage)
 
@@ -146,7 +146,7 @@ class TestRunPipelineFindsRelationships:
     """Relationships are created (CONTAINS, DEFINES, IMPORTS, CALLS)."""
 
     def test_run_pipeline_finds_relationships(
-        self, tmp_repo: Path, storage: KuzuBackend
+        self, tmp_repo: Path, storage: LadybugBackend
     ) -> None:
         _, result = run_pipeline(tmp_repo, storage)
 
@@ -162,7 +162,7 @@ class TestRunPipelineProgressCallback:
     """The progress callback is invoked with expected phase names."""
 
     def test_run_pipeline_progress_callback(
-        self, tmp_repo: Path, storage: KuzuBackend
+        self, tmp_repo: Path, storage: LadybugBackend
     ) -> None:
         calls: list[tuple[str, float]] = []
 
@@ -193,7 +193,7 @@ class TestRunPipelineLoadsToStorage:
     """After the pipeline runs, nodes are retrievable from storage."""
 
     def test_run_pipeline_loads_to_storage(
-        self, tmp_repo: Path, storage: KuzuBackend
+        self, tmp_repo: Path, storage: LadybugBackend
     ) -> None:
         run_pipeline(tmp_repo, storage)
 
@@ -266,10 +266,10 @@ def rich_repo(tmp_path: Path) -> Path:
 
 
 @pytest.fixture()
-def rich_storage(tmp_path: Path) -> KuzuBackend:
-    """Provide an initialised KuzuBackend for the rich repo tests."""
+def rich_storage(tmp_path: Path) -> LadybugBackend:
+    """Provide an initialised LadybugBackend for the rich repo tests."""
     db_path = tmp_path / "rich_db"
-    backend = KuzuBackend()
+    backend = LadybugBackend()
     backend.initialize(db_path)
     yield backend
     backend.close()
@@ -284,7 +284,7 @@ class TestRunPipelineFullPhases:
     """Pipeline phases 7-11 populate the corresponding PipelineResult fields."""
 
     def test_run_pipeline_full_phases(
-        self, rich_repo: Path, rich_storage: KuzuBackend
+        self, rich_repo: Path, rich_storage: LadybugBackend
     ) -> None:
         _, result = run_pipeline(rich_repo, rich_storage)
 
@@ -359,7 +359,7 @@ class TestRunPipelinePhaseTimingsWithStorage:
     """phase_timings is populated for every phase, including storage/embeddings."""
 
     def test_run_pipeline_phase_timings_with_storage(
-        self, rich_repo: Path, rich_storage: KuzuBackend
+        self, rich_repo: Path, rich_storage: LadybugBackend
     ) -> None:
         _, result = run_pipeline(rich_repo, rich_storage)
 
@@ -392,7 +392,7 @@ class TestRunPipelinePhaseTimingsSkipEmbeddings:
     """skip_embeddings=True omits the embeddings phase but keeps storage load."""
 
     def test_run_pipeline_phase_timings_skip_embeddings(
-        self, rich_repo: Path, rich_storage: KuzuBackend
+        self, rich_repo: Path, rich_storage: LadybugBackend
     ) -> None:
         _, result = run_pipeline(rich_repo, rich_storage, skip_embeddings=True)
 
@@ -411,7 +411,7 @@ class TestRunPipelineProgressIncludesNewPhases:
     """Progress callback includes phase names for phases 7-11."""
 
     def test_run_pipeline_progress_includes_new_phases(
-        self, rich_repo: Path, rich_storage: KuzuBackend
+        self, rich_repo: Path, rich_storage: LadybugBackend
     ) -> None:
         calls: list[tuple[str, float]] = []
 
@@ -456,7 +456,7 @@ class TestRunPipelineProgressIncludesNewPhases:
 # save is the bug this package fixes (G3).  A guaranteed full rebuild still
 # happens at the next global-phase commit (`build_full_index` +
 # `commit_full_index` -> `storage.bulk_load`, which unconditionally rebuilds
-# every searchable index -- see `KuzuBackend.bulk_load`).
+# every searchable index -- see `LadybugBackend.bulk_load`).
 #
 # NOTE on what "stale" means here: empirically, on the exact pinned
 # ``kuzu==0.11.3`` (see W1.8 -- upstream is archived, so this is permanent for
@@ -477,7 +477,7 @@ class TestApplyReindexFtsStaleness:
     """apply_reindex defers FTS rebuilds to the next global-phase commit."""
 
     def test_apply_reindex_does_not_rebuild_fts(
-        self, tmp_repo: Path, storage: KuzuBackend, monkeypatch: pytest.MonkeyPatch
+        self, tmp_repo: Path, storage: LadybugBackend, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The per-save path must never call rebuild_fts_indexes."""
         # Initial full index -- this DOES rebuild FTS once, via bulk_load.
@@ -507,7 +507,7 @@ class TestApplyReindexFtsStaleness:
         assert calls == []
 
     def test_fts_search_keeps_working_after_apply_reindex_without_rebuild(
-        self, tmp_repo: Path, storage: KuzuBackend
+        self, tmp_repo: Path, storage: LadybugBackend
     ) -> None:
         """FTS search must keep functioning -- never erroring -- once
         apply_reindex stops rebuilding it, and unaffected content must stay
@@ -551,7 +551,7 @@ class TestApplyReindexFtsStaleness:
         assert any(r.node_name == "helper" for r in untouched_results)
 
     def test_global_rebuild_refreshes_fts_after_apply_reindex(
-        self, tmp_repo: Path, storage: KuzuBackend
+        self, tmp_repo: Path, storage: LadybugBackend
     ) -> None:
         """The next global-phase rebuild guarantees FTS reflects the
         changes -- the same `build_full_index` + `commit_full_index`

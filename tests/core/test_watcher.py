@@ -12,7 +12,7 @@ from synaptiq.core.ingestion import watcher
 from synaptiq.core.ingestion.pipeline import apply_reindex, parse_files, run_pipeline
 from synaptiq.core.ingestion.walker import FileEntry, read_file
 from synaptiq.core.ingestion.watcher import _apply_deletions, _prepare_entries
-from synaptiq.core.storage.kuzu_backend import KuzuBackend
+from synaptiq.core.storage.ladybug_backend import LadybugBackend
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -41,10 +41,10 @@ def tmp_repo(tmp_path: Path) -> Path:
 
 
 @pytest.fixture()
-def storage(tmp_path: Path) -> KuzuBackend:
-    """Provide an initialised KuzuBackend for testing."""
+def storage(tmp_path: Path) -> LadybugBackend:
+    """Provide an initialised LadybugBackend for testing."""
     db_path = tmp_path / "test_db"
-    backend = KuzuBackend()
+    backend = LadybugBackend()
     backend.initialize(db_path)
     yield backend
     backend.close()
@@ -53,7 +53,7 @@ def storage(tmp_path: Path) -> KuzuBackend:
 def _reindex_files_compat(
     changed_paths: list[Path],
     repo_path: Path,
-    storage: KuzuBackend,
+    storage: LadybugBackend,
     gitignore_patterns: list[str] | None = None,
 ) -> int:
     """Compatibility wrapper matching the old _reindex_files interface.
@@ -121,7 +121,7 @@ class TestReindexFiles:
     """reindex_files() correctly removes old nodes and adds new ones."""
 
     def test_reindex_updates_content(
-        self, tmp_repo: Path, storage: KuzuBackend
+        self, tmp_repo: Path, storage: LadybugBackend
     ) -> None:
         # Initial full index.
         run_pipeline(tmp_repo, storage)
@@ -153,7 +153,7 @@ class TestReindexFiles:
         assert "goodbye" in node.content
 
     def test_reindex_handles_new_symbols(
-        self, tmp_repo: Path, storage: KuzuBackend
+        self, tmp_repo: Path, storage: LadybugBackend
     ) -> None:
         # Initial full index.
         run_pipeline(tmp_repo, storage)
@@ -181,7 +181,7 @@ class TestReindexFiles:
         assert storage.get_node("function:src/app.py:world") is not None
 
     def test_reindex_removes_deleted_symbols(
-        self, tmp_repo: Path, storage: KuzuBackend
+        self, tmp_repo: Path, storage: LadybugBackend
     ) -> None:
         # Initial full index.
         run_pipeline(tmp_repo, storage)
@@ -214,7 +214,7 @@ class TestWatcherReindexFiles:
     """Watcher helpers filter and process changed paths."""
 
     def test_reindexes_changed_files(
-        self, tmp_repo: Path, storage: KuzuBackend
+        self, tmp_repo: Path, storage: LadybugBackend
     ) -> None:
         run_pipeline(tmp_repo, storage)
 
@@ -233,7 +233,7 @@ class TestWatcherReindexFiles:
         assert "updated" in node.content
 
     def test_skips_ignored_files(
-        self, tmp_repo: Path, storage: KuzuBackend
+        self, tmp_repo: Path, storage: LadybugBackend
     ) -> None:
         run_pipeline(tmp_repo, storage)
 
@@ -248,7 +248,7 @@ class TestWatcherReindexFiles:
         assert count == 0
 
     def test_skips_unsupported_files(
-        self, tmp_repo: Path, storage: KuzuBackend
+        self, tmp_repo: Path, storage: LadybugBackend
     ) -> None:
         run_pipeline(tmp_repo, storage)
 
@@ -260,7 +260,7 @@ class TestWatcherReindexFiles:
         assert count == 0
 
     def test_handles_deleted_files(
-        self, tmp_repo: Path, storage: KuzuBackend
+        self, tmp_repo: Path, storage: LadybugBackend
     ) -> None:
         run_pipeline(tmp_repo, storage)
 
@@ -276,7 +276,7 @@ class TestWatcherReindexFiles:
         assert count == 0
 
     def test_handles_multiple_files(
-        self, tmp_repo: Path, storage: KuzuBackend
+        self, tmp_repo: Path, storage: LadybugBackend
     ) -> None:
         run_pipeline(tmp_repo, storage)
 

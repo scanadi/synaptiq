@@ -39,11 +39,15 @@ def _print_phase_timing_table(phase_timings: dict, total_seconds: float) -> None
     console.print(table)
 
 
-def _load_storage(repo_path: Path | None = None) -> "KuzuBackend":  # noqa: F821
-    """Load the KuzuDB backend for the given or current repo."""
-    from synaptiq.core.storage.kuzu_backend import KuzuBackend
+def _load_storage(repo_path: Path | None = None) -> "LadybugBackend":  # noqa: F821
+    """Load the LadybugDB backend for the given or current repo."""
+    from synaptiq.core.storage.ladybug_backend import LadybugBackend
 
     target = (repo_path or Path.cwd()).resolve()
+    # The on-disk index path is kept as ``.synaptiq/kuzu`` deliberately: an
+    # index written by the former KuzuDB backend lives there, and reusing the
+    # path lets `synaptiq analyze` (via open_with_recovery) detect the old
+    # format on open and rebuild it in place.
     db_path = target / ".synaptiq" / "kuzu"
     if not db_path.exists():
         console.print(
@@ -51,18 +55,27 @@ def _load_storage(repo_path: Path | None = None) -> "KuzuBackend":  # noqa: F821
         )
         raise typer.Exit(code=1)
 
-    storage = KuzuBackend()
+    storage = LadybugBackend()
     try:
         storage.initialize(db_path, read_only=True)
     except RuntimeError as exc:
-        if "lock on file" in str(exc).lower():
+        msg = str(exc).lower()
+        if "lock on file" in msg or "lock is held" in msg:
             console.print(
                 "[red]Error:[/red] The database is locked by a running "
                 "`synaptiq serve` instance and it could not be reached "
                 "over its socket. Stop the server or retry."
             )
             raise typer.Exit(code=1) from exc
-        raise
+        # A stale index from the former KuzuDB backend (single-file LadybugDB
+        # rejects the old directory format) or a corrupt file can't be read
+        # read-only — point the user at a rebuild instead of dumping a traceback.
+        console.print(
+            "[red]Error:[/red] The index at "
+            f"{target} could not be opened (it may be from an older synaptiq "
+            "version or corrupt). Run 'synaptiq analyze' to rebuild it."
+        )
+        raise typer.Exit(code=1) from exc
     return storage
 
 
@@ -96,14 +109,14 @@ def _call_tool_via_server(socket_path: str, tool: str, arguments: dict) -> str:
 def _run_read_tool(tool: str, arguments: dict) -> str:
     """Run a read-only tool locally, or via a running server's socket.
 
-    While ``synaptiq serve --watch`` holds the database read-write, Kuzu
+    While ``synaptiq serve --watch`` holds the database read-write, LadybugDB
     refuses read-only opens from other processes — so CLI reads must go
     through the server instead of opening the database directly.
 
     Error routing matters here: only ConnectionError means the server is
     actually unreachable (fall back to direct access).  A RuntimeError is
     the server *responding* with an error, and a TimeoutError means it is
-    up but slow — in both cases falling back would just hit Kuzu's file
+    up but slow — in both cases falling back would just hit LadybugDB's file
     lock and mask the real cause.
     """
     from synaptiq.mcp.token_budget import strip_metadata
@@ -190,13 +203,13 @@ def analyze(
         "--jobs",
         "-j",
         help=(
-            "Cap Kuzu threads, ONNX embedding threads, and the walk/parse worker "
-            "pools to N. N=0 means explicit all-cores (restores uncapped "
-            "Kuzu/embedding threads, overriding SYNAPTIQ_* env vars too). Omitted "
-            "(default): SYNAPTIQ_KUZU_THREADS / SYNAPTIQ_KUZU_MEMORY_MB / "
+            "Cap LadybugDB threads, ONNX embedding threads, and the walk/parse "
+            "worker pools to N. N=0 means explicit all-cores (restores uncapped "
+            "engine/embedding threads, overriding SYNAPTIQ_* env vars too). Omitted "
+            "(default): SYNAPTIQ_DB_THREADS / SYNAPTIQ_DB_MEMORY_MB / "
             "SYNAPTIQ_EMBED_THREADS apply if set, else embedding threads default "
             "to a polite max(2, cores - 2) so a foreground index leaves the "
-            "machine usable (Kuzu threads and worker pools keep their library "
+            "machine usable (engine threads and worker pools keep their library "
             "defaults). Precedence: --jobs > env vars > profile defaults."
         ),
     ),
@@ -205,7 +218,7 @@ def analyze(
     from synaptiq.core.daemon.lock import LockManager
     from synaptiq.core.ingestion.pipeline import PipelineResult, run_pipeline
     from synaptiq.core.resources import set_jobs
-    from synaptiq.core.storage.kuzu_backend import open_with_recovery
+    from synaptiq.core.storage.ladybug_backend import open_with_recovery
 
     repo_path = path.resolve()
     if not repo_path.is_dir():
@@ -248,8 +261,15 @@ def analyze(
     try:
         console.print(f"[bold]Indexing[/bold] {repo_path}")
 
+        # Path kept as ``kuzu`` so an index from the former KuzuDB backend is
+        # detected on open and rebuilt in place (see open_with_recovery).
         db_path = data_dir / "kuzu"
-        storage = open_with_recovery(db_path, data_dir / "meta.json")
+        # build_fts_indexes=False: bulk_load builds FTS over the populated
+        # tables and swaps the fresh database in, so building empty FTS indexes
+        # on this initial open would be pure waste (~2s on LadybugDB).
+        storage = open_with_recovery(
+            db_path, data_dir / "meta.json", build_fts_indexes=False
+        )
 
         result: PipelineResult | None = None
         with Progress(
@@ -616,12 +636,15 @@ def serve(
 
 
 def _init_storage_with_index(repo_path: Path, data_dir: Path, *, output=console):
-    """Initialise KuzuDB and run the first index if no meta.json exists."""
+    """Initialise LadybugDB and run the first index if no meta.json exists."""
     from synaptiq.core.ingestion.pipeline import run_pipeline
-    from synaptiq.core.storage.kuzu_backend import open_with_recovery
+    from synaptiq.core.storage.ladybug_backend import open_with_recovery
 
-    kuzu_path = data_dir / "kuzu"
-    storage = open_with_recovery(kuzu_path, data_dir / "meta.json")
+    # Path kept as ``kuzu`` for back-compat (see open_with_recovery). Unlike the
+    # analyze path this keeps the default FTS build: the server may open an
+    # already-indexed database here and must serve full-text queries immediately.
+    db_path = data_dir / "kuzu"
+    storage = open_with_recovery(db_path, data_dir / "meta.json")
 
     if not (data_dir / "meta.json").exists():
         import time as _time
@@ -754,7 +777,7 @@ def _report_watch_death(task) -> None:
 
 # The MCP SDK's server.run() can outlive its session: it neither returns on
 # stdin EOF nor honours task cancellation, so a serve process would otherwise
-# wedge forever while holding the kuzu lock.  Two defenses:
+# wedge forever while holding the database lock.  Two defenses:
 #   - a stdin sentinel that turns pipe hangup into the stop event, and
 #   - a watchdog that force-exits after a bounded grace once stop fires,
 #     running the cleanup callback (lock release) first.

@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from synaptiq.core.ingestion.pipeline import PipelineResult, run_pipeline
-from synaptiq.core.storage.kuzu_backend import KuzuBackend
+from synaptiq.core.storage.ladybug_backend import LadybugBackend
 from synaptiq.mcp.tools import handle_context, handle_dead_code, handle_impact, handle_query
 
 # ---------------------------------------------------------------------------
@@ -108,10 +108,10 @@ def sample_repo(tmp_path: Path) -> Path:
 
 
 @pytest.fixture()
-def storage(tmp_path: Path) -> KuzuBackend:
-    """Provide an initialised KuzuBackend."""
+def storage(tmp_path: Path) -> LadybugBackend:
+    """Provide an initialised LadybugBackend."""
     db_path = tmp_path / "e2e_db"
-    backend = KuzuBackend()
+    backend = LadybugBackend()
     backend.initialize(db_path)
     yield backend
     backend.close()
@@ -119,7 +119,7 @@ def storage(tmp_path: Path) -> KuzuBackend:
 
 @pytest.fixture()
 def pipeline_result(
-    sample_repo: Path, storage: KuzuBackend
+    sample_repo: Path, storage: LadybugBackend
 ) -> PipelineResult:
     """Run the full pipeline once and return the result."""
     _, result = run_pipeline(sample_repo, storage)
@@ -166,7 +166,7 @@ class TestRelationshipTypes:
         assert pipeline_result.relationships > 0
 
     def test_contains_and_defines(
-        self, sample_repo: Path, storage: KuzuBackend, pipeline_result: PipelineResult
+        self, sample_repo: Path, storage: LadybugBackend, pipeline_result: PipelineResult
     ) -> None:
         # CONTAINS: folder -> file
         rows = storage.execute_raw(
@@ -177,7 +177,7 @@ class TestRelationshipTypes:
         assert rows[0][0] > 0
 
     def test_defines_exist(
-        self, sample_repo: Path, storage: KuzuBackend, pipeline_result: PipelineResult
+        self, sample_repo: Path, storage: LadybugBackend, pipeline_result: PipelineResult
     ) -> None:
         rows = storage.execute_raw(
             "MATCH ()-[r:CodeRelation]->() "
@@ -187,7 +187,7 @@ class TestRelationshipTypes:
         assert rows[0][0] > 0
 
     def test_imports_exist(
-        self, sample_repo: Path, storage: KuzuBackend, pipeline_result: PipelineResult
+        self, sample_repo: Path, storage: LadybugBackend, pipeline_result: PipelineResult
     ) -> None:
         rows = storage.execute_raw(
             "MATCH ()-[r:CodeRelation]->() "
@@ -197,7 +197,7 @@ class TestRelationshipTypes:
         assert rows[0][0] > 0
 
     def test_calls_exist(
-        self, sample_repo: Path, storage: KuzuBackend, pipeline_result: PipelineResult
+        self, sample_repo: Path, storage: LadybugBackend, pipeline_result: PipelineResult
     ) -> None:
         rows = storage.execute_raw(
             "MATCH ()-[r:CodeRelation]->() "
@@ -219,7 +219,7 @@ class TestDeadCode:
         assert pipeline_result.dead_code >= 1
 
     def test_orphan_flagged(
-        self, sample_repo: Path, storage: KuzuBackend, pipeline_result: PipelineResult
+        self, sample_repo: Path, storage: LadybugBackend, pipeline_result: PipelineResult
     ) -> None:
         node = storage.get_node("function:src/unused.py:orphan_func")
         assert node is not None
@@ -235,7 +235,7 @@ class TestFTSSearch:
     """Full-text search returns results for known symbols."""
 
     def test_search_validate(
-        self, sample_repo: Path, storage: KuzuBackend, pipeline_result: PipelineResult
+        self, sample_repo: Path, storage: LadybugBackend, pipeline_result: PipelineResult
     ) -> None:
         results = storage.fts_search("validate", limit=5)
         assert len(results) > 0
@@ -243,7 +243,7 @@ class TestFTSSearch:
         assert "validate" in names
 
     def test_search_handler(
-        self, sample_repo: Path, storage: KuzuBackend, pipeline_result: PipelineResult
+        self, sample_repo: Path, storage: LadybugBackend, pipeline_result: PipelineResult
     ) -> None:
         results = storage.fts_search("handler", limit=5)
         assert len(results) > 0
@@ -260,7 +260,7 @@ class TestMCPContext:
     """handle_context returns caller/callee information."""
 
     def test_context_validate(
-        self, sample_repo: Path, storage: KuzuBackend, pipeline_result: PipelineResult
+        self, sample_repo: Path, storage: LadybugBackend, pipeline_result: PipelineResult
     ) -> None:
         result = handle_context(storage, "validate")
 
@@ -269,7 +269,7 @@ class TestMCPContext:
         assert "check" in result.lower()
 
     def test_context_check(
-        self, sample_repo: Path, storage: KuzuBackend, pipeline_result: PipelineResult
+        self, sample_repo: Path, storage: LadybugBackend, pipeline_result: PipelineResult
     ) -> None:
         result = handle_context(storage, "check")
 
@@ -285,7 +285,7 @@ class TestMCPImpact:
     """handle_impact returns upstream callers."""
 
     def test_impact_verify(
-        self, sample_repo: Path, storage: KuzuBackend, pipeline_result: PipelineResult
+        self, sample_repo: Path, storage: LadybugBackend, pipeline_result: PipelineResult
     ) -> None:
         result = handle_impact(storage, "verify")
 
@@ -303,7 +303,7 @@ class TestMCPQuery:
     """handle_query returns search results."""
 
     def test_query_user(
-        self, sample_repo: Path, storage: KuzuBackend, pipeline_result: PipelineResult
+        self, sample_repo: Path, storage: LadybugBackend, pipeline_result: PipelineResult
     ) -> None:
         result = handle_query(storage, "User")
         assert "User" in result
@@ -318,7 +318,7 @@ class TestMCPDeadCode:
     """handle_dead_code lists the dead code symbols."""
 
     def test_dead_code_tool(
-        self, sample_repo: Path, storage: KuzuBackend, pipeline_result: PipelineResult
+        self, sample_repo: Path, storage: LadybugBackend, pipeline_result: PipelineResult
     ) -> None:
         result = handle_dead_code(storage)
         assert "orphan_func" in result
@@ -333,7 +333,7 @@ class TestIdempotency:
     """Running the pipeline twice produces the same stats."""
 
     def test_idempotent(
-        self, sample_repo: Path, storage: KuzuBackend
+        self, sample_repo: Path, storage: LadybugBackend
     ) -> None:
         _, result1 = run_pipeline(sample_repo, storage)
         _, result2 = run_pipeline(sample_repo, storage)

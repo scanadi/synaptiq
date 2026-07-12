@@ -1,4 +1,4 @@
-"""Tests for the KuzuDB storage backend."""
+"""Tests for the LadybugDB storage backend."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from synaptiq.core.graph.model import (
     RelType,
     generate_id,
 )
-from synaptiq.core.storage.kuzu_backend import KuzuBackend
+from synaptiq.core.storage.ladybug_backend import LadybugBackend
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -22,10 +22,10 @@ from synaptiq.core.storage.kuzu_backend import KuzuBackend
 
 
 @pytest.fixture()
-def backend(tmp_path: Path) -> KuzuBackend:
-    """Return a KuzuBackend initialised in a temporary directory."""
+def backend(tmp_path: Path) -> LadybugBackend:
+    """Return a LadybugBackend initialised in a temporary directory."""
     db_path = tmp_path / "test_db"
-    b = KuzuBackend()
+    b = LadybugBackend()
     b.initialize(db_path)
     yield b
     b.close()
@@ -83,13 +83,13 @@ def _build_small_graph() -> KnowledgeGraph:
 
 
 class TestInitializeAndClose:
-    def test_initialize_creates_db(self, backend: KuzuBackend) -> None:
+    def test_initialize_creates_db(self, backend: LadybugBackend) -> None:
         """After initialize, internal handles should be set."""
         assert backend._db is not None
         assert backend._conn is not None
 
     def test_close_releases_handles(self, tmp_path: Path) -> None:
-        b = KuzuBackend()
+        b = LadybugBackend()
         b.initialize(tmp_path / "close_test")
         b.close()
         assert b._db is None
@@ -102,7 +102,7 @@ class TestInitializeAndClose:
 
 
 class TestBulkLoad:
-    def test_bulk_load_inserts_nodes_and_relationships(self, backend: KuzuBackend) -> None:
+    def test_bulk_load_inserts_nodes_and_relationships(self, backend: LadybugBackend) -> None:
         graph = _build_small_graph()
         backend.bulk_load(graph)
 
@@ -118,7 +118,7 @@ class TestBulkLoad:
         assert callee is not None
         assert callee.name == "callee"
 
-    def test_bulk_load_replaces_existing(self, backend: KuzuBackend) -> None:
+    def test_bulk_load_replaces_existing(self, backend: LadybugBackend) -> None:
         """Calling bulk_load twice should not duplicate data."""
         graph = _build_small_graph()
         backend.bulk_load(graph)
@@ -134,7 +134,7 @@ class TestBulkLoad:
 
 
 class TestGetNode:
-    def test_returns_correct_node(self, backend: KuzuBackend) -> None:
+    def test_returns_correct_node(self, backend: LadybugBackend) -> None:
         node = _make_node(name="target_func", file_path="src/x.py")
         backend.add_nodes([node])
 
@@ -145,15 +145,15 @@ class TestGetNode:
         assert result.file_path == "src/x.py"
         assert result.label == NodeLabel.FUNCTION
 
-    def test_returns_none_for_missing(self, backend: KuzuBackend) -> None:
+    def test_returns_none_for_missing(self, backend: LadybugBackend) -> None:
         result = backend.get_node("function:nonexistent.py:ghost")
         assert result is None
 
-    def test_returns_none_for_unknown_label(self, backend: KuzuBackend) -> None:
+    def test_returns_none_for_unknown_label(self, backend: LadybugBackend) -> None:
         result = backend.get_node("unknown_label:foo:bar")
         assert result is None
 
-    def test_preserves_boolean_fields(self, backend: KuzuBackend) -> None:
+    def test_preserves_boolean_fields(self, backend: LadybugBackend) -> None:
         node = GraphNode(
             id=generate_id(NodeLabel.FUNCTION, "src/b.py", "entry"),
             label=NodeLabel.FUNCTION,
@@ -177,7 +177,7 @@ class TestGetNode:
 
 
 class TestModuleAndMixesIn:
-    def test_module_node_round_trips(self, backend: KuzuBackend) -> None:
+    def test_module_node_round_trips(self, backend: LadybugBackend) -> None:
         """A MODULE node persists to the auto-derived Module table."""
         node = _make_node(
             label=NodeLabel.MODULE,
@@ -194,7 +194,7 @@ class TestModuleAndMixesIn:
         rows = backend.execute_raw("MATCH (n:Module) RETURN n.name")
         assert rows == [["Greetable"]]
 
-    def test_mixes_in_relationship_round_trips(self, backend: KuzuBackend) -> None:
+    def test_mixes_in_relationship_round_trips(self, backend: LadybugBackend) -> None:
         """A MIXES_IN edge from a class to a module persists in the REL TABLE GROUP."""
         klass = _make_node(
             label=NodeLabel.CLASS,
@@ -222,7 +222,7 @@ class TestModuleAndMixesIn:
 
 
 class TestCallersAndCallees:
-    def test_get_callers(self, backend: KuzuBackend) -> None:
+    def test_get_callers(self, backend: LadybugBackend) -> None:
         graph = _build_small_graph()
         backend.bulk_load(graph)
 
@@ -232,7 +232,7 @@ class TestCallersAndCallees:
         assert len(callers) == 1
         assert callers[0].name == "caller"
 
-    def test_get_callees(self, backend: KuzuBackend) -> None:
+    def test_get_callees(self, backend: LadybugBackend) -> None:
         graph = _build_small_graph()
         backend.bulk_load(graph)
 
@@ -242,7 +242,7 @@ class TestCallersAndCallees:
         assert len(callees) == 1
         assert callees[0].name == "callee"
 
-    def test_get_callers_empty(self, backend: KuzuBackend) -> None:
+    def test_get_callers_empty(self, backend: LadybugBackend) -> None:
         graph = _build_small_graph()
         backend.bulk_load(graph)
 
@@ -251,7 +251,7 @@ class TestCallersAndCallees:
         callers = backend.get_callers(caller_id)
         assert callers == []
 
-    def test_get_callees_empty(self, backend: KuzuBackend) -> None:
+    def test_get_callees_empty(self, backend: LadybugBackend) -> None:
         graph = _build_small_graph()
         backend.bulk_load(graph)
 
@@ -267,14 +267,14 @@ class TestCallersAndCallees:
 
 
 class TestExecuteRaw:
-    def test_simple_cypher(self, backend: KuzuBackend) -> None:
+    def test_simple_cypher(self, backend: LadybugBackend) -> None:
         backend.add_nodes([_make_node(name="raw_test")])
 
         rows = backend.execute_raw("MATCH (n:Function) RETURN n.name")
         assert len(rows) == 1
         assert rows[0][0] == "raw_test"
 
-    def test_return_expression(self, backend: KuzuBackend) -> None:
+    def test_return_expression(self, backend: LadybugBackend) -> None:
         rows = backend.execute_raw("RETURN 1 + 2 AS result")
         assert rows == [[3]]
 
@@ -285,11 +285,11 @@ class TestExecuteRaw:
 
 
 class TestGetIndexedFiles:
-    def test_returns_empty_initially(self, backend: KuzuBackend) -> None:
+    def test_returns_empty_initially(self, backend: LadybugBackend) -> None:
         result = backend.get_indexed_files()
         assert result == {}
 
-    def test_returns_files_after_insert(self, backend: KuzuBackend) -> None:
+    def test_returns_files_after_insert(self, backend: LadybugBackend) -> None:
         file_node = _make_node(
             label=NodeLabel.FILE,
             file_path="src/main.py",
@@ -313,7 +313,7 @@ class TestGetIndexedFiles:
 
 
 class TestRemoveNodesByFile:
-    def test_removes_matching_nodes(self, backend: KuzuBackend) -> None:
+    def test_removes_matching_nodes(self, backend: LadybugBackend) -> None:
         n1 = _make_node(name="f1", file_path="src/a.py")
         n2 = _make_node(name="f2", file_path="src/a.py")
         n3 = _make_node(name="f3", file_path="src/b.py")
@@ -325,7 +325,7 @@ class TestRemoveNodesByFile:
         assert backend.get_node(n2.id) is None
         assert backend.get_node(n3.id) is not None
 
-    def test_returns_zero_for_no_match(self, backend: KuzuBackend) -> None:
+    def test_returns_zero_for_no_match(self, backend: LadybugBackend) -> None:
         result = backend.remove_nodes_by_file("nonexistent.py")
         assert result == 0
 
@@ -336,7 +336,7 @@ class TestRemoveNodesByFile:
 
 
 class TestTraverse:
-    def test_traverse_one_hop(self, backend: KuzuBackend) -> None:
+    def test_traverse_one_hop(self, backend: LadybugBackend) -> None:
         graph = _build_small_graph()
         backend.bulk_load(graph)
 
@@ -346,7 +346,7 @@ class TestTraverse:
         assert len(nodes) == 1
         assert nodes[0].name == "callee"
 
-    def test_traverse_zero_depth(self, backend: KuzuBackend) -> None:
+    def test_traverse_zero_depth(self, backend: LadybugBackend) -> None:
         graph = _build_small_graph()
         backend.bulk_load(graph)
 
@@ -361,7 +361,7 @@ class TestTraverse:
 
 
 class TestMultipleLabels:
-    def test_class_and_function(self, backend: KuzuBackend) -> None:
+    def test_class_and_function(self, backend: LadybugBackend) -> None:
         fn = _make_node(label=NodeLabel.FUNCTION, name="my_fn", file_path="src/c.py")
         cls = _make_node(label=NodeLabel.CLASS, name="MyClass", file_path="src/c.py")
         backend.add_nodes([fn, cls])
@@ -379,13 +379,13 @@ class TestRecoveryAndRebuildSafety:
         """Sibling WAL/shadow files must die with the database file.
 
         A stale WAL left beside a recreated database gets replayed into
-        the fresh file by kuzu and corrupts it (unordered_map::at).
+        the fresh file by the engine and corrupts it (unordered_map::at).
         """
         db = tmp_path / "kuzu.rebuild"
         for p in (db, Path(str(db) + ".wal"), Path(str(db) + ".shadow")):
             p.write_bytes(b"x")
 
-        KuzuBackend._remove_db_files(db)
+        LadybugBackend._remove_db_files(db)
 
         assert not db.exists()
         assert not Path(str(db) + ".wal").exists()
@@ -395,22 +395,24 @@ class TestRecoveryAndRebuildSafety:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """IndexError('unordered_map::at...') triggers recovery, not a crash."""
-        from synaptiq.core.storage.kuzu_backend import open_with_recovery
+        from synaptiq.core.storage.ladybug_backend import open_with_recovery
 
         db = tmp_path / "kuzu"
         stale_wal = tmp_path / "kuzu.wal"
         stale_wal.write_bytes(b"stale")
 
         calls = {"n": 0}
-        real_init = KuzuBackend.initialize
+        real_init = LadybugBackend.initialize
 
-        def flaky_init(self, path, *, read_only=False):
+        def flaky_init(self, path, *, read_only=False, _build_fts_indexes=True):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise IndexError("unordered_map::at: key not found")
-            return real_init(self, path, read_only=read_only)
+            return real_init(
+                self, path, read_only=read_only, _build_fts_indexes=_build_fts_indexes
+            )
 
-        monkeypatch.setattr(KuzuBackend, "initialize", flaky_init)
+        monkeypatch.setattr(LadybugBackend, "initialize", flaky_init)
 
         storage = open_with_recovery(db, tmp_path / "meta.json")
         try:
@@ -424,7 +426,7 @@ class TestRecoveryAndRebuildSafety:
         from synaptiq.core.graph.model import GraphNode, NodeLabel
 
         db = tmp_path / "kuzu"
-        backend = KuzuBackend()
+        backend = LadybugBackend()
         backend.initialize(db)
         node = GraphNode(
             id="function:src/a.py:keep_me",
@@ -443,17 +445,17 @@ class TestRecoveryAndRebuildSafety:
 
         # Patch the loader dispatcher so the failure is injected regardless of
         # which COPY path (Arrow or CSV) bulk_load selects.
-        original = KuzuBackend._bulk_load_nodes
+        original = LadybugBackend._bulk_load_nodes
 
         def exploding(self, graph):
             raise BoomError("simulated mid-rebuild failure")
 
-        KuzuBackend._bulk_load_nodes = exploding
+        LadybugBackend._bulk_load_nodes = exploding
         try:
             with pytest.raises(BoomError):
                 backend.bulk_load(KnowledgeGraph())
         finally:
-            KuzuBackend._bulk_load_nodes = original
+            LadybugBackend._bulk_load_nodes = original
 
         # Old data still served; no .rebuild leftovers.
         assert backend.get_node(node.id) is not None
@@ -464,8 +466,8 @@ class TestRecoveryAndRebuildSafety:
 class TestBulkLoadCopyPath:
     """Regression tests: CSV COPY must handle source code with embedded newlines.
 
-    Kuzu's parallel CSV reader rejects quoted newlines, so COPY of real code
-    used to fail silently and fall back to ~50x slower row-by-row inserts.
+    LadybugDB's parallel CSV reader rejects quoted newlines, so COPY of real
+    code used to fail silently and fall back to ~50x slower row-by-row inserts.
     PARALLEL=false in ``_csv_copy`` keeps bulk_load on the fast path.
     """
 
@@ -481,13 +483,13 @@ class TestBulkLoadCopyPath:
             language="typescript",
         )
 
-    def test_node_copy_used_for_content_with_newlines(self, backend: KuzuBackend) -> None:
+    def test_node_copy_used_for_content_with_newlines(self, backend: LadybugBackend) -> None:
         """_bulk_load_nodes_csv stays on the fast COPY path (returns True)."""
         g = KnowledgeGraph()
         g.add_node(self._gnarly_node())
         assert backend._bulk_load_nodes_csv(g) is True
 
-    def test_rel_copy_used_for_content_with_newlines(self, backend: KuzuBackend) -> None:
+    def test_rel_copy_used_for_content_with_newlines(self, backend: LadybugBackend) -> None:
         """Relationship COPY succeeds once nodes are present (no fallback)."""
         g = KnowledgeGraph()
         a = self._gnarly_node()
@@ -511,7 +513,7 @@ class TestBulkLoadCopyPath:
         backend.add_nodes(list(g.iter_nodes()))
         assert backend._bulk_load_rels_csv(g) is True
 
-    def test_bulk_load_roundtrips_content_with_newlines(self, backend: KuzuBackend) -> None:
+    def test_bulk_load_roundtrips_content_with_newlines(self, backend: LadybugBackend) -> None:
         """End-to-end: gnarly multi-line content survives bulk_load intact."""
         node = self._gnarly_node()
         g = KnowledgeGraph()
@@ -528,7 +530,7 @@ class TestBulkLoadCopyPath:
 
 
 class _ConnSpy:
-    """Transparent proxy over a kuzu Connection that logs string queries.
+    """Transparent proxy over a ladybug Connection that logs string queries.
 
     Lets tests observe transaction control statements (BEGIN/COMMIT/ROLLBACK)
     while forwarding everything — including prepared-statement execution — to
@@ -556,7 +558,7 @@ class TestTransactionalBatchInserts:
     statements, and roll back atomically on failure."""
 
     def test_batch_inserts_nodes_and_rels_with_properties_intact(
-        self, backend: KuzuBackend
+        self, backend: LadybugBackend
     ) -> None:
         fn = _make_node(label=NodeLabel.FUNCTION, name="caller", file_path="src/m.py")
         cls = _make_node(label=NodeLabel.CLASS, name="Widget", file_path="src/m.py")
@@ -593,7 +595,7 @@ class TestTransactionalBatchInserts:
         )
         assert [row[0] for row in rows] == ["calls", "contains"]
 
-    def test_prepared_statements_cached_per_label_and_pair(self, backend: KuzuBackend) -> None:
+    def test_prepared_statements_cached_per_label_and_pair(self, backend: LadybugBackend) -> None:
         fn = _make_node(label=NodeLabel.FUNCTION, name="f", file_path="src/p.py")
         cls = _make_node(label=NodeLabel.CLASS, name="C", file_path="src/p.py")
         meth = GraphNode(
@@ -622,7 +624,7 @@ class TestTransactionalBatchInserts:
         backend.add_nodes([_make_node(label=NodeLabel.FUNCTION, name="g", file_path="src/p.py")])
         assert backend._prepared["node:Function"] is cached
 
-    def test_node_batch_runs_in_a_single_transaction(self, backend: KuzuBackend) -> None:
+    def test_node_batch_runs_in_a_single_transaction(self, backend: LadybugBackend) -> None:
         spy = _ConnSpy(backend._conn)
         backend._conn = spy  # type: ignore[assignment]
 
@@ -639,7 +641,7 @@ class TestTransactionalBatchInserts:
         assert "ROLLBACK" not in spy.log
 
     def test_failed_node_batch_rolls_back_atomically(
-        self, backend: KuzuBackend, monkeypatch: pytest.MonkeyPatch
+        self, backend: LadybugBackend, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         seed = _make_node(name="seed", file_path="src/a.py")
         backend.add_nodes([seed])
@@ -673,7 +675,7 @@ class TestTransactionalBatchInserts:
         backend.add_nodes([_make_node(name="later", file_path="src/a.py")])
         assert backend.execute_raw("MATCH (n:Function) RETURN count(n)")[0][0] == before + 1
 
-    def test_reinserting_existing_node_upserts_idempotently(self, backend: KuzuBackend) -> None:
+    def test_reinserting_existing_node_upserts_idempotently(self, backend: LadybugBackend) -> None:
         # Mirrors the incremental re-index path: a persistent structural node
         # (e.g. an ancestor Folder) is re-inserted on every rebuild and must
         # upsert via MERGE, not raise a duplicate-primary-key error.
@@ -694,7 +696,7 @@ class TestTransactionalBatchInserts:
         assert count == 1
 
     def test_failed_relationship_batch_rolls_back_atomically(
-        self, backend: KuzuBackend, monkeypatch: pytest.MonkeyPatch
+        self, backend: LadybugBackend, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         a = _make_node(name="A", file_path="src/r.py")
         b = _make_node(name="B", file_path="src/r.py")
@@ -728,7 +730,7 @@ class TestTransactionalBatchInserts:
         total = backend.execute_raw("MATCH ()-[r:CodeRelation]->() RETURN count(r)")[0][0]
         assert total == 1
 
-    def test_empty_batches_open_no_transaction(self, backend: KuzuBackend) -> None:
+    def test_empty_batches_open_no_transaction(self, backend: LadybugBackend) -> None:
         spy = _ConnSpy(backend._conn)
         backend._conn = spy  # type: ignore[assignment]
 
@@ -743,7 +745,7 @@ class TestTransactionalBatchInserts:
         assert spy.log.count("COMMIT") == 1
 
     def test_prepared_cache_cleared_on_close(self, tmp_path: Path) -> None:
-        b = KuzuBackend()
+        b = LadybugBackend()
         b.initialize(tmp_path / "cache_db")
         b.add_nodes([_make_node(name="x", file_path="src/x.py")])
         assert b._prepared  # populated
@@ -886,7 +888,7 @@ def _rich_graph() -> KnowledgeGraph:
 class TestArrowCsvEquivalence:
     """The Arrow and CSV bulk paths must produce byte-identical databases."""
 
-    def _load(self, backend: KuzuBackend, graph: KnowledgeGraph, *, arrow: bool) -> None:
+    def _load(self, backend: LadybugBackend, graph: KnowledgeGraph, *, arrow: bool) -> None:
         if arrow:
             assert backend._bulk_load_nodes_arrow(graph) is True
             assert backend._bulk_load_rels_arrow(graph) is True
@@ -894,12 +896,12 @@ class TestArrowCsvEquivalence:
             assert backend._bulk_load_nodes_csv(graph) is True
             assert backend._bulk_load_rels_csv(graph) is True
 
-    def _dump_nodes(self, backend: KuzuBackend, table: str) -> list[list[object]]:
-        from synaptiq.core.storage.kuzu_backend import _node_columns
+    def _dump_nodes(self, backend: LadybugBackend, table: str) -> list[list[object]]:
+        from synaptiq.core.storage.ladybug_backend import _node_columns
 
         return backend.execute_raw(f"MATCH (n:{table}) RETURN {_node_columns('n')} ORDER BY n.id")
 
-    def _dump_rels(self, backend: KuzuBackend) -> list[list[object]]:
+    def _dump_rels(self, backend: LadybugBackend) -> list[list[object]]:
         return backend.execute_raw(
             "MATCH (a)-[r:CodeRelation]->(b) "
             "RETURN a.id, b.id, r.rel_type, r.confidence, r.role, r.step_number, "
@@ -909,13 +911,13 @@ class TestArrowCsvEquivalence:
 
     def test_nodes_and_rels_identical(self, tmp_path: Path) -> None:
         pytest.importorskip("pyarrow")
-        from synaptiq.core.storage.kuzu_backend import _NODE_TABLE_NAMES
+        from synaptiq.core.storage.ladybug_backend import _NODE_TABLE_NAMES
 
         graph = _rich_graph()
 
-        arrow_be = KuzuBackend()
+        arrow_be = LadybugBackend()
         arrow_be.initialize(tmp_path / "arrow_db")
-        csv_be = KuzuBackend()
+        csv_be = LadybugBackend()
         csv_be.initialize(tmp_path / "csv_db")
         try:
             self._load(arrow_be, graph, arrow=True)
@@ -952,9 +954,9 @@ class TestArrowCsvEquivalence:
             for i in range(5)
         ]
 
-        arrow_be = KuzuBackend()
+        arrow_be = LadybugBackend()
         arrow_be.initialize(tmp_path / "arrow_emb")
-        csv_be = KuzuBackend()
+        csv_be = LadybugBackend()
         csv_be.initialize(tmp_path / "csv_emb")
         try:
             assert arrow_be._bulk_store_embeddings_arrow(embs) is True
@@ -975,11 +977,11 @@ class TestArrowBulkPath:
 
     def test_dispatch_prefers_arrow_when_available(self) -> None:
         pytest.importorskip("pyarrow")
-        import synaptiq.core.storage.kuzu_backend as kb
+        import synaptiq.core.storage.ladybug_backend as kb
 
         assert kb._HAS_PYARROW is True
 
-    def test_bulk_load_roundtrips_gnarly_content(self, backend: KuzuBackend) -> None:
+    def test_bulk_load_roundtrips_gnarly_content(self, backend: LadybugBackend) -> None:
         graph = _rich_graph()
         backend.bulk_load(graph)
         stored = backend.get_node("function:src/a.py:café")
@@ -999,20 +1001,20 @@ class TestCsvFallbackWithoutPyarrow:
     def test_bulk_load_uses_csv_when_pyarrow_absent(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import synaptiq.core.storage.kuzu_backend as kb
+        import synaptiq.core.storage.ladybug_backend as kb
 
         monkeypatch.setattr(kb, "_HAS_PYARROW", False)
 
         called: dict[str, bool] = {}
-        orig_csv = KuzuBackend._bulk_load_nodes_csv
+        orig_csv = LadybugBackend._bulk_load_nodes_csv
 
         def spy(self, graph):
             called["csv"] = True
             return orig_csv(self, graph)
 
-        monkeypatch.setattr(KuzuBackend, "_bulk_load_nodes_csv", spy)
+        monkeypatch.setattr(LadybugBackend, "_bulk_load_nodes_csv", spy)
 
-        backend = KuzuBackend()
+        backend = LadybugBackend()
         backend.initialize(tmp_path / "csv_only_db")
         try:
             backend.bulk_load(_rich_graph())
@@ -1045,15 +1047,15 @@ class TestBulkLoadSkipsEmptyFtsBuild:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         seen_flags: list[bool] = []
-        orig = KuzuBackend._create_schema
+        orig = LadybugBackend._create_schema
 
         def spy(self, *, build_fts: bool = True):
             seen_flags.append(build_fts)
             return orig(self, build_fts=build_fts)
 
-        monkeypatch.setattr(KuzuBackend, "_create_schema", spy)
+        monkeypatch.setattr(LadybugBackend, "_create_schema", spy)
 
-        backend = KuzuBackend()
+        backend = LadybugBackend()
         backend.initialize(tmp_path / "fts_db")
         try:
             backend.bulk_load(self._searchable())
@@ -1067,7 +1069,7 @@ class TestBulkLoadSkipsEmptyFtsBuild:
 
     def test_fts_search_tolerates_missing_indexes(self, tmp_path: Path) -> None:
         # A DB whose FTS indexes were never built must not crash on search.
-        backend = KuzuBackend()
+        backend = LadybugBackend()
         backend.initialize(tmp_path / "nofts_db", _build_fts_indexes=False)
         try:
             backend.add_nodes(

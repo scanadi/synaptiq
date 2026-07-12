@@ -2,7 +2,7 @@
 
 Registers twenty tools and three resources that give AI agents and MCP clients
 access to the Synaptiq knowledge graph.  The server lazily initialises a
-:class:`KuzuBackend` from the ``.synaptiq/kuzu`` directory in the current
+:class:`LadybugBackend` from the ``.synaptiq/kuzu`` index in the current
 working directory.
 
 Concurrency
@@ -33,7 +33,7 @@ from mcp.types import Resource, TextContent, Tool
 from synaptiq.core.daemon.rwlock import AsyncRWLock
 from synaptiq.core.daemon.socket_client import PrimaryPromotedError
 from synaptiq.core.daemon.socket_server import DISPATCH_TIMEOUT
-from synaptiq.core.storage.kuzu_backend import KuzuBackend
+from synaptiq.core.storage.ladybug_backend import LadybugBackend
 from synaptiq.mcp.resources import get_dead_code_list, get_overview, get_schema
 
 if TYPE_CHECKING:
@@ -68,7 +68,7 @@ logger = logging.getLogger(__name__)
 
 server = Server("synaptiq")
 
-_storage: KuzuBackend | None = None
+_storage: LadybugBackend | None = None
 _rwlock: AsyncRWLock | None = None
 _proxy_client: "SocketClient | None" = None
 
@@ -79,7 +79,7 @@ def set_proxy_client(client: "SocketClient | None") -> None:
     _proxy_client = client
 
 
-def set_storage(storage: KuzuBackend) -> None:
+def set_storage(storage: LadybugBackend) -> None:
     """Inject a pre-initialised storage backend (e.g. from ``synaptiq serve --watch``)."""
     global _storage  # noqa: PLW0603
     _storage = storage
@@ -100,19 +100,20 @@ async def _dispatch_under_read_lock(fn: object, *args: object) -> str:
     return await asyncio.wait_for(coro, timeout=DISPATCH_TIMEOUT)
 
 
-def _get_storage() -> KuzuBackend:
-    """Lazily initialise and return the KuzuDB storage backend.
+def _get_storage() -> LadybugBackend:
+    """Lazily initialise and return the LadybugDB storage backend.
 
-    Looks for a ``.synaptiq/kuzu`` directory in the current working directory.
+    Looks for a ``.synaptiq/kuzu`` index in the current working directory.
     If it exists, the backend is initialised from that path.  Otherwise a
     bare (uninitialised) backend is returned so that tools can still be
     called without crashing.
 
-    If the database is corrupted (e.g. duplicate primary key from a
-    mid-write kill), the kuzu directory and meta.json are deleted so
-    the next ``serve --watch`` or ``analyze`` invocation rebuilds cleanly.
+    If the database cannot be opened (corruption from a mid-write kill, or an
+    index left behind by the former KuzuDB backend), it is deleted along with
+    meta.json so the next ``serve --watch`` or ``analyze`` invocation rebuilds
+    cleanly.
     """
-    from synaptiq.core.storage.kuzu_backend import open_with_recovery
+    from synaptiq.core.storage.ladybug_backend import open_with_recovery
 
     global _storage  # noqa: PLW0603
     if _storage is None:
@@ -126,9 +127,9 @@ def _get_storage() -> KuzuBackend:
                 )
                 logger.info("Initialised storage (read-only) from %s", db_path)
             except RuntimeError as exc:
-                if "lock on file" in str(exc).lower():
+                if "lock on file" in str(exc).lower() or "lock is held" in str(exc).lower():
                     # Another process holds the database read-write
-                    # (e.g. ``synaptiq serve --watch``). Kuzu allows
+                    # (e.g. ``synaptiq serve --watch``). LadybugDB allows
                     # read-only opens only when no writer exists.
                     raise RuntimeError(
                         "The Synaptiq database is locked by another process "
@@ -138,8 +139,8 @@ def _get_storage() -> KuzuBackend:
                     ) from exc
                 raise
         else:
-            _storage = KuzuBackend()
-            logger.warning("No .synaptiq/kuzu directory found in %s", Path.cwd())
+            _storage = LadybugBackend()
+            logger.warning("No .synaptiq/kuzu index found in %s", Path.cwd())
     return _storage
 
 TOOLS: list[Tool] = [
@@ -606,7 +607,7 @@ def _as_str_list(value: object) -> list[str] | None:
     return None
 
 
-def dispatch_tool(name: str, arguments: dict, storage: KuzuBackend) -> str:
+def dispatch_tool(name: str, arguments: dict, storage: LadybugBackend) -> str:
     """Synchronous tool dispatch — called directly or via ``asyncio.to_thread``."""
     max_tokens = _as_int(arguments.get("max_tokens"), 0) or None
 
@@ -732,7 +733,7 @@ async def list_resources() -> list[Resource]:
         ),
     ]
 
-def dispatch_resource(uri_str: str, storage: KuzuBackend) -> str:
+def dispatch_resource(uri_str: str, storage: LadybugBackend) -> str:
     """Synchronous resource dispatch."""
     if uri_str == "synaptiq://overview":
         result = get_overview(storage)

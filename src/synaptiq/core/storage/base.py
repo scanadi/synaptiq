@@ -1,7 +1,7 @@
 """Storage backend abstraction for Synaptiq.
 
 Defines the :class:`StorageBackend` protocol that all concrete storage
-implementations (KuzuDB, Neo4j, in-memory, etc.) must satisfy, along with
+implementations (LadybugDB, Neo4j, in-memory, etc.) must satisfy, along with
 supporting data classes for search results and embeddings.
 """
 
