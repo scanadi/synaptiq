@@ -812,7 +812,7 @@ class _PrimaryRuntime:
 
         from synaptiq.core.daemon.rwlock import AsyncRWLock
         from synaptiq.core.daemon.socket_server import SocketServer
-        from synaptiq.core.ingestion.watcher import watch_repo
+        from synaptiq.core.ingestion.watcher import RebuildCoordinator, watch_repo
         from synaptiq.mcp.server import (
             dispatch_resource,
             dispatch_tool,
@@ -828,6 +828,11 @@ class _PrimaryRuntime:
         rwlock = AsyncRWLock()
         set_storage(storage)
         set_rwlock(rwlock)
+
+        # Single-flight guard shared with the watcher's global phase so a
+        # socket reindex and the watcher can never run two full CPU builds
+        # concurrently in this process (G10).
+        rebuild_coordinator = RebuildCoordinator()
 
         def dispatch(method: str, params: dict) -> str:
             if method == "ping":
@@ -849,6 +854,10 @@ class _PrimaryRuntime:
             holding the writer lock — a cancelled `async with rwlock.writer()`
             would release the lock while the commit thread keeps resetting the
             database under live readers.
+
+            The whole build+commit runs through the shared
+            ``rebuild_coordinator`` so it can never overlap the watcher's
+            global phase (or another reindex) — single-flight, per G10.
             """
             import time as _time
 
@@ -858,31 +867,34 @@ class _PrimaryRuntime:
                 load_previous_embeddings,
             )
 
-            start = _time.monotonic()
-            skip_embeddings = params.get("skip_embeddings", False)
-            previous = (
-                {}
-                if skip_embeddings
-                else await asyncio.to_thread(load_previous_embeddings, storage)
-            )
-            graph, embeddings, result = await asyncio.to_thread(
-                build_full_index,
-                repo_path,
-                full=params.get("full", True),
-                skip_embeddings=skip_embeddings,
-                previous_embeddings=previous,
-            )
+            async def _build_and_commit() -> str:
+                start = _time.monotonic()
+                skip_embeddings = params.get("skip_embeddings", False)
+                previous = (
+                    {}
+                    if skip_embeddings
+                    else await asyncio.to_thread(load_previous_embeddings, storage)
+                )
+                graph, embeddings, result = await asyncio.to_thread(
+                    build_full_index,
+                    repo_path,
+                    full=params.get("full", True),
+                    skip_embeddings=skip_embeddings,
+                    previous_embeddings=previous,
+                )
 
-            async def _locked_commit() -> None:
-                # Generous acquisition timeout: a single read dispatch may
-                # legitimately hold the reader lock for up to the server's
-                # 120s budget — the default 60s would discard the whole build.
-                async with rwlock.writer(timeout=300.0):
-                    await asyncio.to_thread(commit_full_index, storage, graph, embeddings)
+                async def _locked_commit() -> None:
+                    # Generous acquisition timeout: a single read dispatch may
+                    # legitimately hold the reader lock for up to the server's
+                    # 120s budget — the default 60s would discard the whole build.
+                    async with rwlock.writer(timeout=300.0):
+                        await asyncio.to_thread(commit_full_index, storage, graph, embeddings)
 
-            await asyncio.shield(_locked_commit())
-            _write_meta(data_dir, repo_path, result)
-            return _reindex_stats_json(result, _time.monotonic() - start)
+                await asyncio.shield(_locked_commit())
+                _write_meta(data_dir, repo_path, result)
+                return _reindex_stats_json(result, _time.monotonic() - start)
+
+            return await rebuild_coordinator.run(_build_and_commit)
 
         socket_server = SocketServer(
             self._lock_mgr.socket_path,
@@ -893,7 +905,13 @@ class _PrimaryRuntime:
         await socket_server.start()
 
         watch_task = asyncio.create_task(
-            watch_repo(repo_path, storage, stop_event=stop_event, rwlock=rwlock)
+            watch_repo(
+                repo_path,
+                storage,
+                stop_event=stop_event,
+                rwlock=rwlock,
+                rebuild_coordinator=rebuild_coordinator,
+            )
         )
         watch_task.add_done_callback(_report_watch_death)
 
