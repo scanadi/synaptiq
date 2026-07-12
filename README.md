@@ -253,6 +253,9 @@ synaptiq analyze .
 synaptiq analyze [PATH]          Index a repository (default: current directory)
     --full                       Force full rebuild (skip incremental)
     --no-embeddings              Skip embedding generation for faster indexing
+    --jobs / -j N                Cap Kuzu threads, ONNX embedding threads, and
+                                  walk/parse worker pools to N (0 = explicit
+                                  all-cores). See "CPU usage" below.
 
 synaptiq status                  Show index status for current repo
 synaptiq list                    List all indexed repositories
@@ -286,6 +289,23 @@ synaptiq serve                   Start MCP server with daemon features
     --port PORT                  Port for HTTP transport (default: 8080)
 synaptiq --version               Print version
 ```
+
+### CPU usage during `analyze`
+
+By default, `analyze` keeps Kuzu at its library default (all cores) but caps
+ONNX embedding threads to a polite `max(2, cores - 2)`, so a foreground index
+doesn't lock up the rest of the machine. `--jobs N` overrides this:
+
+| Setting | Kuzu threads | ONNX embed threads | Walk/parse pools |
+|---------|-------------|---------------------|-------------------|
+| default (no flag, no env) | all cores (library default) | `max(2, cores - 2)` | `min(8, cores)` |
+| `SYNAPTIQ_KUZU_THREADS` / `SYNAPTIQ_EMBED_THREADS` env vars | as set | as set | unaffected |
+| `--jobs N` (`N > 0`) | `N` | `N` | `N` |
+| `--jobs 0` | all cores (library default) | all cores (library default) | `min(8, cores)` |
+
+Precedence is **`--jobs` flag > environment variables > profile defaults**.
+`serve`/`mcp`/`watch` are unaffected — those long-running daemons always use
+the stricter "server" profile regardless of `--jobs`.
 
 ---
 

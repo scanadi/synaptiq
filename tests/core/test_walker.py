@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
+from synaptiq.core.ingestion import walker as walker_module
 from synaptiq.core.ingestion.walker import discover_files, walk_repo
+from synaptiq.core.resources import set_jobs
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -220,3 +223,50 @@ class TestWalkRepoSkipsBinary:
 
         assert "binary.py" not in paths
         assert "valid.py" in paths
+
+
+class TestWalkRepoWorkerCount:
+    """max_workers resolution: explicit value wins; default derives from
+    current_limits().pool_workers (W1.4 — analyze --jobs)."""
+
+    @staticmethod
+    def _spy_executor(captured: dict) -> type[ThreadPoolExecutor]:
+        class SpyExecutor(ThreadPoolExecutor):
+            def __init__(self, max_workers=None, *args, **kwargs):
+                captured["max_workers"] = max_workers
+                super().__init__(max_workers=max_workers, *args, **kwargs)
+
+        return SpyExecutor
+
+    def test_explicit_max_workers_is_honored(
+        self, tmp_repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict = {}
+        monkeypatch.setattr(walker_module, "ThreadPoolExecutor", self._spy_executor(captured))
+
+        walk_repo(tmp_repo, max_workers=2)
+
+        assert captured["max_workers"] == 2
+
+    def test_default_worker_count_derives_from_jobs_override(
+        self, tmp_repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict = {}
+        monkeypatch.setattr(walker_module, "ThreadPoolExecutor", self._spy_executor(captured))
+        set_jobs(3)
+
+        walk_repo(tmp_repo)
+
+        assert captured["max_workers"] == 3
+
+    def test_default_worker_count_falls_back_to_pool_default(
+        self, tmp_repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No --jobs, no explicit max_workers: min(8, cpu_count) applies."""
+        captured: dict = {}
+        monkeypatch.setattr(walker_module, "ThreadPoolExecutor", self._spy_executor(captured))
+        monkeypatch.setattr("synaptiq.core.resources.os.cpu_count", lambda: 4)
+
+        walk_repo(tmp_repo)
+
+        assert captured["max_workers"] == 4

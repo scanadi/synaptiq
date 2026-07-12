@@ -14,7 +14,9 @@ def _reset_resource_profile():
     CLI tests invoke ``serve``/``mcp``/``watch`` in-process, which switch
     the profile to "server"; without a per-test reset, every later test
     would see capped engine limits (and e.g. embedder call signatures
-    change with the runner's core count).
+    change with the runner's core count).  Also resets the ``--jobs``
+    override (``analyze --jobs`` / ``set_jobs``) for the same reason.
     """
     resources._active_profile = "interactive"
+    resources._jobs_override = None
     yield

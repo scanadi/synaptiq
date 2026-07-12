@@ -180,7 +180,7 @@ def parse_file(file_path: str, content: str, language: str) -> FileParseData:
 def process_parsing(
     files: list[FileEntry],
     graph: KnowledgeGraph,
-    max_workers: int = 8,
+    max_workers: int | None = None,
 ) -> list[FileParseData]:
     """Parse every file and populate the knowledge graph with symbol nodes.
 
@@ -197,11 +197,20 @@ def process_parsing(
         graph: The knowledge graph to populate.  File nodes are expected to
             already exist (created by the structure phase).
         max_workers: Maximum number of threads for parallel parsing.
+            Defaults to ``None``, which resolves
+            ``current_limits().pool_workers`` at call time (``min(8,
+            cpu_count)`` unless capped further by ``analyze --jobs``) —
+            pass an explicit value to override.
 
     Returns:
         A list of :class:`FileParseData` objects that carry the full parse
         results (imports, calls, heritage, type_refs) for use by later phases.
     """
+    if max_workers is None:
+        from synaptiq.core.resources import current_limits
+
+        max_workers = current_limits().pool_workers
+
     # Phase 1: Parse all files in parallel.
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         all_parse_data = list(
