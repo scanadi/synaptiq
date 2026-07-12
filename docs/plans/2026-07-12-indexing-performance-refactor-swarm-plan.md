@@ -181,6 +181,14 @@ Findings from the 2026-07-12 analysis, with source references:
 - **Acceptance:** both leaders scored against the full rubric with evidence links; recommendation is falsifiable (states what would change it).
 - **Risk:** none (isolated spike). **Gate:** feeds the Wave 3 design review — W3.1 must state which engine the incremental design assumes and keep the Protocol engine-portable either way.
 
+### W2.7 — Replace Kuzu with LadybugDB in full (OWNER DECISION 2026-07-12)
+- **Why:** W2.6's evaluation designated LadybugDB (PyPI `ladybug`, MIT, wheels cp310-3.14 incl. Windows, API drop-in, 7/7 Synaptiq-critical ops pass hands-on, 3× faster COPY micro-bench). Owner overrode the cautious dual-backend path: with a near-zero install base there is nothing to migrate — replace outright, no legacy kuzu support.
+- **Scope:** swap `kuzu==0.11.3` → `ladybug` (pin the hands-on-tested version, floor-pin acceptable given live upstream) in pyproject + lock; port `kuzu_backend.py` (expected mostly import/module renames given drop-in API — verify every Synaptiq-critical behavior: rel table group + rel_type filtering, properties_json, FTS CREATE/DROP/QUERY, HNSW create/drop/query + pinning constraint, CSV COPY incl. PARALLEL flag semantics, crash-safe `.rebuild` swap, transactions + prepared statements (W1.6), generation counter, DOUBLE[] legacy fallback removal is allowed — no legacy DBs exist); update resources.py env-var naming only if the engine's knobs differ (keep `SYNAPTIQ_KUZU_*` as deprecated aliases for one release); existing on-disk kuzu indexes must fail-safe into a clean full reindex (verify `open_with_recovery` handles a foreign/unreadable DB dir). Update CLAUDE.md + README storage references.
+- **Explicitly allowed:** renaming the backend module/class; dropping kuzu-specific workarounds that LadybugDB obsoletes (document each drop in the commit).
+- **Gate:** ENTIRE suite incl. e2e green; bench_index before/after (storage phase — evaluation predicts an improvement); manual smoke: `analyze` on a repo with a stale kuzu-era `.synaptiq` dir rebuilds cleanly.
+- **Sequencing:** after W2.3 merges (same file). W2.3's Arrow work is retargeted/ported as part of this package if its kuzu-era form doesn't carry over — LadybugDB has native Arrow interop, so the Arrow path may get simpler, not harder.
+- **Risk:** medium-high (whole storage surface) — mitigated by the 1018-test suite + e2e as the gate and git-revert as escape hatch.
+
 ### W2.5 — Algorithmic fixes bundle (3 independent sub-fixes, may split across agents)
 - **a. processes:** `deduplicate_flows` O(n²) → inverted index `node → [flow_idx]`, compare only overlapping flows; top-k slice instead of full sort at `processes.py:238-240`.
 - **b. imports (Ruby):** precompute `basename → [file_ids]` once instead of scan+sort per unresolved require (`imports.py:336-375`).
