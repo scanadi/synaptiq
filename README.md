@@ -100,6 +100,7 @@ Finds unreachable symbols with intelligence — not just "zero callers" but a mu
 4. **Protocol conformance** — un-flags methods on classes conforming to Protocol interfaces
 5. **Protocol stubs** — un-flags all methods on Protocol classes (interface contracts)
 6. **Ruby exemptions** — `initialize` constructors, metaprogramming hooks (`method_missing`, `inherited`, ...), `attr_*`/Rails-callback macro methods, and Rails framework base classes (`ApplicationRecord`/`ApplicationController`/...)
+7. **Go exemptions** — `main`/`init` runtime entries, exported (upper-case) identifiers, and `_test.go` files (`Test*`/`Benchmark*`/`Fuzz*`/`Example*` helpers)
 
 ### Impact Analysis (Blast Radius)
 
@@ -118,6 +119,7 @@ Detects entry points using framework-aware patterns:
 - **Python**: `@app.route`, `@router.get`, `@click.command`, `test_*` functions, `__main__` blocks
 - **JavaScript/TypeScript**: Express handlers, exported functions, `handler`/`middleware` patterns
 - **Ruby**: Rails controller/job/mailer actions, Sinatra/Rails route blocks, RSpec `*_spec.rb` / `*_test.rb`, `Rakefile`/`config.ru`
+- **Go**: `main`/`init` functions, exported package symbols, `Test*`/`Benchmark*`/`Fuzz*` functions
 
 Then traces BFS execution flows from each entry point through the call graph, classifying flows as intra-community or cross-community.
 
@@ -175,6 +177,7 @@ Symbols removed (1):
 | TypeScript | `.ts`, `.tsx` | tree-sitter-typescript |
 | JavaScript | `.js`, `.jsx`, `.mjs`, `.cjs` | tree-sitter-javascript |
 | Ruby | `.rb`, `.rake`, `.gemspec`, `.ru`, `.rbi` (+ `Rakefile`, `Gemfile`, `Guardfile`, `Capfile`, `Vagrantfile`, `Brewfile`, `Podfile`) | tree-sitter-ruby |
+| Go | `.go` | tree-sitter-go |
 
 ---
 
@@ -528,11 +531,11 @@ Unix domain socket paths are limited to 104 bytes on macOS. When the `.synaptiq/
 | `File` | Source file |
 | `Folder` | Directory |
 | `Function` | Top-level function |
-| `Class` | Class definition |
-| `Method` | Method within a class |
-| `Module` | Ruby module (namespace / mixin) |
-| `Interface` | Interface / Protocol definition |
-| `TypeAlias` | Type alias |
+| `Class` | Class definition (incl. Go `struct`) |
+| `Method` | Method within a class (incl. Go receiver funcs) |
+| `Module` | Ruby module (namespace / mixin) or Go package |
+| `Interface` | Interface / Protocol definition (incl. Go `interface`) |
+| `TypeAlias` | Type alias (incl. Go `type X = Y` / `type X Y`) |
 | `Enum` | Enumeration |
 | `Community` | Auto-detected functional cluster |
 | `Process` | Detected execution flow |
@@ -545,7 +548,7 @@ Unix domain socket paths are limited to 104 bytes on macOS. When the `.synaptiq/
 | `DEFINES` | File -> Symbol it defines | — |
 | `CALLS` | Symbol -> Symbol it calls | `confidence` (0.0-1.0) |
 | `IMPORTS` | File -> File it imports from | `symbols` (names list) |
-| `EXTENDS` | Class -> Class it extends | — |
+| `EXTENDS` | Class -> Class it extends (incl. Go struct/interface embedding) | — |
 | `IMPLEMENTS` | Class -> Interface it implements | — |
 | `MIXES_IN` | Class/Module -> Ruby module it mixes in (`include`/`extend`/`prepend`) | — |
 | `USES_TYPE` | Symbol -> Type it references | `role` (param/return/variable) |
@@ -572,7 +575,7 @@ Examples:
 
 ```mermaid
 flowchart TB
-    SRC(["📁 Source Code<br/>.py · .ts · .js · .tsx · .jsx · .rb"])
+    SRC(["📁 Source Code<br/>.py · .ts · .js · .tsx · .jsx · .rb · .go"])
 
     PIPELINE["⚙️ Ingestion Pipeline — 12 Phases<br/>walk → structure → parse → imports → calls<br/>rest_linking → heritage → types → communities<br/>processes → dead_code → coupling"]
 
