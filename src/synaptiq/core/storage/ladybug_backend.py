@@ -685,6 +685,81 @@ class LadybugBackend:
             logger.debug("Failed to remove embeddings for %s", file_path, exc_info=True)
         return 0
 
+    def remove_nodes_by_id(self, node_ids: list[str]) -> int:
+        """Surgically delete only the named nodes (by exact ``id``), any table.
+
+        The scoped counterpart to :meth:`remove_nodes_by_file`. The incremental
+        delta path removes *only the symbols that genuinely disappeared* from a
+        changed file rather than DETACH-DELETEing the file's whole node set, so
+        symbols that survived an edit keep their inbound edges from unchanged
+        files — e.g. a ``C -> A.foo`` CALLS edge survives an edit to ``A`` that
+        leaves ``A.foo`` in place. This is the remedy for the scoped-reindex
+        inbound-edge-loss latent bug (``remove_nodes_by_file`` DETACH-DELETEs a
+        surviving symbol together with its cross-file inbound edges, which the
+        outbound-only re-insert never restores). DETACH-DELETEing a *genuinely*
+        removed symbol still correctly cascades its own now-dangling inbound
+        edges. Embedding rows for the removed ids are cleaned up so vector
+        search does not return ghosts.
+
+        Transaction-agnostic: runs on ``self._conn`` directly, so it
+        auto-commits when called standalone and participates in the caller's
+        transaction when invoked from :meth:`apply_graph_delta`.
+
+        Returns:
+            The number of nodes actually removed (ids that existed).
+        """
+        if not node_ids:
+            return 0
+        removed = self._count_nodes_by_id(node_ids)
+        self._delete_nodes_by_id(node_ids)
+        return removed
+
+    def _count_nodes_by_id(self, node_ids: list[str]) -> int:
+        """Count how many of *node_ids* currently exist across all node tables."""
+        assert self._conn is not None
+        total = 0
+        for table in _NODE_TABLE_NAMES:
+            try:
+                rows = self._drain(
+                    self._conn.execute(
+                        f"MATCH (n:{table}) WHERE n.id IN $ids RETURN count(n)",
+                        parameters={"ids": node_ids},
+                    )
+                )
+                if rows:
+                    total += int(rows[0][0])
+            except Exception:
+                logger.debug("count-by-id failed for table %s", table, exc_info=True)
+        return total
+
+    def _delete_nodes_by_id(self, node_ids: list[str]) -> None:
+        """DETACH DELETE nodes by exact id + embedding cleanup. No own transaction.
+
+        Runs on ``self._conn`` so it can be called standalone (auto-commit) or
+        inside :meth:`apply_graph_delta`'s explicit transaction. Each per-table
+        statement matches only that table's own ids (ids are unique by label
+        prefix), so looping every table is safe.
+        """
+        if not node_ids:
+            return
+        assert self._conn is not None
+        for table in _NODE_TABLE_NAMES:
+            try:
+                self._conn.execute(
+                    f"MATCH (n:{table}) WHERE n.id IN $ids DETACH DELETE n",
+                    parameters={"ids": node_ids},
+                )
+            except Exception:
+                logger.debug("Failed to remove nodes by id from table %s", table, exc_info=True)
+
+        try:
+            self._conn.execute(
+                "MATCH (e:Embedding) WHERE e.node_id IN $ids DELETE e",
+                parameters={"ids": node_ids},
+            )
+        except Exception:
+            logger.debug("Failed to remove embeddings by id", exc_info=True)
+
     # ------------------------------------------------------------------
     # Read operations (use pooled connections — safe for concurrent use)
     # ------------------------------------------------------------------
@@ -2055,7 +2130,23 @@ class LadybugBackend:
         self._conn.execute(stmt, parameters=params)
 
     def _insert_relationship(self, rel: GraphRelationship) -> None:
-        """MATCH source and target, then CREATE the rel via a prepared statement.
+        """MATCH source and target, then MERGE the rel via a prepared statement.
+
+        Uses ``MERGE ... SET`` keyed on the endpoint pair **and** the logical
+        ``rel_type`` property — the rel-table group stores the logical kind in
+        ``rel_type`` (not as a label), so the merge key is ``(source, target,
+        rel_type)`` and MERGE matches-or-creates on that full triple (verified
+        against LadybugDB: a distinct ``rel_type`` between the same endpoints is
+        a distinct edge; re-inserting the same triple refreshes it in place
+        rather than duplicating). This makes edge insertion **idempotent**,
+        fixing a latent duplication bug in the scoped re-index path: re-parsing
+        a file re-emits persistent structural edges — e.g. folder→folder /
+        folder→file ``CONTAINS`` whose endpoints survive
+        :meth:`remove_nodes_by_file` (their ``file_path`` is the directory, not
+        the changed file) — which the old ``CREATE`` duplicated on every reindex
+        and which would accumulate permanently once periodic full wipes stop. On
+        a fresh database (the ``bulk_load`` fallback) every MERGE is a create,
+        so behaviour there is unchanged.
 
         Runs inside :meth:`_write_batch`'s transaction; an execution error
         propagates so the batch can roll back atomically. A relationship
@@ -2080,15 +2171,13 @@ class LadybugBackend:
             f"rel:{src_table}:{tgt_table}",
             f"MATCH (a:{src_table}), (b:{tgt_table}) "
             f"WHERE a.id = $src AND b.id = $tgt "
-            f"CREATE (a)-[:CodeRelation {{"
-            f"rel_type: $rel_type, "
-            f"confidence: $confidence, "
-            f"role: $role, "
-            f"step_number: $step_number, "
-            f"strength: $strength, "
-            f"co_changes: $co_changes, "
-            f"symbols: $symbols"
-            f"}}]->(b)",
+            f"MERGE (a)-[r:CodeRelation {{rel_type: $rel_type}}]->(b) "
+            f"SET r.confidence = $confidence, "
+            f"r.role = $role, "
+            f"r.step_number = $step_number, "
+            f"r.strength = $strength, "
+            f"r.co_changes = $co_changes, "
+            f"r.symbols = $symbols",
         )
         params = {
             "src": rel.source,

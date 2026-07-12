@@ -72,6 +72,18 @@ class StorageBackend(Protocol):
         """
         ...
 
+    def remove_nodes_by_id(self, node_ids: list[str]) -> int:
+        """Surgically remove only the nodes with the given ids.
+
+        Unlike :meth:`remove_nodes_by_file`, this leaves other symbols from the
+        same file — and their inbound edges from unchanged files — in place. It
+        is the scoped-removal primitive used by the incremental delta path.
+
+        Returns:
+            The number of nodes actually removed.
+        """
+        ...
+
     def get_node(self, node_id: str) -> GraphNode | None:
         """Return a single node by ID, or ``None`` if not found."""
         ...
