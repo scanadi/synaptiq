@@ -7,6 +7,7 @@ represent end-to-end execution paths through the codebase.
 
 from __future__ import annotations
 
+import heapq
 import logging
 import re
 from collections import deque
@@ -235,14 +236,30 @@ def trace_flow(
             continue
 
         outgoing = graph.get_outgoing(current_id, RelType.CALLS)
-        outgoing.sort(
-            key=lambda r: r.properties.get("confidence", 0.0), reverse=True
-        )
+
+        # Highest-confidence edges are preferred; ties keep the original
+        # (insertion) order, matching the stable-sort-with-reverse=True
+        # semantics of the old ``outgoing.sort(key=..., reverse=True)``.
+        # A heap lets the loop below stop as soon as it has collected
+        # *max_branching* NEW nodes instead of always sorting every
+        # outgoing edge up front. Edges whose target is already visited
+        # (or dangling) don't count against the branch budget, so the
+        # loop may still pop past position ``max_branching`` in the
+        # worst case -- same bound as the old full sort, but typically far
+        # fewer comparisons for high-fan-out nodes since a plain top-k
+        # slice would silently under-fill the budget whenever an early,
+        # high-confidence edge is skipped.
+        heap = [
+            (-rel.properties.get("confidence", 0.0), idx, rel)
+            for idx, rel in enumerate(outgoing)
+        ]
+        heapq.heapify(heap)
 
         count = 0
-        for rel in outgoing:
+        while heap:
             if count >= max_branching or len(result) >= _MAX_FLOW_SIZE:
                 break
+            _, _, rel = heapq.heappop(heap)
             target_id = rel.target
             if target_id in visited:
                 continue
@@ -284,6 +301,21 @@ def deduplicate_flows(flows: list[list[GraphNode]]) -> list[list[GraphNode]]:
     Two flows are "similar" if they share > 50% of the smaller flow's
     nodes (by ID).  When a pair is similar, the shorter flow is discarded.
 
+    Flows are considered longest-first (a stable sort, so flows of equal
+    length keep their original relative order -- this matters because the
+    kept/discarded outcome is order-dependent).  A flow is compared only
+    against flows that have *already* been kept, in that same order, and
+    is discarded on the first kept flow it overlaps with by more than 50%.
+
+    Rather than comparing every flow against every kept flow (the O(n^2)
+    cost this rewrite removes), an inverted index (node id -> indices of
+    kept flows containing it) narrows each comparison down to only the
+    kept flows that share at least one node with the candidate.  This is
+    safe because overlap > 0.5 always implies a non-empty intersection,
+    so a kept flow that shares zero nodes with the candidate could never
+    have triggered a match anyway -- skipping it changes nothing about
+    the result, only how many comparisons it takes to get there.
+
     Args:
         flows: List of flows (each flow is a list of nodes).
 
@@ -294,24 +326,41 @@ def deduplicate_flows(flows: list[list[GraphNode]]) -> list[list[GraphNode]]:
 
     kept: list[list[GraphNode]] = []
     kept_sets: list[set[str]] = []
+    # node id -> indices into kept/kept_sets of kept flows containing it.
+    node_to_kept: dict[str, list[int]] = {}
 
     for flow in flows_sorted:
         flow_ids = {n.id for n in flow}
         is_duplicate = False
 
-        for kept_set in kept_sets:
-            if not flow_ids or not kept_set:
-                continue
-            intersection = flow_ids & kept_set
-            smaller_size = min(len(flow_ids), len(kept_set))
-            overlap = len(intersection) / smaller_size
-            if overlap > 0.5:
-                is_duplicate = True
-                break
+        if flow_ids:
+            candidate_indices: set[int] = set()
+            for node_id in flow_ids:
+                indices = node_to_kept.get(node_id)
+                if indices:
+                    candidate_indices.update(indices)
+
+            for idx in candidate_indices:
+                kept_set = kept_sets[idx]
+                if not kept_set:
+                    # Unreachable in practice: only non-empty flow_ids ever
+                    # populate node_to_kept (see below), so a candidate
+                    # index can never point at an empty kept set. Kept for
+                    # a literal match with the original guard clause.
+                    continue
+                intersection = flow_ids & kept_set
+                smaller_size = min(len(flow_ids), len(kept_set))
+                overlap = len(intersection) / smaller_size
+                if overlap > 0.5:
+                    is_duplicate = True
+                    break
 
         if not is_duplicate:
+            kept_index = len(kept)
             kept.append(flow)
             kept_sets.append(flow_ids)
+            for node_id in flow_ids:
+                node_to_kept.setdefault(node_id, []).append(kept_index)
 
     return kept
 
