@@ -408,6 +408,21 @@ class LadybugBackend:
         """
         return self._generation
 
+    @property
+    def data_dir(self) -> Path | None:
+        """The ``.synaptiq/`` directory this backend's database lives in.
+
+        ``None`` before :meth:`initialize` has been called. Duck-typed (not
+        part of the :class:`~synaptiq.core.storage.base.StorageBackend`
+        Protocol — a URI-addressed backend like Neo4j has no natural
+        filesystem directory) rather than declared on the Protocol, so
+        callers that want it (e.g. ``mcp.tools._get_query_embedding``,
+        resolving which embedding tier ``meta.json`` next to the database
+        says this index was built with) read it via ``getattr(storage,
+        "data_dir", None)``.
+        """
+        return self._db_path.parent if self._db_path is not None else None
+
     def initialize(
         self, path: Path, *, read_only: bool = False, _build_fts_indexes: bool = True
     ) -> None:
@@ -1461,12 +1476,51 @@ class LadybugBackend:
                 mapping[row[0]] = (row[1], [float(v) for v in row[2]])
         return mapping
 
+    @classmethod
+    def _stored_embedding_dim(cls, conn: ladybug.Connection) -> int | None:
+        """Return the actual width of stored ``Embedding.vec`` rows.
+
+        ``None`` when the table is empty (or unreadable) — meaning there is
+        nothing to compare a query vector's width against, so
+        :meth:`vector_search` skips the dimension guard and falls through to
+        its normal (empty-result) behavior instead of treating "no vectors
+        stored yet" as a mismatch (the W4.1 lazy-embeddings window: hybrid
+        search must degrade to keyword-only while the Embedding table is
+        still empty, never error).
+
+        Deliberately reads a real row instead of the table's declared column
+        type: a freshly created, still-empty Embedding table carries the
+        ``EMBEDDING_DIM`` bootstrap placeholder in its schema (see
+        :func:`_embedding_ddl`), which says nothing about the width the
+        first real :meth:`store_embeddings` call will actually use.
+        """
+        try:
+            rows = cls._drain(conn.execute("MATCH (e:Embedding) RETURN e.vec LIMIT 1"))
+        except Exception:
+            return None
+        if not rows or not rows[0] or rows[0][0] is None:
+            return None
+        return len(rows[0][0])
+
     def vector_search(self, vector: list[float], limit: int) -> list[SearchResult]:
         """Find the closest nodes to *vector* via the HNSW vector index.
 
         Falls back to a full ``array_cosine_similarity`` scan when the index
         is unavailable (pre-index database or failed index build).  Joins
         with node tables to fetch metadata in a single query.
+
+        Raises:
+            RuntimeError: *vector*'s width does not match the stored index's
+                actual vector width — e.g. the index was built with the
+                "fast" embedding tier (256-dim) but *vector* was encoded
+                with "quality" (384-dim), or vice versa (W4.4). Without this
+                guard the native FLOAT[N] type-cast fails with an opaque
+                binder error on the full-scan fallback, while the HNSW path
+                silently swallows the same error and returns as if there
+                were no matches at all — neither tells the caller what's
+                actually wrong. Never raised when the Embedding table is
+                empty (nothing to compare against) — see
+                :meth:`_stored_embedding_dim`.
         """
         limit = max(1, int(limit))
         # Vector literals must be inlined — the engine cannot bind a parameter
@@ -1476,6 +1530,14 @@ class LadybugBackend:
         dim = len(vector)
 
         with self._read_conn() as conn:
+            stored_dim = self._stored_embedding_dim(conn)
+            if stored_dim is not None and stored_dim != dim:
+                raise RuntimeError(
+                    f"Query embedding is {dim}-dim but the stored index holds "
+                    f"{stored_dim}-dim vectors (it was likely built with a "
+                    "different --embedding-model tier). Re-run `synaptiq analyze` "
+                    "to rebuild the index, or query with the matching tier."
+                )
             emb_rows = self._vector_index_query(conn, vec_literal, dim, limit)
             if emb_rows is None:
                 emb_rows = self._vector_scan_query(conn, vec_literal, dim, limit)

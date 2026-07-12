@@ -27,23 +27,29 @@ logger = logging.getLogger(__name__)
 
 MAX_TRAVERSE_DEPTH = 10
 
-_query_model = None
 
+def _get_query_embedding(query: str, storage: StorageBackend) -> list[float] | None:
+    """Generate a query embedding vector, returning None if unavailable.
 
-def _get_query_embedding(query: str) -> list[float] | None:
-    """Generate a query embedding vector, returning None if unavailable."""
-    global _query_model  # noqa: PLW0603
+    Encodes with whatever tier *storage*'s index was actually built with
+    (:func:`~synaptiq.core.embeddings.embedder.tier_from_meta`, read from
+    ``meta.json`` next to the database) rather than a hardcoded model — an
+    index built with the "fast" tier must be queried with "fast" vectors,
+    never "quality" ones, since the two have different widths (W4.4). The
+    resolved model is cached by
+    :func:`~synaptiq.core.embeddings.embedder._get_model` (keyed by tier
+    name), so repeated calls in a long-running `serve`/`mcp` process reuse
+    the already-loaded model instead of reloading it every query.
+    """
     try:
-        if _query_model is None:
-            from fastembed import TextEmbedding
+        from synaptiq.core.embeddings.embedder import encode_query, tier_from_meta
 
-            from synaptiq.core.resources import current_limits
-
-            threads = current_limits().embed_threads
-            _query_model = TextEmbedding(
-                model_name="BAAI/bge-small-en-v1.5", threads=threads or None
-            )
-        return next(iter(_query_model.embed([query]))).tolist()
+        # duck-typed: only LadybugBackend exposes `data_dir` (see its
+        # docstring) — any other backend, or a bare mock in tests, falls
+        # back to the default tier via tier_from_meta(None).
+        data_dir = getattr(storage, "data_dir", None)
+        tier = tier_from_meta(data_dir)
+        return encode_query(tier.name, query)
     except Exception:
         logger.debug("Query embedding generation failed", exc_info=True)
         return None
@@ -237,10 +243,18 @@ def handle_query(
 
         ppr_scores = personalized_pagerank(storage, focus_files)
 
-    query_embedding = _get_query_embedding(query)
-    results = hybrid_search(
-        query, storage, query_embedding=query_embedding, limit=limit, ppr_scores=ppr_scores
-    )
+    query_embedding = _get_query_embedding(query, storage)
+    try:
+        results = hybrid_search(
+            query, storage, query_embedding=query_embedding, limit=limit, ppr_scores=ppr_scores
+        )
+    except RuntimeError as exc:
+        # storage.vector_search's embedding-tier dimension guard (W4.4) — the
+        # only exception hybrid_search's own call chain can raise (FTS/fuzzy
+        # search already degrade internally rather than raising). Surface it
+        # as the tool's text result, matching handle_cypher's pattern, rather
+        # than letting it propagate as an MCP protocol-level error.
+        return str(exc)
     if not results:
         return f"No results found for '{query}'."
 

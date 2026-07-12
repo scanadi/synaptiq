@@ -179,7 +179,7 @@ class TestEncodeAndStore:
         repo, data_dir, _ = indexed_repo
         seen: list[dict] = []
 
-        def fake_embed(graph, previous=None, progress_callback=None):
+        def fake_embed(graph, tier=None, previous=None, progress_callback=None):
             progress_callback(1, 3)
             seen.append(lazy_worker.read_state(data_dir))
             progress_callback(3, 3)
@@ -208,6 +208,101 @@ class TestEncodeAndStore:
 
 
 # ---------------------------------------------------------------------------
+# Embedding tier resolution (W4.4) — the worker is a detached subprocess
+# with no CLI arg, so it must always re-derive the tier from meta.json.
+# ---------------------------------------------------------------------------
+
+
+class _FakeStaticModel:
+    """Deterministic stand-in for model2vec's ``StaticModel.encode()`` shape
+    (a single batched call returning a 2D array, unlike fastembed's
+    streaming-generator ``.embed()``) — see embedder._encode_batches."""
+
+    def encode(self, texts, batch_size: int = 64, use_multiprocessing: bool = True):
+        return np.array(
+            [
+                np.random.default_rng(int.from_bytes(hashlib.md5(t.encode()).digest()[:4], "big"))
+                .random(256)
+                .astype(np.float32)
+                for t in texts
+            ]
+        )
+
+
+class TestWorkerTierResolution:
+    def test_worker_passes_meta_tier_to_embed_graph(self, indexed_repo, monkeypatch) -> None:
+        """indexed_repo's meta.json was written by a plain run_pipeline call
+        (no --embedding-model), so it defaults to "quality"."""
+        repo, data_dir, _ = indexed_repo
+        seen_tiers: list = []
+
+        def spy_embed(graph, tier=None, previous=None, progress_callback=None):
+            seen_tiers.append(tier)
+            return []
+
+        monkeypatch.setattr("synaptiq.core.embeddings.embedder.embed_graph", spy_embed)
+        lazy_worker.run_lazy_embedding_worker(repo)
+
+        assert seen_tiers == ["quality"]
+
+    def test_worker_honors_fast_tier_recorded_in_meta(self, indexed_repo, monkeypatch) -> None:
+        repo, data_dir, _ = indexed_repo
+        meta = _read_meta(data_dir)
+        meta["stats"]["embedding_model"] = "fast"
+        (data_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+
+        seen_tiers: list = []
+
+        def spy_embed(graph, tier=None, previous=None, progress_callback=None):
+            seen_tiers.append(tier)
+            return []
+
+        monkeypatch.setattr("synaptiq.core.embeddings.embedder.embed_graph", spy_embed)
+        lazy_worker.run_lazy_embedding_worker(repo)
+
+        assert seen_tiers == ["fast"]
+
+    def test_worker_encodes_and_stores_256dim_vectors_for_fast_tier(
+        self, indexed_repo, monkeypatch
+    ) -> None:
+        """Full loop through the REAL embed_graph/tier dispatch (not spied):
+        a repo whose meta.json says "fast" ends up with real 256-dim vectors
+        in storage, proving the tier name round-trips correctly end to end
+        (meta.json -> tier_from_meta -> embed_graph -> _encode_batches ->
+        store_embeddings' actual-width table)."""
+        repo, data_dir, db_path = indexed_repo
+        meta = _read_meta(data_dir)
+        meta["stats"]["embedding_model"] = "fast"
+        (data_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+
+        # Override the module's autouse fastembed-shaped fake (_fake_model,
+        # above) with a model2vec-shaped one for this test only —
+        # _encode_batches dispatches on tier.backend ("model2vec" here, from
+        # meta.json), not by introspecting the model instance, so this fake
+        # only needs to match .encode()'s shape for the real dispatch path
+        # to exercise it.
+        monkeypatch.setattr(
+            "synaptiq.core.embeddings.embedder._get_model", lambda *a, **k: _FakeStaticModel()
+        )
+
+        rc = lazy_worker.run_lazy_embedding_worker(repo)
+        assert rc == 0
+
+        state = lazy_worker.read_state(data_dir)
+        assert state["state"] == "complete"
+
+        storage = LadybugBackend()
+        storage.initialize(db_path, read_only=True)
+        try:
+            stored = storage.load_embeddings()
+            assert stored, "worker should have stored at least one vector"
+            sample_vec = next(iter(stored.values()))[1]
+            assert len(sample_vec) == 256
+        finally:
+            storage.close()
+
+
+# ---------------------------------------------------------------------------
 # Staleness guard
 # ---------------------------------------------------------------------------
 
@@ -220,14 +315,16 @@ class TestStalenessGuard:
         repo, data_dir, _ = indexed_repo
         calls = {"n": 0}
 
-        def flaky_embed(graph, previous=None, progress_callback=None):
+        def flaky_embed(graph, tier=None, previous=None, progress_callback=None):
             calls["n"] += 1
             if calls["n"] == 1:
                 # Simulate another `analyze` committing a fresh graph mid-encode.
                 meta = _read_meta(data_dir)
                 meta["last_indexed_at"] = "2099-01-01T00:00:00+00:00"
                 (data_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
-            return real_embed_graph(graph, previous=previous, progress_callback=progress_callback)
+            return real_embed_graph(
+                graph, tier=tier, previous=previous, progress_callback=progress_callback
+            )
 
         monkeypatch.setattr("synaptiq.core.embeddings.embedder.embed_graph", flaky_embed)
         rc = lazy_worker.run_lazy_embedding_worker(repo)
@@ -240,7 +337,7 @@ class TestStalenessGuard:
         monkeypatch.setattr(lazy_worker, "_MAX_GENERATIONS", 2)
         counter = {"n": 0}
 
-        def always_stale(graph, previous=None, progress_callback=None):
+        def always_stale(graph, tier=None, previous=None, progress_callback=None):
             counter["n"] += 1
             meta = _read_meta(data_dir)
             meta["last_indexed_at"] = f"2099-02-0{counter['n']}T00:00:00+00:00"

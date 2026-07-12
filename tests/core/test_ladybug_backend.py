@@ -97,6 +97,32 @@ class TestInitializeAndClose:
 
 
 # ---------------------------------------------------------------------------
+# data_dir property (W4.4 — lets mcp.tools._get_query_embedding find
+# meta.json next to the database to resolve which embedding tier to use)
+# ---------------------------------------------------------------------------
+
+
+class TestDataDirProperty:
+    def test_none_before_initialize(self) -> None:
+        b = LadybugBackend()
+        assert b.data_dir is None
+
+    def test_parent_of_db_path_after_initialize(
+        self, backend: LadybugBackend, tmp_path: Path
+    ) -> None:
+        assert backend.data_dir == tmp_path
+
+    def test_none_after_close(self, tmp_path: Path) -> None:
+        b = LadybugBackend()
+        b.initialize(tmp_path / "close_test")
+        assert b.data_dir == tmp_path
+        b.close()
+        # close() does not clear _db_path (it's only set on initialize), so
+        # data_dir is still meaningful for a closed-but-reusable handle.
+        assert b.data_dir == tmp_path
+
+
+# ---------------------------------------------------------------------------
 # bulk_load
 # ---------------------------------------------------------------------------
 

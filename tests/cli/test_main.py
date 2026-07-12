@@ -305,6 +305,215 @@ class TestAnalyzeEmbeddingsFlag:
         assert meta["stats"]["embeddings"] == 0
 
 
+class _FakeStaticModel:
+    """Deterministic model2vec.StaticModel stand-in for CLI tests.
+
+    Unlike fastembed's streaming-generator `.embed()`, model2vec's
+    `.encode()` returns the whole batch as one array — see
+    embedder._encode_batches, which dispatches on this shape difference.
+    """
+
+    def encode(self, texts, batch_size: int = 64, use_multiprocessing: bool = True):
+        import hashlib
+
+        import numpy as np
+
+        return np.array(
+            [
+                np.random.default_rng(int.from_bytes(hashlib.md5(t.encode()).digest()[:4], "big"))
+                .random(256)
+                .astype(np.float32)
+                for t in texts
+            ]
+        )
+
+
+class TestAnalyzeEmbeddingModelFlag:
+    """Tests for `analyze --embedding-model quality|fast` (W4.4)."""
+
+    @staticmethod
+    def _tiny_repo(repo: Path) -> None:
+        src = repo / "src"
+        src.mkdir(parents=True)
+        (src / "main.py").write_text(
+            "def main():\n    return helper()\n\n\ndef helper():\n    return 42\n",
+            encoding="utf-8",
+        )
+
+    def test_help_lists_embedding_model_choices(self) -> None:
+        result = runner.invoke(app, ["analyze", "--help"])
+        output = " ".join(result.output.replace("│", " ").split())
+        assert "--embedding-model" in output
+        assert "quality" in output and "fast" in output
+
+    def test_default_tier_is_quality(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        repo = tmp_path / "repo"
+        self._tiny_repo(repo)
+        monkeypatch.chdir(repo)
+        monkeypatch.setattr(
+            "synaptiq.core.embeddings.embedder._get_model", lambda *a, **k: _FakeEmbedModel()
+        )
+
+        result = runner.invoke(app, ["analyze", ".", "--embeddings", "sync"])
+
+        assert result.exit_code == 0, result.output
+        meta = json.loads((repo / ".synaptiq" / "meta.json").read_text())
+        assert meta["stats"]["embedding_model"] == "quality"
+
+    def test_fast_tier_persisted_and_stores_256dim_vectors(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repo = tmp_path / "repo"
+        self._tiny_repo(repo)
+        monkeypatch.chdir(repo)
+        monkeypatch.setattr(
+            "synaptiq.core.embeddings.embedder._get_model", lambda *a, **k: _FakeStaticModel()
+        )
+
+        result = runner.invoke(
+            app, ["analyze", ".", "--embeddings", "sync", "--embedding-model", "fast"]
+        )
+
+        assert result.exit_code == 0, result.output
+        meta = json.loads((repo / ".synaptiq" / "meta.json").read_text())
+        assert meta["stats"]["embedding_model"] == "fast"
+        assert meta["stats"]["embeddings"] > 0
+
+        from synaptiq.core.storage.ladybug_backend import LadybugBackend
+
+        storage = LadybugBackend()
+        storage.initialize(repo / ".synaptiq" / "kuzu", read_only=True)
+        try:
+            stored = storage.load_embeddings()
+            assert stored
+            assert len(next(iter(stored.values()))[1]) == 256
+        finally:
+            storage.close()
+
+    def test_missing_dependency_fails_fast_before_indexing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """model2vec "not installed" (simulated) — analyze must fail with a
+        clear, actionable error BEFORE running the pipeline at all, not
+        after minutes of indexing."""
+        import sys
+
+        repo = tmp_path / "repo"
+        self._tiny_repo(repo)
+        monkeypatch.chdir(repo)
+        monkeypatch.setitem(sys.modules, "model2vec", None)
+
+        result = runner.invoke(
+            app, ["analyze", ".", "--embeddings", "sync", "--embedding-model", "fast"]
+        )
+
+        assert result.exit_code == 1
+        # The exact bracketed install hint, not just a loose substring: Rich
+        # console markup parses an unescaped "[fast-embeddings]" as a style
+        # tag and silently drops it, so this specific assertion catches that
+        # regression class (it did, once, during development of this flag).
+        assert "synaptiq[fast-embeddings]" in result.output
+        # Failed before any indexing started — no .synaptiq directory at all.
+        assert not (repo / ".synaptiq").exists()
+
+    def test_off_mode_skips_missing_dependency_check(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """--embeddings off never encodes anything, so a missing fast-tier
+        dependency must not block indexing even with --embedding-model fast."""
+        import sys
+
+        repo = tmp_path / "repo"
+        self._tiny_repo(repo)
+        monkeypatch.chdir(repo)
+        monkeypatch.setitem(sys.modules, "model2vec", None)
+
+        result = runner.invoke(
+            app, ["analyze", ".", "--embeddings", "off", "--embedding-model", "fast"]
+        )
+
+        assert result.exit_code == 0, result.output
+        meta = json.loads((repo / ".synaptiq" / "meta.json").read_text())
+        assert meta["stats"]["embeddings"] == 0
+
+    def test_tier_switch_forces_full_reencode_sync_mode(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A repo indexed with "quality" then re-analyzed with "fast" must
+        re-encode every symbol fresh rather than reusing the
+        differently-sized old vectors (embedder._partition_texts' tier-
+        salted text_sha)."""
+        repo = tmp_path / "repo"
+        self._tiny_repo(repo)
+        monkeypatch.chdir(repo)
+
+        def _dispatch(tier_name):
+            return _FakeEmbedModel() if tier_name == "quality" else _FakeStaticModel()
+
+        monkeypatch.setattr("synaptiq.core.embeddings.embedder._get_model", _dispatch)
+
+        first = runner.invoke(app, ["analyze", ".", "--embeddings", "sync"])
+        assert first.exit_code == 0, first.output
+        meta_after_first = json.loads((repo / ".synaptiq" / "meta.json").read_text())
+        assert meta_after_first["stats"]["embedding_model"] == "quality"
+        quality_count = meta_after_first["stats"]["embeddings"]
+        assert quality_count > 0
+
+        second = runner.invoke(
+            app, ["analyze", ".", "--embeddings", "sync", "--embedding-model", "fast"]
+        )
+        assert second.exit_code == 0, second.output
+        meta_after_second = json.loads((repo / ".synaptiq" / "meta.json").read_text())
+        assert meta_after_second["stats"]["embedding_model"] == "fast"
+        # Every symbol was re-encoded fresh (same total count as before) —
+        # a partial/leftover reuse from the old tier would have either
+        # errored (mixed FLOAT[dim] widths in one COPY) or under-counted.
+        assert meta_after_second["stats"]["embeddings"] == quality_count
+
+        from synaptiq.core.storage.ladybug_backend import LadybugBackend
+
+        storage = LadybugBackend()
+        storage.initialize(repo / ".synaptiq" / "kuzu", read_only=True)
+        try:
+            stored = storage.load_embeddings()
+            assert len(next(iter(stored.values()))[1]) == 256
+        finally:
+            storage.close()
+
+    def test_tier_switch_in_lazy_mode_shows_zero_reuse(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Lazy mode's console output explicitly distinguishes "N reused"
+        from "encoding N" — a tier switch must show the latter (nothing
+        reused), matching partition_embeddings returning zero reused."""
+        repo = tmp_path / "repo"
+        self._tiny_repo(repo)
+        monkeypatch.chdir(repo)
+
+        def _dispatch(tier_name):
+            return _FakeEmbedModel() if tier_name == "quality" else _FakeStaticModel()
+
+        monkeypatch.setattr("synaptiq.core.embeddings.embedder._get_model", _dispatch)
+
+        first = runner.invoke(app, ["analyze", ".", "--embeddings", "sync"])
+        assert first.exit_code == 0, first.output
+
+        spawned: dict = {}
+        monkeypatch.setattr(
+            "synaptiq.core.embeddings.lazy_worker.spawn_lazy_worker",
+            lambda rp: spawned.setdefault("called", True) or 9999,
+        )
+
+        second = runner.invoke(
+            app, ["analyze", ".", "--embeddings", "lazy", "--embedding-model", "fast"]
+        )
+
+        assert second.exit_code == 0, second.output
+        assert "reused" not in second.output.lower()
+        assert "in the background" in second.output
+        assert spawned.get("called") is True
+
+
 class TestAnalyzeLazyReuse:
     """`analyze --embeddings lazy` reuses vectors across rebuilds (W4.1b).
 
@@ -521,6 +730,26 @@ class TestStatus:
         result = runner.invoke(app, ["status"])
         assert "failed" in result.output
         assert "model offline" in result.output
+
+    def test_status_shows_failed_error_with_brackets_intact(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A worker failure whose message contains a literal bracketed
+        substring (e.g. the fast tier's missing-dependency install hint,
+        W4.4) must render in full — unescaped, Rich console markup parses
+        "[fast-embeddings]" as a style tag and silently drops it."""
+        monkeypatch.chdir(tmp_path)
+        self._write_index(
+            tmp_path,
+            {
+                "state": "failed",
+                "error": "The 'fast' embedding tier requires the 'model2vec' package, "
+                "which is not installed. Install it with: pip install "
+                "'synaptiq[fast-embeddings]'.",
+            },
+        )
+        result = runner.invoke(app, ["status"])
+        assert "synaptiq[fast-embeddings]" in result.output
 
     def test_status_shows_deferred(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.chdir(tmp_path)

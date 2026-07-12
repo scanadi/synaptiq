@@ -321,6 +321,70 @@ class TestHybridDegradationWithoutVectors:
 
 
 # ---------------------------------------------------------------------------
+# Embedding-tier dimension guard (W4.4)
+# ---------------------------------------------------------------------------
+
+
+class TestVectorSearchDimensionGuard:
+    """vector_search raises a clear error when the query vector's width
+    doesn't match the ACTUAL stored vectors' width — e.g. querying a
+    "fast"-built (256-dim) index with a "quality" (384-dim) query vector,
+    or vice versa. Never raised when the Embedding table is empty — see
+    TestHybridDegradationWithoutVectors above, which covers that case."""
+
+    def test_raises_on_dimension_mismatch(self, backend: LadybugBackend) -> None:
+        node = _make_node(name="f", file_path="src/a.py")
+        backend.add_nodes([node])
+        backend.store_embeddings([NodeEmbedding(node_id=node.id, embedding=[1.0] * 256)])
+
+        with pytest.raises(RuntimeError, match="256-dim"):
+            backend.vector_search([0.1] * 384, limit=5)
+
+    def test_error_message_mentions_both_dims_and_guidance(self, backend: LadybugBackend) -> None:
+        node = _make_node(name="f", file_path="src/a.py")
+        backend.add_nodes([node])
+        backend.store_embeddings([NodeEmbedding(node_id=node.id, embedding=[1.0] * 384)])
+
+        with pytest.raises(RuntimeError) as exc_info:
+            backend.vector_search([0.1] * 256, limit=5)
+        message = str(exc_info.value)
+        assert "256-dim" in message
+        assert "384-dim" in message
+        assert "synaptiq analyze" in message
+
+    def test_matching_dimension_does_not_raise(self, backend: LadybugBackend) -> None:
+        node = _make_node(name="f", file_path="src/a.py")
+        backend.add_nodes([node])
+        backend.store_embeddings([NodeEmbedding(node_id=node.id, embedding=[1.0, 0.0, 0.0])])
+
+        results = backend.vector_search([1.0, 0.0, 0.0], limit=5)
+        assert len(results) == 1
+
+    def test_empty_table_never_raises_regardless_of_query_width(
+        self, backend: LadybugBackend
+    ) -> None:
+        """No embeddings stored yet (the W4.1 lazy window, or a fresh
+        `--embeddings off` index) — any query vector width is fine, the
+        result is just empty; there is nothing to compare it against."""
+        assert backend.vector_search([0.1] * 384, limit=5) == []
+        assert backend.vector_search([0.1] * 256, limit=5) == []
+        assert backend.vector_search([0.1], limit=5) == []
+
+    def test_hybrid_search_surfaces_mismatch_as_raise(self, backend: LadybugBackend) -> None:
+        """hybrid_search doesn't catch storage.vector_search's errors
+        itself — that's handle_query's job (see tests/mcp/test_tools.py's
+        TestHandleQueryDimensionMismatch) — so it must propagate here."""
+        from synaptiq.core.search.hybrid import hybrid_search
+
+        node = _make_node(name="f", file_path="src/a.py")
+        backend.add_nodes([node])
+        backend.store_embeddings([NodeEmbedding(node_id=node.id, embedding=[1.0] * 256)])
+
+        with pytest.raises(RuntimeError, match="256-dim"):
+            hybrid_search("f", backend, query_embedding=[0.1] * 384, limit=10)
+
+
+# ---------------------------------------------------------------------------
 # Fuzzy search tests
 # ---------------------------------------------------------------------------
 

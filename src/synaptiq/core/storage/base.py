@@ -201,7 +201,14 @@ class StorageBackend(Protocol):
         ...
 
     def vector_search(self, vector: list[float], limit: int) -> list[SearchResult]:
-        """Find the closest nodes to *vector* by cosine similarity."""
+        """Find the closest nodes to *vector* by cosine similarity.
+
+        May raise if *vector*'s width doesn't match the stored vectors'
+        width (e.g. it was encoded with a different embedding tier than the
+        index was built with) and the store holds at least one vector to
+        compare against — implementations should prefer a clear error over
+        a silent empty result in that case (see ``LadybugBackend``).
+        """
         ...
 
     def get_indexed_files(self) -> dict[str, str]:

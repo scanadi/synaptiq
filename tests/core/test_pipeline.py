@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import threading
 import time
@@ -20,6 +21,7 @@ from synaptiq.core.ingestion.pipeline import (
     commit_full_index,
     parse_files,
     run_pipeline,
+    write_meta,
 )
 from synaptiq.core.ingestion.structure import process_structure
 from synaptiq.core.ingestion.walker import FileEntry, walk_repo
@@ -402,6 +404,107 @@ class TestRunPipelinePhaseTimingsSkipEmbeddings:
         assert "Generating embeddings" not in result.phase_timings
 
         _assert_timings_sum_close(result.phase_timings, result.duration_seconds)
+
+
+# ---------------------------------------------------------------------------
+# Embedding tier (W4.4)
+# ---------------------------------------------------------------------------
+
+
+class TestRunPipelineEmbeddingTier:
+    """PipelineResult.embedding_model records the resolved tier, and
+    write_meta persists it into meta.json's stats.embedding_model — even on
+    a run that skips embedding generation entirely, so the repo's tier
+    preference survives an `--embeddings off` run (the Embedding table ends
+    up empty either way, so there is nothing stored to mismatch it against).
+    """
+
+    def test_default_tier_recorded_without_storage(self, tmp_repo: Path) -> None:
+        _, result = run_pipeline(tmp_repo)
+        assert result.embedding_model == "quality"
+
+    def test_default_tier_recorded_with_skip_embeddings(
+        self, tmp_repo: Path, storage: LadybugBackend
+    ) -> None:
+        _, result = run_pipeline(tmp_repo, storage, skip_embeddings=True)
+        assert result.embedding_model == "quality"
+
+    def test_explicit_fast_tier_recorded_with_skip_embeddings(
+        self, tmp_repo: Path, storage: LadybugBackend
+    ) -> None:
+        _, result = run_pipeline(
+            tmp_repo, storage, skip_embeddings=True, embedding_tier="fast"
+        )
+        assert result.embedding_model == "fast"
+
+    def test_write_meta_persists_embedding_model(
+        self, tmp_repo: Path, storage: LadybugBackend, tmp_path: Path
+    ) -> None:
+        _, result = run_pipeline(tmp_repo, storage, skip_embeddings=True, embedding_tier="fast")
+
+        data_dir = tmp_path / "meta_out"
+        data_dir.mkdir()
+        write_meta(data_dir, tmp_repo, result)
+
+        meta = json.loads((data_dir / "meta.json").read_text())
+        assert meta["stats"]["embedding_model"] == "fast"
+
+    def test_unknown_tier_raised_by_embed_graph_not_swallowed_by_run_pipeline(
+        self, tmp_repo: Path, storage: LadybugBackend
+    ) -> None:
+        """run_pipeline's sync embed step has no try/except of its own (see
+        pipeline.py) — an invalid tier propagates rather than silently
+        indexing without vectors, unlike build_full_index's deliberately
+        forgiving daemon path (covered below)."""
+        with pytest.raises(ValueError, match="Unknown embedding tier"):
+            run_pipeline(tmp_repo, storage, embedding_tier="nonexistent-tier")
+
+
+class TestBuildFullIndexEmbeddingTier:
+    """build_full_index (the daemon rebuild path) re-derives the tier from
+    meta.json when not given one explicitly — the watcher's routine global
+    phase and the primary's socket `reindex` handler have no per-cycle CLI
+    flag to take it from (see pipeline.build_full_index's docstring)."""
+
+    def test_no_meta_json_defaults_to_quality(self, tmp_repo: Path) -> None:
+        # No .synaptiq/meta.json exists yet under tmp_repo.
+        _, _, result = build_full_index(tmp_repo, skip_embeddings=True)
+        assert result.embedding_model == "quality"
+
+    def test_rederives_fast_tier_from_existing_meta(self, tmp_repo: Path) -> None:
+        data_dir = tmp_repo / ".synaptiq"
+        data_dir.mkdir()
+        (data_dir / "meta.json").write_text(
+            json.dumps({"stats": {"embedding_model": "fast"}}), encoding="utf-8"
+        )
+
+        _, _, result = build_full_index(tmp_repo, skip_embeddings=True)
+
+        assert result.embedding_model == "fast"
+
+    def test_explicit_tier_overrides_meta(self, tmp_repo: Path) -> None:
+        """The socket-delegated `analyze --embedding-model` path passes an
+        explicit override rather than relying on self-derivation (W4.4)."""
+        data_dir = tmp_repo / ".synaptiq"
+        data_dir.mkdir()
+        (data_dir / "meta.json").write_text(
+            json.dumps({"stats": {"embedding_model": "quality"}}), encoding="utf-8"
+        )
+
+        _, _, result = build_full_index(tmp_repo, skip_embeddings=True, tier="fast")
+
+        assert result.embedding_model == "fast"
+
+    def test_invalid_explicit_tier_degrades_instead_of_crashing_daemon(
+        self, tmp_repo: Path
+    ) -> None:
+        """Unlike run_pipeline's sync path, build_full_index wraps the
+        actual encode in try/except (a daemon must never crash over an
+        embedding problem) — an invalid tier is just a variant of "embedding
+        generation failed"."""
+        graph, embeddings, result = build_full_index(tmp_repo, tier="nonexistent-tier")
+        assert embeddings == []
+        assert graph is not None
 
 
 # ---------------------------------------------------------------------------
