@@ -84,8 +84,15 @@ class RubyParser(LanguageParser):
         except Exception:
             return result
 
-        self._walk(tree.root_node, content, result, class_name="")
-        self._extract_calls(tree.root_node, result, locals_=set())
+        self._walk(
+            tree.root_node,
+            content,
+            result,
+            class_name="",
+            owner=None,
+            locals_=set(),
+            collect_symbols=True,
+        )
         return result
 
     # ------------------------------------------------------------------
@@ -98,38 +105,155 @@ class RubyParser(LanguageParser):
         content: str,
         result: ParseResult,
         class_name: str,
-        owner: SymbolInfo | None = None,
+        owner: SymbolInfo | None,
+        locals_: set[str],
+        collect_symbols: bool,
     ) -> None:
-        """Recursively walk the AST collecting definitions.
+        """Walk the AST once, collecting definitions **and** calls together.
 
-        ``class_name`` is the name of the lexically enclosing class/module, used
-        to attribute methods and constants.  ``owner`` is that type's
-        :class:`SymbolInfo`, used to record accessor macros (``attr_*``) directly
-        on the node properties.  Definition nodes are dispatched to their
-        dedicated extractors; everything else is descended into so that a
-        definition nested inside e.g. an ``if`` block is still discovered.
+        This folds the former second ``_extract_calls`` pass into the single
+        definition walk. Two independent kinds of state are threaded down:
+
+        * *Symbol state* — ``class_name`` (the lexically enclosing class/module,
+          for method/constant attribution) and ``owner`` (that type's
+          :class:`SymbolInfo`, for ``attr_*``/callback macros). Symbol
+          extraction only runs when ``collect_symbols`` is set.
+        * *Call state* — ``locals_``, the names bound as locals/parameters in
+          the current scope. Ruby resolves a bare identifier as a method call
+          only when no local of that name exists, so this set separates a
+          zero-arg call (``validate``) from a local read (``count``). Call
+          extraction always runs.
+
+        ``collect_symbols`` is cleared for the sub-regions the old symbol walk
+        never descended into but the old call walk did — an assignment RHS and a
+        class/module's non-body children — so those yield calls only, exactly as
+        before. Scope rules mirror Ruby's: a ``def`` opens a *fresh* scope
+        seeded with its parameters; a block inherits a *copy* of the enclosing
+        locals plus its block parameters; a class/module body shares the
+        enclosing locals.
         """
         for child in node.children:
-            match child.type:
-                case "method":
-                    self._extract_method(child, content, result, class_name)
-                case "singleton_method":
-                    self._extract_singleton_method(child, content, result, class_name)
-                case "class":
-                    self._extract_class(child, content, result, class_name)
-                case "module":
-                    self._extract_module(child, content, result, class_name)
-                case "assignment":
-                    self._extract_constant(child, content, result, class_name)
-                case "call":
-                    # A ``call`` may be a ``require``-family import or a class
-                    # macro (mixin / attr_*); either way we still descend so
-                    # definitions nested in a block are found.
+            ctype = child.type
+
+            if ctype == "call":
+                # Call site is always recorded; a bare ``call`` may also be a
+                # ``require`` import or a class macro (mixin / attr_*), which are
+                # symbol-side concerns.
+                self._extract_call_node(child, result)
+                if collect_symbols:
                     self._extract_import(child, result)
                     self._extract_class_macro(child, result, class_name, owner)
-                    self._walk(child, content, result, class_name, owner)
-                case _:
-                    self._walk(child, content, result, class_name, owner)
+                self._walk(
+                    child, content, result, class_name, owner, locals_, collect_symbols
+                )
+
+            elif ctype in ("method", "singleton_method"):
+                if collect_symbols:
+                    if ctype == "method":
+                        self._extract_method(child, content, result, class_name)
+                    else:
+                        self._extract_singleton_method(child, content, result, class_name)
+                # A ``def`` opens a fresh scope seeded with its parameters and
+                # only its body is descended (a paren-less identifier in the
+                # parameter list is never a method call).
+                body = child.child_by_field_name("body")
+                if body is not None:
+                    self._walk(
+                        body,
+                        content,
+                        result,
+                        class_name="",
+                        owner=None,
+                        locals_=self._parameter_names(child),
+                        collect_symbols=collect_symbols,
+                    )
+
+            elif ctype in ("class", "module"):
+                symbol: SymbolInfo | None = None
+                if collect_symbols:
+                    if ctype == "class":
+                        symbol = self._extract_class(child, content, result, class_name)
+                    else:
+                        symbol = self._extract_module(child, content, result, class_name)
+                if symbol is None:
+                    # Unnamed/malformed, or already in a calls-only region: the
+                    # old symbol walk skipped the whole node while the call walk
+                    # descended it — so recurse every child for calls only.
+                    self._walk(
+                        child, content, result, class_name, None, locals_, False
+                    )
+                else:
+                    # Calls in the superclass expression (``class A < Base.for(x)``)
+                    # precede the body in source order; the ``name`` field is a
+                    # constant and never holds a call, so it is skipped. The body
+                    # shares the enclosing locals (only defs reset the scope).
+                    superclass = child.child_by_field_name("superclass")
+                    if superclass is not None:
+                        self._walk(
+                            superclass, content, result, class_name, None, locals_, False
+                        )
+                    body = child.child_by_field_name("body")
+                    if body is not None:
+                        self._walk(
+                            body,
+                            content,
+                            result,
+                            symbol.name,
+                            symbol,
+                            locals_,
+                            collect_symbols,
+                        )
+
+            elif ctype in ("block", "do_block"):
+                # A block inherits a COPY of the enclosing locals plus its own
+                # block parameters, so its bindings do not leak outward.
+                self._walk(
+                    child,
+                    content,
+                    result,
+                    class_name,
+                    owner,
+                    locals_ | self._block_parameter_names(child),
+                    collect_symbols,
+                )
+
+            elif ctype in ("assignment", "operator_assignment"):
+                # ``x = foo`` / ``x ||= foo`` — a bare identifier RHS is a
+                # paren-less call; the LHS name then becomes a local.
+                if collect_symbols and ctype == "assignment":
+                    self._extract_constant(child, content, result, class_name)
+                right = child.child_by_field_name("right")
+                if right is not None and right.type == "identifier":
+                    name = right.text.decode("utf8")
+                    if name not in locals_:
+                        result.calls.append(
+                            CallInfo(name=name, line=right.start_point[0] + 1)
+                        )
+                else:
+                    # The old symbol walk descended into an ``operator_assignment``
+                    # but not a plain ``assignment`` (only its constant LHS
+                    # mattered); the call walk descended into both. Preserve the
+                    # split so a ``require`` hidden in an assignment RHS is not
+                    # newly promoted to an import.
+                    recurse_symbols = collect_symbols and ctype == "operator_assignment"
+                    self._walk(
+                        child, content, result, class_name, owner, locals_, recurse_symbols
+                    )
+                left = child.child_by_field_name("left")
+                if left is not None and left.type == "identifier":
+                    locals_.add(left.text.decode("utf8"))
+
+            elif ctype == "identifier" and node.type in _STMT_CONTAINERS:
+                name = child.text.decode("utf8")
+                if name not in locals_:
+                    result.calls.append(
+                        CallInfo(name=name, line=child.start_point[0] + 1)
+                    )
+
+            else:
+                self._walk(
+                    child, content, result, class_name, owner, locals_, collect_symbols
+                )
 
     def _extract_method(
         self,
@@ -138,7 +262,11 @@ class RubyParser(LanguageParser):
         result: ParseResult,
         class_name: str,
     ) -> None:
-        """Extract an instance method (``def foo``) or top-level function."""
+        """Extract an instance method (``def foo``) or top-level function.
+
+        The body (nested definitions and calls) is descended by the unified
+        ``_walk``; nested defs are treated as standalone functions.
+        """
         name_node = node.child_by_field_name("name")
         if name_node is None:
             return
@@ -159,13 +287,6 @@ class RubyParser(LanguageParser):
                 class_name=class_name,
             )
         )
-
-        # Descend into the body for nested definitions (rare in Ruby, but a
-        # ``def`` may itself contain a class/module).  Nested defs are treated
-        # as standalone functions, matching the Python parser.
-        body = node.child_by_field_name("body")
-        if body is not None:
-            self._walk(body, content, result, class_name="")
 
     def _extract_singleton_method(
         self,
@@ -198,10 +319,7 @@ class RubyParser(LanguageParser):
                 class_name=class_name,
             )
         )
-
-        body = node.child_by_field_name("body")
-        if body is not None:
-            self._walk(body, content, result, class_name="")
+        # The body is descended by the unified _walk.
 
     def _extract_class(
         self,
@@ -209,11 +327,16 @@ class RubyParser(LanguageParser):
         content: str,
         result: ParseResult,
         class_name: str,
-    ) -> None:
-        """Extract a class definition and walk its body for members."""
+    ) -> SymbolInfo | None:
+        """Extract a class definition; return its symbol for scope threading.
+
+        The body (members and calls) is descended by the unified ``_walk``;
+        this records only the class symbol and its ``extends`` heritage.
+        Returns ``None`` for an unnamed (malformed) class.
+        """
         name = self._definition_name(node)
         if not name:
-            return
+            return None
 
         symbol = SymbolInfo(
             name=name,
@@ -232,10 +355,7 @@ class RubyParser(LanguageParser):
             parent = self._superclass_name(superclass)
             if parent:
                 result.heritage.append((name, "extends", parent))
-
-        body = node.child_by_field_name("body")
-        if body is not None:
-            self._walk(body, content, result, class_name=name, owner=symbol)
+        return symbol
 
     def _extract_module(
         self,
@@ -243,11 +363,15 @@ class RubyParser(LanguageParser):
         content: str,
         result: ParseResult,
         class_name: str,
-    ) -> None:
-        """Extract a module definition and walk its body for members."""
+    ) -> SymbolInfo | None:
+        """Extract a module definition; return its symbol for scope threading.
+
+        The body (members and calls) is descended by the unified ``_walk``.
+        Returns ``None`` for an unnamed (malformed) module.
+        """
         name = self._definition_name(node)
         if not name:
-            return
+            return None
 
         symbol = SymbolInfo(
             name=name,
@@ -259,10 +383,7 @@ class RubyParser(LanguageParser):
             content=node.text.decode("utf8"),
         )
         result.symbols.append(symbol)
-
-        body = node.child_by_field_name("body")
-        if body is not None:
-            self._walk(body, content, result, class_name=name, owner=symbol)
+        return symbol
 
     def _extract_constant(
         self,
@@ -401,52 +522,6 @@ class RubyParser(LanguageParser):
     # ------------------------------------------------------------------
     # Calls
     # ------------------------------------------------------------------
-
-    def _extract_calls(self, node: Node, result: ParseResult, locals_: set[str]) -> None:
-        """Recursively collect method calls into ``result.calls``.
-
-        ``locals_`` holds the names bound as local variables / parameters in the
-        current scope.  Ruby resolves a bare identifier as a method call only
-        when no local of that name exists, so this set distinguishes a real
-        zero-arg call (``validate``) from a local-variable read (``count``).
-
-        Scope rules mirror Ruby's: a ``def`` opens a *fresh* scope (methods do
-        not capture surrounding locals) seeded with its parameters, while a
-        block inherits the enclosing locals plus its own block parameters.
-        """
-        for child in node.children:
-            ctype = child.type
-            if ctype == "call":
-                self._extract_call_node(child, result)
-                # Descend to find nested calls (arguments, receiver chains,
-                # block bodies).  A ``call`` is not a statement container, so a
-                # receiver identifier here is never mistaken for a bare call.
-                self._extract_calls(child, result, locals_)
-            elif ctype in ("method", "singleton_method"):
-                body = child.child_by_field_name("body")
-                if body is not None:
-                    self._extract_calls(body, result, self._parameter_names(child))
-            elif ctype in ("block", "do_block"):
-                self._extract_calls(child, result, locals_ | self._block_parameter_names(child))
-            elif ctype in ("assignment", "operator_assignment"):
-                # Both ``x = foo`` and ``x ||= foo`` (the idiomatic memoization
-                # form) take a bare identifier on the RHS as a paren-less call.
-                right = child.child_by_field_name("right")
-                if right is not None and right.type == "identifier":
-                    name = right.text.decode("utf8")
-                    if name not in locals_:
-                        result.calls.append(CallInfo(name=name, line=right.start_point[0] + 1))
-                else:
-                    self._extract_calls(child, result, locals_)
-                left = child.child_by_field_name("left")
-                if left is not None and left.type == "identifier":
-                    locals_.add(left.text.decode("utf8"))
-            elif ctype == "identifier" and node.type in _STMT_CONTAINERS:
-                name = child.text.decode("utf8")
-                if name not in locals_:
-                    result.calls.append(CallInfo(name=name, line=child.start_point[0] + 1))
-            else:
-                self._extract_calls(child, result, locals_)
 
     def _extract_call_node(self, node: Node, result: ParseResult) -> None:
         """Extract a single ``call`` node into a :class:`CallInfo`."""
