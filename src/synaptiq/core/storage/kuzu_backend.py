@@ -43,8 +43,7 @@ _LABEL_TO_TABLE: dict[str, str] = {
 _LABEL_MAP: dict[str, NodeLabel] = {label.value: label for label in NodeLabel}
 
 _SEARCHABLE_TABLES: list[str] = [
-    t for t in _NODE_TABLE_NAMES
-    if t not in ("Folder", "Community", "Process")
+    t for t in _NODE_TABLE_NAMES if t not in ("Folder", "Community", "Process")
 ]
 
 _NODE_PROPERTIES = (
@@ -68,15 +67,26 @@ _NODE_PROPERTIES = (
 # Explicit column lists (instead of ``RETURN n.*``) keep row decoding
 # independent of Kuzu's internal property ordering.
 _NODE_COLUMN_NAMES: tuple[str, ...] = (
-    "id", "name", "file_path", "start_line", "end_line", "content",
-    "signature", "language", "class_name", "is_dead", "is_entry_point",
-    "is_exported", "properties_json",
+    "id",
+    "name",
+    "file_path",
+    "start_line",
+    "end_line",
+    "content",
+    "signature",
+    "language",
+    "class_name",
+    "is_dead",
+    "is_entry_point",
+    "is_exported",
+    "properties_json",
 )
 
 
 def _node_columns(alias: str) -> str:
     """Return the explicit node column list for *alias* (e.g. ``n.id, n.name, ...``)."""
     return ", ".join(f"{alias}.{c}" for c in _NODE_COLUMN_NAMES)
+
 
 _REL_PROPERTIES = (
     "rel_type STRING, "
@@ -87,6 +97,7 @@ _REL_PROPERTIES = (
     "co_changes INT64, "
     "symbols STRING"
 )
+
 
 def _escape(value: str) -> str:
     """Escape a string for inclusion in a Cypher literal.
@@ -127,6 +138,7 @@ def deserialize_properties(raw: Any) -> dict[str, Any]:
         return {}
     return parsed if isinstance(parsed, dict) else {}
 
+
 # Embedding vectors use a fixed-dimension FLOAT column so Kuzu's HNSW
 # vector index can be built on them; 384 matches BAAI/bge-small-en-v1.5.
 # The bulk store path recreates the table from the actual embedding width,
@@ -143,6 +155,7 @@ def _embedding_ddl(dim: int) -> str:
     from, so rebuilds can reuse vectors for unchanged symbols.
     """
     return f"node_id STRING, vec FLOAT[{dim}], text_sha STRING, PRIMARY KEY(node_id)"
+
 
 # Maximum number of read connections to keep in the pool.
 _MAX_POOL_SIZE = 8
@@ -169,20 +182,17 @@ def open_with_recovery(
     try:
         storage.initialize(db_path, read_only=read_only)
         return storage
-    except RuntimeError as exc:
+    except (RuntimeError, IndexError) as exc:
+        # "unordered_map::at" surfaces as IndexError from the native layer
+        # when kuzu replays a stale WAL or reads a partially written file.
         msg = str(exc).lower()
-        if "primary key" not in msg and "corrupt" not in msg:
+        recoverable = "primary key" in msg or "corrupt" in msg or "unordered_map" in msg
+        if not recoverable:
             raise
 
     logger.warning("Corrupted index detected, removing %s", db_path)
     storage.close()
-    if db_path.is_dir():
-        shutil.rmtree(db_path, ignore_errors=True)
-    else:
-        db_path.unlink(missing_ok=True)
-        # Clean up WAL/shadow files left alongside a file-based DB.
-        for suffix in (".wal", ".shadow"):
-            db_path.with_suffix(suffix).unlink(missing_ok=True)
+    KuzuBackend._remove_db_files(db_path)
     if meta_path is not None:
         meta_path.unlink(missing_ok=True)
 
@@ -215,7 +225,7 @@ class KuzuBackend:
         self._read_pool: list[tuple[int, kuzu.Connection]] = []
         self._pool_lock = threading.Lock()
         self._generation = 0
-        # In-flight read tracking so destructive operations (_reset_database)
+        # In-flight read tracking so destructive operations (the bulk_load swap)
         # can drain readers that outlived their dispatch timeout.
         self._reads_cv = threading.Condition()
         self._active_reads = 0
@@ -370,7 +380,7 @@ class KuzuBackend:
     def _read_conn(self) -> Iterator[kuzu.Connection]:
         """Context manager for read connections from the pool.
 
-        Tracks in-flight reads so :meth:`_reset_database` can wait for
+        Tracks in-flight reads so the ``bulk_load`` swap can wait for
         stragglers before deleting database files out from under them.
         The counter is incremented BEFORE acquiring the connection — a
         reader inside connection creation must already be visible to
@@ -553,9 +563,7 @@ class KuzuBackend:
                     break
 
                 # Batch query: get all neighbors of current level at once.
-                neighbors = self._get_neighbors_batch(
-                    conn, current_ids, direction
-                )
+                neighbors = self._get_neighbors_batch(conn, current_ids, direction)
 
                 next_ids: list[str] = []
                 for node in neighbors:
@@ -601,9 +609,7 @@ class KuzuBackend:
                     if node is not None:
                         nodes.append(node)
             except Exception:
-                logger.debug(
-                    "_get_neighbors_batch failed for table %s", table, exc_info=True
-                )
+                logger.debug("_get_neighbors_batch failed for table %s", table, exc_info=True)
 
         return nodes
 
@@ -711,9 +717,7 @@ class KuzuBackend:
                         if row[0] and row[1]:
                             mapping[row[0]] = row[1]
                 except Exception:
-                    logger.debug(
-                        "get_process_memberships failed on table %s", table, exc_info=True
-                    )
+                    logger.debug("get_process_memberships failed on table %s", table, exc_info=True)
         return mapping
 
     def load_graph(self) -> KnowledgeGraph:
@@ -736,11 +740,13 @@ class KuzuBackend:
 
             # One label-less query covers every table pair in the rel group.
             try:
-                rel_rows = self._drain(conn.execute(
-                    "MATCH (a)-[r:CodeRelation]->(b) "
-                    "RETURN a.id, b.id, r.rel_type, r.confidence, r.symbols, "
-                    "r.strength, r.co_changes, r.step_number, r.role"
-                ))
+                rel_rows = self._drain(
+                    conn.execute(
+                        "MATCH (a)-[r:CodeRelation]->(b) "
+                        "RETURN a.id, b.id, r.rel_type, r.confidence, r.symbols, "
+                        "r.strength, r.co_changes, r.step_number, r.role"
+                    )
+                )
             except Exception:
                 logger.debug("load_graph: relationship query failed", exc_info=True)
                 rel_rows = []
@@ -765,18 +771,18 @@ class KuzuBackend:
                     props["step_number"] = int(row[7])
                 if row[8]:
                     props["role"] = str(row[8])
-                graph.add_relationship(GraphRelationship(
-                    id=rel_id,
-                    type=rel_type,
-                    source=row[0],
-                    target=row[1],
-                    properties=props,
-                ))
+                graph.add_relationship(
+                    GraphRelationship(
+                        id=rel_id,
+                        type=rel_type,
+                        source=row[0],
+                        target=row[1],
+                        properties=props,
+                    )
+                )
         return graph
 
-    def execute_raw(
-        self, query: str, parameters: dict[str, Any] | None = None
-    ) -> list[list[Any]]:
+    def execute_raw(self, query: str, parameters: dict[str, Any] | None = None) -> list[list[Any]]:
         """Execute a raw Cypher query and return all result rows.
 
         Args:
@@ -888,9 +894,7 @@ class KuzuBackend:
         candidates.sort(key=lambda r: (-r.score, r.node_id))
         return candidates[:limit]
 
-    def fuzzy_search(
-        self, query: str, limit: int, max_distance: int = 2
-    ) -> list[SearchResult]:
+    def fuzzy_search(self, query: str, limit: int, max_distance: int = 2) -> list[SearchResult]:
         """Fuzzy name search using Levenshtein edit distance.
 
         Scans all node tables for symbols whose name is within
@@ -965,9 +969,7 @@ class KuzuBackend:
                         },
                     )
                 except Exception:
-                    logger.debug(
-                        "store_embeddings failed for node %s", emb.node_id, exc_info=True
-                    )
+                    logger.debug("store_embeddings failed for node %s", emb.node_id, exc_info=True)
 
         self._create_vector_index()
 
@@ -998,9 +1000,7 @@ class KuzuBackend:
         """Drop the HNSW index if present (no-op when absent)."""
         assert self._conn is not None
         try:
-            self._conn.execute(
-                f"CALL DROP_VECTOR_INDEX('Embedding', '{_VECTOR_INDEX_NAME}')"
-            )
+            self._conn.execute(f"CALL DROP_VECTOR_INDEX('Embedding', '{_VECTOR_INDEX_NAME}')")
         except Exception:
             pass
 
@@ -1015,13 +1015,11 @@ class KuzuBackend:
         mapping: dict[str, tuple[str, list[float]]] = {}
         with self._read_conn() as conn:
             try:
-                rows = self._drain(conn.execute(
-                    "MATCH (e:Embedding) RETURN e.node_id, e.text_sha, e.vec"
-                ))
-            except Exception:
-                logger.debug(
-                    "load_embeddings failed (pre-text_sha schema?)", exc_info=True
+                rows = self._drain(
+                    conn.execute("MATCH (e:Embedding) RETURN e.node_id, e.text_sha, e.vec")
                 )
+            except Exception:
+                logger.debug("load_embeddings failed (pre-text_sha schema?)", exc_info=True)
                 return {}
         for row in rows:
             if row[0] and row[1] and row[2]:
@@ -1106,10 +1104,7 @@ class KuzuBackend:
         except Exception:
             logger.debug("Vector index unavailable, falling back to scan", exc_info=True)
             return None
-        return [
-            (row[0] or "", 1.0 - float(row[1]) if row[1] is not None else 0.0)
-            for row in rows
-        ]
+        return [(row[0] or "", 1.0 - float(row[1]) if row[1] is not None else 0.0) for row in rows]
 
     @classmethod
     def _vector_scan_query(
@@ -1133,10 +1128,7 @@ class KuzuBackend:
             except Exception:
                 logger.debug("vector scan failed for %s", vec_expr[:40], exc_info=True)
                 continue
-            return [
-                (row[0] or "", float(row[1]) if row[1] is not None else 0.0)
-                for row in rows
-            ]
+            return [(row[0] or "", float(row[1]) if row[1] is not None else 0.0) for row in rows]
         return []
 
     def get_indexed_files(self) -> dict[str, str]:
@@ -1144,9 +1136,7 @@ class KuzuBackend:
         mapping: dict[str, str] = {}
         with self._read_conn() as conn:
             try:
-                rows = self._drain(conn.execute(
-                    "MATCH (n:File) RETURN n.file_path, n.content"
-                ))
+                rows = self._drain(conn.execute("MATCH (n:File) RETURN n.file_path, n.content"))
                 for row in rows:
                     fp = row[0] or ""
                     content = row[1] or ""
@@ -1155,47 +1145,65 @@ class KuzuBackend:
                 logger.debug("get_indexed_files failed", exc_info=True)
         return mapping
 
-    def _reset_database(self) -> None:
-        """Close, delete, and reinitialize the database from scratch.
-
-        This avoids ``MATCH (n) DETACH DELETE n`` which triggers a segfault
-        in Kuzu's native layer on large datasets (2000+ files).
-
-        Waits for in-flight reads to drain first: a read whose dispatch
-        timed out keeps running in its thread after the RW lock is released,
-        and deleting the database files under a live native query risks a
-        crash in Kuzu's native layer.
-        """
-        assert self._db_path is not None
-        db_path = self._db_path
-        self._wait_for_readers()
-        self.close()
-        if db_path.exists():
-            if db_path.is_dir():
-                shutil.rmtree(db_path)
-            else:
-                db_path.unlink()
-        self.initialize(db_path)
+    @staticmethod
+    def _remove_db_files(db_path: Path) -> None:
+        """Delete a database file/dir and its WAL/shadow siblings."""
+        if db_path.is_dir():
+            shutil.rmtree(db_path, ignore_errors=True)
+        else:
+            db_path.unlink(missing_ok=True)
+        # str-concat, not with_suffix: the path may already carry a suffix
+        # (e.g. ``kuzu.rebuild``) that with_suffix would replace.
+        for suffix in (".wal", ".shadow"):
+            Path(str(db_path) + suffix).unlink(missing_ok=True)
 
     def bulk_load(self, graph: KnowledgeGraph) -> None:
         """Replace the entire store with the contents of *graph*.
 
+        Builds into a sibling ``.rebuild`` database first and swaps it in
+        only after the load fully succeeds — a failed build (or a crash
+        mid-build) leaves the live index untouched.  Rebuilding from
+        scratch rather than ``MATCH (n) DETACH DELETE n`` also avoids a
+        Kuzu native segfault on large deletes.
+
         Uses CSV-based COPY FROM for bulk loading nodes and relationships,
         falling back to individual inserts if COPY FROM fails.
 
-        Recreates the database from scratch to avoid a Kuzu native segfault
-        on large ``DETACH DELETE`` operations.
+        The swap waits for in-flight reads to drain first: a read whose
+        dispatch timed out keeps running in its thread after the RW lock
+        is released, and moving database files under a live native query
+        risks a crash in Kuzu's native layer.
         """
-        self._reset_database()
-        assert self._conn is not None
+        assert self._db_path is not None
+        live_path = self._db_path
+        tmp_path = live_path.with_name(live_path.name + ".rebuild")
 
-        if not self._bulk_load_nodes_csv(graph):
-            self.add_nodes(list(graph.iter_nodes()))
+        self._remove_db_files(tmp_path)
+        builder = KuzuBackend()
+        builder.initialize(tmp_path)
+        try:
+            if not builder._bulk_load_nodes_csv(graph):
+                builder.add_nodes(list(graph.iter_nodes()))
+            if not builder._bulk_load_rels_csv(graph):
+                builder.add_relationships(list(graph.iter_relationships()))
+            builder.rebuild_fts_indexes()
+        except BaseException:
+            builder.close()
+            self._remove_db_files(tmp_path)
+            raise
+        builder.close()
 
-        if not self._bulk_load_rels_csv(graph):
-            self.add_relationships(list(graph.iter_relationships()))
-
-        self.rebuild_fts_indexes()
+        # Swap: drain readers, close the live handle, move the fresh
+        # database into place, reopen.
+        self._wait_for_readers()
+        self.close()
+        self._remove_db_files(live_path)
+        tmp_path.replace(live_path)
+        for suffix in (".wal", ".shadow"):
+            artifact = Path(str(tmp_path) + suffix)
+            if artifact.exists():
+                artifact.replace(Path(str(live_path) + suffix))
+        self.initialize(live_path)
 
     def rebuild_fts_indexes(self) -> None:
         """Drop and recreate all FTS indexes.
@@ -1232,7 +1240,13 @@ class KuzuBackend:
                 writer = csv.writer(f)
                 writer.writerows(rows)
                 csv_path = f.name
-            self._conn.execute(f'COPY {table} FROM "{csv_path}" (HEADER=false)')
+            # PARALLEL=false is required: node ``content``/``signature`` and
+            # relationship properties carry source code with embedded newlines,
+            # and Kuzu's parallel CSV reader rejects quoted newlines ("Quoted
+            # newlines are not supported in parallel CSV reader"). Without this
+            # every COPY of real code silently fails and bulk_load falls back to
+            # row-by-row inserts — ~50x slower on large repos.
+            self._conn.execute(f'COPY {table} FROM "{csv_path}" (HEADER=false, PARALLEL=false)')
         finally:
             if csv_path:
                 Path(csv_path).unlink(missing_ok=True)
@@ -1263,16 +1277,33 @@ class KuzuBackend:
 
         try:
             for table, nodes in by_table.items():
-                self._csv_copy(table, [
-                    [node.id, node.name, node.file_path, node.start_line,
-                     node.end_line, node.content, node.signature, node.language,
-                     node.class_name, node.is_dead, node.is_entry_point,
-                     node.is_exported, _serialize_properties(node.properties)]
-                    for node in nodes
-                ])
+                self._csv_copy(
+                    table,
+                    [
+                        [
+                            node.id,
+                            node.name,
+                            node.file_path,
+                            node.start_line,
+                            node.end_line,
+                            node.content,
+                            node.signature,
+                            node.language,
+                            node.class_name,
+                            node.is_dead,
+                            node.is_entry_point,
+                            node.is_exported,
+                            _serialize_properties(node.properties),
+                        ]
+                        for node in nodes
+                    ],
+                )
             return True
         except Exception:
-            logger.debug("CSV bulk_load_nodes failed, falling back", exc_info=True)
+            logger.warning(
+                "CSV COPY for nodes failed; falling back to slow row-by-row inserts",
+                exc_info=True,
+            )
             return False
 
     def _bulk_load_rels_csv(self, graph: KnowledgeGraph) -> bool:
@@ -1313,19 +1344,29 @@ class KuzuBackend:
 
         try:
             for (src_table, dst_table), rels in by_pair.items():
-                self._csv_copy(f"CodeRelation_{src_table}_{dst_table}", [
-                    [rel.source, rel.target, rel.type.value,
-                     float((rel.properties or {}).get("confidence", 1.0)),
-                     str((rel.properties or {}).get("role", "")),
-                     int((rel.properties or {}).get("step_number", 0)),
-                     float((rel.properties or {}).get("strength", 0.0)),
-                     int((rel.properties or {}).get("co_changes", 0)),
-                     str((rel.properties or {}).get("symbols", ""))]
-                    for rel in rels
-                ])
+                self._csv_copy(
+                    f"CodeRelation_{src_table}_{dst_table}",
+                    [
+                        [
+                            rel.source,
+                            rel.target,
+                            rel.type.value,
+                            float((rel.properties or {}).get("confidence", 1.0)),
+                            str((rel.properties or {}).get("role", "")),
+                            int((rel.properties or {}).get("step_number", 0)),
+                            float((rel.properties or {}).get("strength", 0.0)),
+                            int((rel.properties or {}).get("co_changes", 0)),
+                            str((rel.properties or {}).get("symbols", "")),
+                        ]
+                        for rel in rels
+                    ],
+                )
             return True
         except Exception:
-            logger.debug("CSV bulk_load_rels failed, falling back", exc_info=True)
+            logger.warning(
+                "CSV COPY for relationships failed; falling back to slow row-by-row inserts",
+                exc_info=True,
+            )
             return False
 
     def _bulk_store_embeddings_csv(self, embeddings: list[NodeEmbedding]) -> bool:
@@ -1347,15 +1388,19 @@ class KuzuBackend:
                 f"Embedding({_embedding_ddl(len(embeddings[0].embedding))})"
             )
 
-            self._csv_copy("Embedding", [
-                [emb.node_id,
-                 "[" + ",".join(str(v) for v in emb.embedding) + "]",
-                 emb.text_sha]
-                for emb in embeddings
-            ])
+            self._csv_copy(
+                "Embedding",
+                [
+                    [emb.node_id, "[" + ",".join(str(v) for v in emb.embedding) + "]", emb.text_sha]
+                    for emb in embeddings
+                ],
+            )
             return True
         except Exception:
-            logger.debug("CSV bulk_store_embeddings failed, falling back", exc_info=True)
+            logger.warning(
+                "CSV COPY for embeddings failed; falling back to slow row-by-row inserts",
+                exc_info=True,
+            )
             return False
 
     def _create_schema(self) -> None:
@@ -1394,8 +1439,7 @@ class KuzuBackend:
 
         pairs_clause = ", ".join(from_to_pairs)
         rel_stmt = (
-            f"CREATE REL TABLE GROUP IF NOT EXISTS CodeRelation("
-            f"{pairs_clause}, {_REL_PROPERTIES})"
+            f"CREATE REL TABLE GROUP IF NOT EXISTS CodeRelation({pairs_clause}, {_REL_PROPERTIES})"
         )
         try:
             self._conn.execute(rel_stmt)
@@ -1502,9 +1546,7 @@ class KuzuBackend:
                 "Insert relationship failed: %s -> %s", rel.source, rel.target, exc_info=True
             )
 
-    def _query_nodes(
-        self, query: str, parameters: dict[str, Any] | None = None
-    ) -> list[GraphNode]:
+    def _query_nodes(self, query: str, parameters: dict[str, Any] | None = None) -> list[GraphNode]:
         """Execute a query returning the node column list and convert to GraphNodes."""
         nodes: list[GraphNode] = []
         with self._read_conn() as conn:

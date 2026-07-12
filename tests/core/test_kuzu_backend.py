@@ -102,9 +102,7 @@ class TestInitializeAndClose:
 
 
 class TestBulkLoad:
-    def test_bulk_load_inserts_nodes_and_relationships(
-        self, backend: KuzuBackend
-    ) -> None:
+    def test_bulk_load_inserts_nodes_and_relationships(self, backend: KuzuBackend) -> None:
         graph = _build_small_graph()
         backend.bulk_load(graph)
 
@@ -372,3 +370,151 @@ class TestMultipleLabels:
         assert backend.get_node(cls.id) is not None
         assert backend.get_node(fn.id).label == NodeLabel.FUNCTION
         assert backend.get_node(cls.id).label == NodeLabel.CLASS
+
+
+class TestRecoveryAndRebuildSafety:
+    """Regression tests for the stale-WAL incident (v1.4.0 → v1.4.1)."""
+
+    def test_remove_db_files_takes_wal_and_shadow_siblings(self, tmp_path: Path) -> None:
+        """Sibling WAL/shadow files must die with the database file.
+
+        A stale WAL left beside a recreated database gets replayed into
+        the fresh file by kuzu and corrupts it (unordered_map::at).
+        """
+        db = tmp_path / "kuzu.rebuild"
+        for p in (db, Path(str(db) + ".wal"), Path(str(db) + ".shadow")):
+            p.write_bytes(b"x")
+
+        KuzuBackend._remove_db_files(db)
+
+        assert not db.exists()
+        assert not Path(str(db) + ".wal").exists()
+        assert not Path(str(db) + ".shadow").exists()
+
+    def test_open_with_recovery_handles_native_map_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """IndexError('unordered_map::at...') triggers recovery, not a crash."""
+        from synaptiq.core.storage.kuzu_backend import open_with_recovery
+
+        db = tmp_path / "kuzu"
+        stale_wal = tmp_path / "kuzu.wal"
+        stale_wal.write_bytes(b"stale")
+
+        calls = {"n": 0}
+        real_init = KuzuBackend.initialize
+
+        def flaky_init(self, path, *, read_only=False):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise IndexError("unordered_map::at: key not found")
+            return real_init(self, path, read_only=read_only)
+
+        monkeypatch.setattr(KuzuBackend, "initialize", flaky_init)
+
+        storage = open_with_recovery(db, tmp_path / "meta.json")
+        try:
+            assert storage._db is not None
+            assert not stale_wal.exists()
+        finally:
+            storage.close()
+
+    def test_failed_rebuild_leaves_live_index_intact(self, tmp_path: Path) -> None:
+        """bulk_load builds aside and swaps — a failed build keeps old data."""
+        from synaptiq.core.graph.model import GraphNode, NodeLabel
+
+        db = tmp_path / "kuzu"
+        backend = KuzuBackend()
+        backend.initialize(db)
+        node = GraphNode(
+            id="function:src/a.py:keep_me",
+            label=NodeLabel.FUNCTION,
+            name="keep_me",
+            file_path="src/a.py",
+        )
+        g1 = KnowledgeGraph()
+        g1.add_node(node)
+        backend.bulk_load(g1)
+        assert backend.get_node(node.id) is not None
+
+        # Sabotage the builder so the rebuild fails mid-flight.
+        class BoomError(Exception):
+            pass
+
+        original = KuzuBackend._bulk_load_nodes_csv
+
+        def exploding(self, graph):
+            raise BoomError("simulated mid-rebuild failure")
+
+        KuzuBackend._bulk_load_nodes_csv = exploding
+        try:
+            with pytest.raises(BoomError):
+                backend.bulk_load(KnowledgeGraph())
+        finally:
+            KuzuBackend._bulk_load_nodes_csv = original
+
+        # Old data still served; no .rebuild leftovers.
+        assert backend.get_node(node.id) is not None
+        assert not (tmp_path / "kuzu.rebuild").exists()
+        backend.close()
+
+
+class TestBulkLoadCopyPath:
+    """Regression tests: CSV COPY must handle source code with embedded newlines.
+
+    Kuzu's parallel CSV reader rejects quoted newlines, so COPY of real code
+    used to fail silently and fall back to ~50x slower row-by-row inserts.
+    PARALLEL=false in ``_csv_copy`` keeps bulk_load on the fast path.
+    """
+
+    def _gnarly_node(self) -> GraphNode:
+        # newlines, double-quotes, and commas — all CSV hazards.
+        return GraphNode(
+            id="function:src/x.ts:f",
+            label=NodeLabel.FUNCTION,
+            name="f",
+            file_path="src/x.ts",
+            content='export const f = (a: string, b: number) => {\n  return `hi, "${a}"`;\n};\n',
+            signature='(a: string, b: number) => `hi, "x"`',
+            language="typescript",
+        )
+
+    def test_node_copy_used_for_content_with_newlines(self, backend: KuzuBackend) -> None:
+        """_bulk_load_nodes_csv stays on the fast COPY path (returns True)."""
+        g = KnowledgeGraph()
+        g.add_node(self._gnarly_node())
+        assert backend._bulk_load_nodes_csv(g) is True
+
+    def test_rel_copy_used_for_content_with_newlines(self, backend: KuzuBackend) -> None:
+        """Relationship COPY succeeds once nodes are present (no fallback)."""
+        g = KnowledgeGraph()
+        a = self._gnarly_node()
+        b = GraphNode(
+            id="function:src/x.ts:g",
+            label=NodeLabel.FUNCTION,
+            name="g",
+            file_path="src/x.ts",
+        )
+        g.add_node(a)
+        g.add_node(b)
+        g.add_relationship(
+            GraphRelationship(
+                id="r0",
+                type=RelType.CALLS,
+                source=a.id,
+                target=b.id,
+                properties={"rel_type": "calls", "confidence": 1.0},
+            )
+        )
+        backend.add_nodes(list(g.iter_nodes()))
+        assert backend._bulk_load_rels_csv(g) is True
+
+    def test_bulk_load_roundtrips_content_with_newlines(self, backend: KuzuBackend) -> None:
+        """End-to-end: gnarly multi-line content survives bulk_load intact."""
+        node = self._gnarly_node()
+        g = KnowledgeGraph()
+        g.add_node(node)
+        backend.bulk_load(g)
+        stored = backend.get_node(node.id)
+        assert stored is not None
+        assert stored.content == node.content
