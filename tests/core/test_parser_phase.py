@@ -336,6 +336,30 @@ class TestProcessParsingReturnsParseData:
         assert len(result) == 2
         assert all(isinstance(d, FileParseData) for d in result)
 
+    def test_parse_data_carries_symbol_ids(
+        self, graph: KnowledgeGraph
+    ) -> None:
+        """Phase 2 carries the computed node IDs forward on symbol_ids (W2.5c)
+        so later phases (calls.py's decorator-edge resolution) can reuse
+        them instead of recomputing via assign_symbol_ids a second time."""
+        files = [_make_file_entry("src/utils.py", PYTHON_CODE, "python")]
+        result = process_parsing(files, graph)
+
+        fpd = result[0]
+        assert fpd.symbol_ids is not None
+        assert len(fpd.symbol_ids) == len(fpd.parse_result.symbols)
+        # No unresolved collisions in this fixture -- every entry is a
+        # real ID, and it matches what assign_symbol_ids computes directly.
+        assert all(sid is not None for sid in fpd.symbol_ids)
+        assert fpd.symbol_ids == parser_phase_module.assign_symbol_ids(
+            fpd.parse_result.symbols, "src/utils.py"
+        )
+
+        # And the carried IDs are exactly the IDs the nodes were stored
+        # under in the graph.
+        for sid in fpd.symbol_ids:
+            assert graph.get_node(sid) is not None
+
     def test_parse_data_carries_imports(
         self, graph: KnowledgeGraph
     ) -> None:
