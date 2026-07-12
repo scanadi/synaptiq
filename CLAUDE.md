@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Synaptiq is a graph-powered code intelligence engine that indexes codebases into a knowledge graph (KuzuDB) and exposes it via MCP tools for AI agents and a Typer CLI for developers. It supports Python, TypeScript, JavaScript, and Ruby via tree-sitter parsing.
+Synaptiq is a graph-powered code intelligence engine that indexes codebases into a knowledge graph (LadybugDB) and exposes it via MCP tools for AI agents and a Typer CLI for developers. It supports Python, TypeScript, JavaScript, and Ruby via tree-sitter parsing.
 
 Package name: `synaptiq` (published to PyPI). Python 3.11+ required.
 
@@ -75,24 +75,24 @@ The core of Synaptiq is `src/synaptiq/core/ingestion/pipeline.py` which orchestr
 12. `coupling.py` — git history co-change analysis (COUPLED_WITH edges)
 13. Embeddings (optional) — fastembed BAAI/bge-small-en-v1.5 384-dim vectors for semantic search. Skippable via `--no-embeddings` flag on `analyze`. Incremental across rebuilds: vectors carry a `text_sha` of their source text, and `embed_graph(previous=...)` reuses stored vectors (snapshot via `load_previous_embeddings` BEFORE `bulk_load` wipes the DB) so only changed symbols hit ONNX — a one-file change re-encodes a handful of symbols, not all ~19k.
 
-Note: all edges are stored in a single Kuzu rel table group `CodeRelation` with the
+Note: all edges are stored in a single LadybugDB rel table group `CodeRelation` with the
 logical kind in its `rel_type` property — Cypher must filter on `r.rel_type`, not
 use logical labels like `[:CALLS]`. Node `properties` dicts are persisted in the
 `properties_json` column.
 
 ### Storage Layer
 
-`src/synaptiq/core/storage/base.py` defines a `StorageBackend` Protocol. The default implementation is `kuzu_backend.py` (KuzuDB — embedded graph DB with Cypher, FTS, and vector support). Optional Neo4j backend available via `synaptiq[neo4j]`.
+`src/synaptiq/core/storage/base.py` defines a `StorageBackend` Protocol. The default implementation is `ladybug_backend.py` (LadybugDB — embedded graph DB with Cypher, FTS, and vector support). LadybugDB is the actively-maintained, API-drop-in successor to the archived KuzuDB; the full replacement was an owner decision (W2.7) — see `docs/plans/2026-07-12-storage-successor-evaluation.md`. There is no legacy kuzu support: an old kuzu-format index (a directory; LadybugDB uses a single-file format) fails to open and `open_with_recovery` rebuilds it from source. Optional Neo4j backend available via `synaptiq[neo4j]`.
 
-Data stored in `.synaptiq/` directory within each indexed repo.
+Data stored in `.synaptiq/` directory within each indexed repo. The on-disk index path is kept as `.synaptiq/kuzu` deliberately — reusing the path lets `analyze` detect a former-KuzuDB index on open and rebuild it in place.
 
 ### Search
 
-`src/synaptiq/core/search/hybrid.py` implements BM25 + vector (384-dim BAAI/bge-small-en-v1.5 via fastembed) + fuzzy search fused with Reciprocal Rank Fusion. Vector search is served by a Kuzu HNSW index (`embedding_vec_idx`, cosine metric) rebuilt by `store_embeddings`; pre-index databases (legacy `DOUBLE[]` column) fall back to a full `array_cosine_similarity` scan. The index pins the Embedding table — drop it before `DROP TABLE` or column updates.
+`src/synaptiq/core/search/hybrid.py` implements BM25 + vector (384-dim BAAI/bge-small-en-v1.5 via fastembed) + fuzzy search fused with Reciprocal Rank Fusion. Vector search is served by a LadybugDB HNSW index (`embedding_vec_idx`, cosine metric) rebuilt by `store_embeddings`; a database whose index build failed falls back to a full `array_cosine_similarity` scan. The index pins the Embedding table — drop it before `DROP TABLE` or column updates.
 
 ### Resource Profiles
 
-`src/synaptiq/core/resources.py` defines role-aware engine limits. Long-running daemons (`serve`, `mcp`, `watch`) call `set_profile("server")` at entry and get strict caps: Kuzu task-scheduler threads `max(2, cores//4)`, 512 MB buffer pool, capped ONNX embedding threads. One-shot CLI commands (`analyze`, `query`, ...) keep library defaults (all cores, Kuzu's default buffer pool). `KuzuBackend.initialize()` and the embedders read `current_limits()` at creation time — set the profile before creating either. Env overrides: `SYNAPTIQ_KUZU_THREADS`, `SYNAPTIQ_KUZU_MEMORY_MB`, `SYNAPTIQ_EMBED_THREADS`.
+`src/synaptiq/core/resources.py` defines role-aware engine limits. Long-running daemons (`serve`, `mcp`, `watch`) call `set_profile("server")` at entry and get strict caps: LadybugDB task-scheduler threads `max(2, cores//4)`, 512 MB buffer pool, capped ONNX embedding threads. One-shot CLI commands (`analyze`, `query`, ...) keep library defaults (all cores, LadybugDB's default buffer pool). `LadybugBackend.initialize()` and the embedders read `current_limits()` at creation time — set the profile before creating either. Env overrides: `SYNAPTIQ_DB_THREADS`, `SYNAPTIQ_DB_MEMORY_MB`, `SYNAPTIQ_EMBED_THREADS` (the former `SYNAPTIQ_KUZU_THREADS` / `SYNAPTIQ_KUZU_MEMORY_MB` still work as deprecated aliases for one release, logging a one-time warning).
 
 ### Multi-Instance Concurrency
 
@@ -133,4 +133,4 @@ Ruby support recognizes `.rb`, `.rake`, `.gemspec`, `.ru`, `.rbi` extensions plu
 
 ## Key Dependencies
 
-tree-sitter (parsing), kuzu (graph DB), igraph+leidenalg (community detection), fastembed (ONNX embeddings), mcp SDK (FastMCP), typer+rich (CLI), watchfiles (file watcher), pathspec (gitignore).
+tree-sitter (parsing), ladybug (LadybugDB graph DB), igraph+leidenalg (community detection), fastembed (ONNX embeddings), mcp SDK (FastMCP), typer+rich (CLI), watchfiles (file watcher), pathspec (gitignore).
