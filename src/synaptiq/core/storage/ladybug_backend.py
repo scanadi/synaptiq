@@ -1319,24 +1319,25 @@ class LadybugBackend:
     ) -> list[tuple[str, float]]:
         """Full-scan cosine similarity over all embeddings.
 
-        Tries the plain literal first (matches the legacy ``DOUBLE[]``
-        column), then a ``FLOAT[dim]`` cast (new column type without an
-        index, e.g. after a failed index build).
+        Fallback for when the HNSW index is missing or its build failed: the
+        ``vec`` column is ``FLOAT[dim]`` but unindexed, so the query vector is
+        cast to ``FLOAT[dim]`` to match. There is no legacy ``DOUBLE[]`` path —
+        ``bulk_load`` / ``store_embeddings`` always (re)create the Embedding
+        table at the current width, so an old column type can't survive a
+        reindex (review F9).
         """
-        for vec_expr in (vec_literal, f"CAST({vec_literal} AS FLOAT[{dim}])"):
-            query = (
-                f"MATCH (e:Embedding) "
-                f"RETURN e.node_id, "
-                f"array_cosine_similarity(e.vec, {vec_expr}) AS sim "
-                f"ORDER BY sim DESC LIMIT {limit}"
-            )
-            try:
-                rows = cls._drain(conn.execute(query))
-            except Exception:
-                logger.debug("vector scan failed for %s", vec_expr[:40], exc_info=True)
-                continue
-            return [(row[0] or "", float(row[1]) if row[1] is not None else 0.0) for row in rows]
-        return []
+        query = (
+            f"MATCH (e:Embedding) "
+            f"RETURN e.node_id, "
+            f"array_cosine_similarity(e.vec, CAST({vec_literal} AS FLOAT[{dim}])) AS sim "
+            f"ORDER BY sim DESC LIMIT {limit}"
+        )
+        try:
+            rows = cls._drain(conn.execute(query))
+        except Exception:
+            logger.debug("vector scan failed", exc_info=True)
+            return []
+        return [(row[0] or "", float(row[1]) if row[1] is not None else 0.0) for row in rows]
 
     def get_indexed_files(self) -> dict[str, str]:
         """Return ``{file_path: sha256(content)}`` for all File nodes."""

@@ -248,47 +248,6 @@ class TestEmbeddingsAndVectorSearch:
         assert sha == "abc123"
         assert vec == pytest.approx([1.0, 0.0, 0.5], abs=1e-6)
 
-    def test_load_embeddings_empty_on_legacy_schema(
-        self, backend: LadybugBackend
-    ) -> None:
-        """Pre-text_sha schemas yield {} so callers fall back to a full encode."""
-        assert backend._conn is not None
-        backend._conn.execute("DROP TABLE Embedding")
-        backend._conn.execute(
-            "CREATE NODE TABLE Embedding(node_id STRING, vec DOUBLE[], "
-            "PRIMARY KEY(node_id))"
-        )
-        backend._conn.execute(
-            "MERGE (e:Embedding {node_id: $nid}) SET e.vec = $vec",
-            parameters={"nid": "function:src/x.py:f", "vec": [1.0, 0.0]},
-        )
-
-        assert backend.load_embeddings() == {}
-
-    def test_vector_search_falls_back_on_legacy_schema(
-        self, backend: LadybugBackend
-    ) -> None:
-        """Pre-index databases (DOUBLE[] column, no HNSW index) still search."""
-        node = _make_node(name="legacy_func", file_path="src/legacy.py")
-        backend.add_nodes([node])
-        # Recreate the table exactly as pre-1.3 synaptiq did: variable-length
-        # DOUBLE[] and no vector index.
-        assert backend._conn is not None
-        backend._conn.execute("DROP TABLE Embedding")
-        backend._conn.execute(
-            "CREATE NODE TABLE Embedding(node_id STRING, vec DOUBLE[], "
-            "PRIMARY KEY(node_id))"
-        )
-        backend._conn.execute(
-            "MERGE (e:Embedding {node_id: $nid}) SET e.vec = $vec",
-            parameters={"nid": node.id, "vec": [1.0, 0.0, 0.0]},
-        )
-
-        results = backend.vector_search([1.0, 0.0, 0.0], limit=5)
-        assert len(results) == 1
-        assert results[0].node_id == node.id
-        assert results[0].score == pytest.approx(1.0, abs=1e-6)
-
     def test_vector_search_limit(self, backend: LadybugBackend) -> None:
         """Only *limit* results should be returned from vector_search."""
         nodes = []

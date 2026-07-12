@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -97,7 +98,10 @@ def _env_int(name: str) -> int | None:
 
 # Deprecated env-var names already warned about, so the warning fires once per
 # process regardless of how often ``resolve_limits`` / ``current_limits`` runs.
+# Guarded by a lock: ``current_limits`` runs on server read threads, so a
+# check-then-add race could otherwise emit the deprecation warning twice (F6).
 _warned_env_aliases: set[str] = set()
+_warned_lock = threading.Lock()
 
 
 def _env_int_aliased(new_name: str, old_name: str) -> int | None:
@@ -112,13 +116,15 @@ def _env_int_aliased(new_name: str, old_name: str) -> int | None:
     if value is not None:
         return value
     legacy = _env_int(old_name)
-    if legacy is not None and old_name not in _warned_env_aliases:
-        _warned_env_aliases.add(old_name)
-        logger.warning(
-            "%s is deprecated and will be removed in a future release; use %s instead.",
-            old_name,
-            new_name,
-        )
+    if legacy is not None:
+        with _warned_lock:
+            if old_name not in _warned_env_aliases:
+                _warned_env_aliases.add(old_name)
+                logger.warning(
+                    "%s is deprecated and will be removed in a future release; use %s instead.",
+                    old_name,
+                    new_name,
+                )
     return legacy
 
 

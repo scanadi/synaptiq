@@ -298,7 +298,7 @@ def apply_reindex(
     instead of O(one file).  A full rebuild always still happens at the
     watcher's next debounced global phase: ``commit_full_index`` ->
     ``storage.bulk_load()`` unconditionally rebuilds every FTS index from the
-    fresh graph (see ``KuzuBackend.bulk_load``), so no separate "FTS dirty"
+    fresh graph (see ``LadybugBackend.bulk_load``), so no separate "FTS dirty"
     flag is needed -- the global phase's existing change-tracking in
     ``_GlobalPhaseScheduler`` (``watcher.py``) already gates it, and every
     non-skipped rebuild it triggers rebuilds FTS as a side effect of
@@ -308,11 +308,11 @@ def apply_reindex(
     BM25 results are not actively refreshed by this function, so they may
     lag behind the graph -- which IS updated immediately here, so exact-name
     search and graph traversal are unaffected regardless of FTS freshness.
-    (In practice, ``QUERY_FTS_INDEX`` on the pinned ``kuzu==0.11.3`` already
-    reflects rows inserted/deleted on the same connection without an
-    explicit rebuild -- verified empirically, not a documented Kuzu
-    guarantee, so this function does not rely on it either way.)
-    ``KuzuBackend.fts_search`` catches query failures per-table, so a stale
+    (An earlier ``QUERY_FTS_INDEX`` reflecting rows inserted/deleted on the
+    same connection without an explicit rebuild was observed empirically on
+    kuzu 0.11.3 -- NOT re-verified on LadybugDB, never a documented guarantee,
+    and this function does not rely on it either way.)
+    ``LadybugBackend.fts_search`` catches query failures per-table, so a stale
     or mid-mutation FTS index degrades results but never raises -- hybrid
     search cannot error because of this.  The window is bounded by the same
     ceiling that already governs embeddings (which have likewise never been
