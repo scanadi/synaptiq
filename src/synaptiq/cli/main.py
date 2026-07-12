@@ -725,7 +725,11 @@ def _watch_stdin_hup(loop, stop_event) -> None:
         # never consume data the MCP stdio reader owns.
         poller.register(fd, 0)
         while True:
-            for _fd, event in poller.poll(1000):
+            # poll() returns as soon as a registered event fires, so a HUP
+            # is still caught immediately — this timeout only bounds how
+            # often the loop wakes for nothing while stdin stays open.
+            # 10s keeps that idle wakeup rare without delaying shutdown.
+            for _fd, event in poller.poll(10000):
                 if event & (select.POLLHUP | select.POLLERR | select.POLLNVAL):
                     loop.call_soon_threadsafe(stop_event.set)
                     return
