@@ -6,7 +6,15 @@ from pathlib import Path
 
 import pytest
 
-from synaptiq.core.ingestion.pipeline import PipelineResult, run_pipeline
+from synaptiq.core.ingestion.pipeline import (
+    PipelineResult,
+    apply_reindex,
+    build_full_index,
+    commit_full_index,
+    parse_files,
+    run_pipeline,
+)
+from synaptiq.core.ingestion.walker import FileEntry
 from synaptiq.core.storage.kuzu_backend import KuzuBackend
 
 # ---------------------------------------------------------------------------
@@ -421,3 +429,151 @@ class TestRunPipelineProgressIncludesNewPhases:
             phase_pcts = {pct for name, pct in calls if name == phase_name}
             assert 0.0 in phase_pcts, f"{phase_name} missing 0.0 progress"
             assert 1.0 in phase_pcts, f"{phase_name} missing 1.0 progress"
+
+
+# ---------------------------------------------------------------------------
+# apply_reindex: FTS staleness contract (W1.2 -- G3)
+#
+# apply_reindex is the watcher's per-file-save path.  It must NOT rebuild FTS
+# (BM25) indexes: `rebuild_fts_indexes()` (DROP_FTS_INDEX + CREATE_FTS_INDEX
+# per table) is an O(whole corpus) operation, so paying it on every single
+# save is the bug this package fixes (G3).  A guaranteed full rebuild still
+# happens at the next global-phase commit (`build_full_index` +
+# `commit_full_index` -> `storage.bulk_load`, which unconditionally rebuilds
+# every searchable index -- see `KuzuBackend.bulk_load`).
+#
+# NOTE on what "stale" means here: empirically, on the exact pinned
+# ``kuzu==0.11.3`` (see W1.8 -- upstream is archived, so this is permanent for
+# this codebase), `QUERY_FTS_INDEX` already reflects rows inserted or deleted
+# on the same live connection *without* an explicit rebuild -- this is not
+# documented as a guaranteed contract by Kuzu, just observed behavior of this
+# pinned version. These tests therefore do NOT assert that new content is
+# hidden from FTS pre-rebuild (that would be an assertion about internal
+# Kuzu behavior, not about apply_reindex). They assert the properties that
+# actually matter and that the code guarantees: no per-save rebuild call, no
+# errors ever, unaffected content stays correct, and a real rebuild always
+# happens at the next global phase.  See `apply_reindex`'s docstring for the
+# full contract.
+# ---------------------------------------------------------------------------
+
+
+class TestApplyReindexFtsStaleness:
+    """apply_reindex defers FTS rebuilds to the next global-phase commit."""
+
+    def test_apply_reindex_does_not_rebuild_fts(
+        self, tmp_repo: Path, storage: KuzuBackend, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The per-save path must never call rebuild_fts_indexes."""
+        # Initial full index -- this DOES rebuild FTS once, via bulk_load.
+        run_pipeline(tmp_repo, storage)
+
+        calls: list[None] = []
+        monkeypatch.setattr(storage, "rebuild_fts_indexes", lambda: calls.append(None))
+
+        (tmp_repo / "src" / "main.py").write_text(
+            "from .auth import validate\n"
+            "\n"
+            "def main():\n"
+            "    validate()\n"
+            "\n"
+            "def extra():\n"
+            "    pass\n",
+            encoding="utf-8",
+        )
+        entry = FileEntry(
+            path="src/main.py",
+            content=(tmp_repo / "src" / "main.py").read_text(),
+            language="python",
+        )
+        graph = parse_files([entry], tmp_repo)
+        apply_reindex([entry], storage, graph)
+
+        assert calls == []
+
+    def test_fts_search_keeps_working_after_apply_reindex_without_rebuild(
+        self, tmp_repo: Path, storage: KuzuBackend
+    ) -> None:
+        """FTS search must keep functioning -- never erroring -- once
+        apply_reindex stops rebuilding it, and unaffected content must stay
+        correctly searchable throughout.  The graph and exact-match paths
+        reflect the change immediately either way (never FTS-gated)."""
+        run_pipeline(tmp_repo, storage)
+
+        # Rename auth.py's only symbol: its old node is deleted and a new
+        # one inserted -- exercises both sides of the FTS index's contents.
+        (tmp_repo / "src" / "auth.py").write_text(
+            "from .utils import helper\n"
+            "\n"
+            "def brand_new_symbol():\n"
+            "    helper()\n",
+            encoding="utf-8",
+        )
+        entry = FileEntry(
+            path="src/auth.py",
+            content=(tmp_repo / "src" / "auth.py").read_text(),
+            language="python",
+        )
+        graph = parse_files([entry], tmp_repo)
+        apply_reindex([entry], storage, graph)
+
+        # The graph reflects the change immediately (never FTS-gated).
+        assert storage.get_node("function:src/auth.py:brand_new_symbol") is not None
+        assert storage.get_node("function:src/auth.py:validate") is None
+
+        # None of these may raise: fts_search catches per-table query
+        # failures internally, so a stale or mid-mutation FTS index must
+        # degrade gracefully rather than propagate an error. Covers a
+        # deleted row's old name, a freshly inserted row, and untouched
+        # content, in one sweep.
+        for query in ("validate", "brand_new_symbol", "helper"):
+            results = storage.fts_search(query, limit=10)
+            assert isinstance(results, list)
+
+        # An untouched file's content is unaffected by another file's
+        # mutation and must still be found correctly.
+        untouched_results = storage.fts_search("helper", limit=10)
+        assert any(r.node_name == "helper" for r in untouched_results)
+
+    def test_global_rebuild_refreshes_fts_after_apply_reindex(
+        self, tmp_repo: Path, storage: KuzuBackend
+    ) -> None:
+        """The next global-phase rebuild guarantees FTS reflects the
+        changes -- the same `build_full_index` + `commit_full_index`
+        machinery used by both the watcher's `_on_build` and the socket
+        `reindex` handler."""
+        run_pipeline(tmp_repo, storage)
+
+        (tmp_repo / "src" / "auth.py").write_text(
+            "from .utils import helper\n"
+            "\n"
+            "def brand_new_symbol():\n"
+            "    helper()\n",
+            encoding="utf-8",
+        )
+        entry = FileEntry(
+            path="src/auth.py",
+            content=(tmp_repo / "src" / "auth.py").read_text(),
+            language="python",
+        )
+        graph = parse_files([entry], tmp_repo)
+        apply_reindex([entry], storage, graph)
+
+        # Simulate the watcher's global phase: build_full_index (CPU work,
+        # off the write lock) + commit_full_index (bulk_load, under the
+        # write lock) -- exactly what watcher.py's `_on_build` and the
+        # socket `reindex` handler both run. This is the guaranteed,
+        # version-independent rebuild point (unlike apply_reindex alone,
+        # it does not depend on Kuzu's internal FTS update behavior).
+        full_graph, embeddings, _result = build_full_index(tmp_repo, skip_embeddings=True)
+        commit_full_index(storage, full_graph, embeddings)
+
+        results = storage.fts_search("brand_new_symbol", limit=10)
+        assert any(r.node_name == "brand_new_symbol" for r in results)
+
+        # The old, now-removed "validate" function node is gone from the
+        # rebuilt database -- main.py's body still literally contains the
+        # substring "validate()" as a call site, so it legitimately still
+        # matches the query; what must NOT appear is the deleted node itself.
+        assert storage.get_node("function:src/auth.py:validate") is None
+        stale_node_id = "function:src/auth.py:validate"
+        assert all(r.node_id != stale_node_id for r in storage.fts_search("validate", limit=10))

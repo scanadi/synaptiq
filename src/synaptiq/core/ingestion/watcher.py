@@ -4,8 +4,17 @@ Uses ``watchfiles`` (Rust-backed) for efficient file system monitoring with
 native debouncing.  Changes are processed in tiers:
 
 - **File-local** (immediate): Parse without lock, then write under write lock.
+  Updates the graph only — full-text (BM25) indexes are not actively
+  refreshed here, exactly like embeddings, which this tier has also never
+  refreshed per-save (see ``apply_reindex`` in ``pipeline.py`` for the exact
+  staleness contract and its bound).
 - **Global** (debounced): Build the full graph and re-embed symbols without
-  the lock, then ``bulk_load`` + ``store_embeddings`` under the write lock.
+  the lock, then ``bulk_load`` (which unconditionally rebuilds every FTS
+  index as part of the swap, see ``KuzuBackend.bulk_load``) +
+  ``store_embeddings`` under the write lock.  This is the only place FTS is
+  rebuilt — there is no separate "FTS dirty" flag; the scheduler's own
+  change-tracking below already gates it, since every non-skipped rebuild it
+  triggers goes through ``bulk_load``.
   The global phase is governed by a scheduler that:
 
   * **debounces to quiescence** — a rebuild fires only after
@@ -426,6 +435,10 @@ async def watch_repo(
                     graph = await asyncio.to_thread(parse_files, entries, repo_path)
 
                     # Step 4: Apply to storage UNDER write lock (I/O only).
+                    # Graph-only — apply_reindex intentionally leaves FTS stale
+                    # (see its docstring); Step 5's notify() below is what
+                    # eventually triggers the FTS refresh, via the global
+                    # phase's bulk_load.
                     await _run_under_write_lock(
                         rwlock, apply_reindex, entries, storage, graph
                     )
