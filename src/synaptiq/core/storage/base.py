@@ -9,10 +9,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from synaptiq.core.graph.graph import KnowledgeGraph
 from synaptiq.core.graph.model import GraphNode, GraphRelationship
+
+if TYPE_CHECKING:
+    from synaptiq.core.ingestion.manifest import Manifest
 
 
 @dataclass
@@ -147,4 +150,21 @@ class StorageBackend(Protocol):
 
     def bulk_load(self, graph: KnowledgeGraph) -> None:
         """Replace the entire store contents with *graph*."""
+        ...
+
+    def write_manifest(self, manifest: Manifest) -> None:
+        """Persist the incremental-indexing manifest, replacing any prior one.
+
+        Full builds stamp a fresh manifest as part of :meth:`bulk_load`; this
+        method exists on the protocol so the manifest is a first-class, portable
+        capability (design §2).
+        """
+        ...
+
+    def read_manifest(self) -> Manifest | None:
+        """Return the stored manifest, or ``None`` to force a full rebuild.
+
+        ``None`` means "no trustworthy manifest": missing, a version mismatch, or
+        an unreadable/corrupt manifest (design §8 triggers 1/2/5). Never raises.
+        """
         ...
