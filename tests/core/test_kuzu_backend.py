@@ -518,3 +518,238 @@ class TestBulkLoadCopyPath:
         stored = backend.get_node(node.id)
         assert stored is not None
         assert stored.content == node.content
+
+
+# ---------------------------------------------------------------------------
+# Transactional batched inserts + prepared statements (W1.6)
+# ---------------------------------------------------------------------------
+
+
+class _ConnSpy:
+    """Transparent proxy over a kuzu Connection that logs string queries.
+
+    Lets tests observe transaction control statements (BEGIN/COMMIT/ROLLBACK)
+    while forwarding everything — including prepared-statement execution — to
+    the real connection.
+    """
+
+    def __init__(self, real: object) -> None:
+        self._real = real
+        self.log: list[str] = []
+
+    def execute(self, query: object, parameters: object = None) -> object:
+        if isinstance(query, str):
+            self.log.append(query)
+        return self._real.execute(query, parameters=parameters)
+
+    def prepare(self, query: str) -> object:
+        return self._real.prepare(query)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._real, name)
+
+
+class TestTransactionalBatchInserts:
+    """add_nodes/add_relationships batch in one transaction, reuse prepared
+    statements, and roll back atomically on failure."""
+
+    def test_batch_inserts_nodes_and_rels_with_properties_intact(
+        self, backend: KuzuBackend
+    ) -> None:
+        fn = _make_node(label=NodeLabel.FUNCTION, name="caller", file_path="src/m.py")
+        cls = _make_node(label=NodeLabel.CLASS, name="Widget", file_path="src/m.py")
+        meth = GraphNode(
+            id=generate_id(NodeLabel.METHOD, "src/m.py", "Widget.render"),
+            label=NodeLabel.METHOD,
+            name="Widget.render",
+            file_path="src/m.py",
+            start_line=10,
+            end_line=20,
+            signature="render(self) -> str",
+            class_name="Widget",
+            is_entry_point=True,
+        )
+        backend.add_nodes([fn, cls, meth])
+
+        # Two distinct source/target table pairs.
+        r_call = _make_rel(fn.id, meth.id, rel_type=RelType.CALLS)
+        r_contains = _make_rel(cls.id, meth.id, rel_type=RelType.CONTAINS)
+        backend.add_relationships([r_call, r_contains])
+
+        stored = backend.get_node(meth.id)
+        assert stored is not None
+        assert stored.name == "Widget.render"
+        assert stored.start_line == 10
+        assert stored.end_line == 20
+        assert stored.signature == "render(self) -> str"
+        assert stored.class_name == "Widget"
+        assert stored.is_entry_point is True
+
+        assert {n.name for n in backend.get_callees(fn.id)} == {"Widget.render"}
+        rows = backend.execute_raw(
+            "MATCH (a)-[r:CodeRelation]->(b) RETURN r.rel_type ORDER BY r.rel_type"
+        )
+        assert [row[0] for row in rows] == ["calls", "contains"]
+
+    def test_prepared_statements_cached_per_label_and_pair(
+        self, backend: KuzuBackend
+    ) -> None:
+        fn = _make_node(label=NodeLabel.FUNCTION, name="f", file_path="src/p.py")
+        cls = _make_node(label=NodeLabel.CLASS, name="C", file_path="src/p.py")
+        meth = GraphNode(
+            id=generate_id(NodeLabel.METHOD, "src/p.py", "C.m"),
+            label=NodeLabel.METHOD,
+            name="C.m",
+            file_path="src/p.py",
+        )
+        backend.add_nodes([fn, cls, meth])
+        backend.add_relationships(
+            [
+                _make_rel(fn.id, meth.id, rel_type=RelType.CALLS),
+                _make_rel(cls.id, meth.id, rel_type=RelType.CONTAINS),
+            ]
+        )
+
+        # Two node labels and two rel-table pairs were prepared and cached.
+        assert "node:Function" in backend._prepared
+        assert "node:Class" in backend._prepared
+        assert "node:Method" in backend._prepared
+        assert "rel:Function:Method" in backend._prepared
+        assert "rel:Class:Method" in backend._prepared
+
+        # Adding more Function nodes reuses the SAME prepared statement object.
+        cached = backend._prepared["node:Function"]
+        backend.add_nodes(
+            [_make_node(label=NodeLabel.FUNCTION, name="g", file_path="src/p.py")]
+        )
+        assert backend._prepared["node:Function"] is cached
+
+    def test_node_batch_runs_in_a_single_transaction(self, backend: KuzuBackend) -> None:
+        spy = _ConnSpy(backend._conn)
+        backend._conn = spy  # type: ignore[assignment]
+
+        backend.add_nodes(
+            [
+                _make_node(name="a", file_path="src/t.py"),
+                _make_node(name="b", file_path="src/t.py"),
+                _make_node(name="c", file_path="src/t.py"),
+            ]
+        )
+
+        assert spy.log.count("BEGIN TRANSACTION") == 1
+        assert spy.log.count("COMMIT") == 1
+        assert "ROLLBACK" not in spy.log
+
+    def test_failed_node_batch_rolls_back_atomically(
+        self, backend: KuzuBackend, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seed = _make_node(name="seed", file_path="src/a.py")
+        backend.add_nodes([seed])
+        before = backend.execute_raw("MATCH (n:Function) RETURN count(n)")[0][0]
+
+        real_insert = backend._insert_node
+        state = {"n": 0}
+
+        def flaky(node: GraphNode) -> None:
+            state["n"] += 1
+            if state["n"] == 2:
+                raise RuntimeError("induced node failure")
+            real_insert(node)
+
+        monkeypatch.setattr(backend, "_insert_node", flaky)
+
+        n1 = _make_node(name="first", file_path="src/a.py")
+        n2 = _make_node(name="second", file_path="src/a.py")
+        # n1 is really inserted inside the txn; n2 raises -> whole batch rolls back.
+        with pytest.raises(RuntimeError, match="induced node failure"):
+            backend.add_nodes([n1, n2])
+
+        # Atomic: n1 (inserted inside the failed transaction) was rolled back.
+        after = backend.execute_raw("MATCH (n:Function) RETURN count(n)")[0][0]
+        assert after == before
+        assert backend.get_node(n1.id) is None
+        assert backend.get_node(seed.id) is not None
+
+        # Connection recovers for subsequent writes.
+        monkeypatch.undo()
+        backend.add_nodes([_make_node(name="later", file_path="src/a.py")])
+        assert backend.execute_raw("MATCH (n:Function) RETURN count(n)")[0][0] == before + 1
+
+    def test_reinserting_existing_node_upserts_idempotently(
+        self, backend: KuzuBackend
+    ) -> None:
+        # Mirrors the incremental re-index path: a persistent structural node
+        # (e.g. an ancestor Folder) is re-inserted on every rebuild and must
+        # upsert via MERGE, not raise a duplicate-primary-key error.
+        first = _make_node(name="dir", file_path="src", content="v1")
+        second = _make_node(name="dir", file_path="src", content="v2")  # same id
+        assert second.id == first.id
+
+        backend.add_nodes([first])
+        backend.add_nodes([second])  # must not raise; must not duplicate
+
+        stored = backend.get_node(first.id)
+        assert stored is not None
+        assert stored.content == "v2"  # properties refreshed
+        count = backend.execute_raw(
+            "MATCH (n:Function) WHERE n.id = $id RETURN count(n)",
+            {"id": first.id},
+        )[0][0]
+        assert count == 1
+
+    def test_failed_relationship_batch_rolls_back_atomically(
+        self, backend: KuzuBackend, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_node(name="A", file_path="src/r.py")
+        b = _make_node(name="B", file_path="src/r.py")
+        c = _make_node(name="C", file_path="src/r.py")
+        backend.add_nodes([a, b, c])
+        # Pre-existing edge in its own committed transaction.
+        backend.add_relationships([_make_rel(a.id, b.id, rel_type=RelType.CALLS)])
+
+        real_insert = backend._insert_relationship
+        state = {"n": 0}
+
+        def flaky(rel: GraphRelationship) -> None:
+            state["n"] += 1
+            if state["n"] == 2:
+                raise RuntimeError("induced relationship failure")
+            real_insert(rel)
+
+        monkeypatch.setattr(backend, "_insert_relationship", flaky)
+
+        # First rel (A->C) inserts inside the txn, second raises -> whole batch rolls back.
+        with pytest.raises(RuntimeError, match="induced relationship failure"):
+            backend.add_relationships(
+                [
+                    _make_rel(a.id, c.id, rel_type=RelType.CALLS),
+                    _make_rel(b.id, c.id, rel_type=RelType.CALLS),
+                ]
+            )
+
+        # A->C was rolled back; the pre-existing A->B survived.
+        assert {n.name for n in backend.get_callees(a.id)} == {"B"}
+        total = backend.execute_raw("MATCH ()-[r:CodeRelation]->() RETURN count(r)")[0][0]
+        assert total == 1
+
+    def test_empty_batches_open_no_transaction(self, backend: KuzuBackend) -> None:
+        spy = _ConnSpy(backend._conn)
+        backend._conn = spy  # type: ignore[assignment]
+
+        backend.add_nodes([])
+        backend.add_relationships([])
+        assert "BEGIN TRANSACTION" not in spy.log
+
+        # No dangling transaction was left open: a real batch still succeeds
+        # (a leaked BEGIN would make the next BEGIN raise).
+        backend.add_nodes([_make_node(name="ok", file_path="src/e.py")])
+        assert spy.log.count("BEGIN TRANSACTION") == 1
+        assert spy.log.count("COMMIT") == 1
+
+    def test_prepared_cache_cleared_on_close(self, tmp_path: Path) -> None:
+        b = KuzuBackend()
+        b.initialize(tmp_path / "cache_db")
+        b.add_nodes([_make_node(name="x", file_path="src/x.py")])
+        assert b._prepared  # populated
+        b.close()
+        assert b._prepared == {}  # cleared with the connection
