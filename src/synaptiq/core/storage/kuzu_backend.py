@@ -22,9 +22,10 @@ import logging
 import shutil
 import tempfile
 import threading
+import warnings
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import kuzu
 
@@ -217,6 +218,12 @@ class KuzuBackend:
     def __init__(self) -> None:
         self._db: kuzu.Database | None = None
         self._conn: kuzu.Connection | None = None
+        # Prepared statements for the write connection, keyed by node label
+        # or source/target rel-table pair. Reused across the rows of a batch
+        # so each INSERT is planned once instead of re-planned per row. Bound
+        # to the current ``self._conn`` — cleared whenever it is (re)created
+        # or closed (see :meth:`initialize` / :meth:`close`).
+        self._prepared: dict[str, Any] = {}
         self._db_path: Path | None = None
         # Thread-safe pool of read connections, tagged with the database
         # generation they were created against.  The generation increments
@@ -265,6 +272,9 @@ class KuzuBackend:
             buffer_pool_size=limits.kuzu_buffer_bytes,
         )
         self._conn = kuzu.Connection(self._db)
+        # Fresh write connection — any statements prepared against a prior
+        # one are invalid, so start with an empty cache.
+        self._prepared = {}
         with self._pool_lock:
             self._generation += 1
         if not read_only:
@@ -339,6 +349,8 @@ class KuzuBackend:
         if self._conn is not None:
             self._close_quietly(self._conn)
             self._conn = None
+        # Prepared statements are bound to the now-closed connection.
+        self._prepared = {}
         if self._db is not None:
             self._close_quietly(self._db)
             self._db = None
@@ -440,14 +452,66 @@ class KuzuBackend:
     # ------------------------------------------------------------------
 
     def add_nodes(self, nodes: list[GraphNode]) -> None:
-        """Insert nodes into their respective label tables."""
-        for node in nodes:
-            self._insert_node(node)
+        """Insert nodes into their respective label tables.
+
+        The whole batch runs inside a single explicit transaction and
+        reuses a prepared statement per node label, so each row is planned
+        once and the batch is committed once — rather than the previous
+        per-row auto-commit + re-plan. Inserts are idempotent upserts
+        (``MERGE`` keyed on ``id``; see :meth:`_insert_node`), so re-adding an
+        existing node refreshes it instead of failing. The batch is atomic: if
+        an insert fails unexpectedly, the transaction is rolled back (leaving
+        the database exactly as it was before the batch) and the error is
+        re-raised.
+        """
+        self._write_batch(nodes, self._insert_node)
 
     def add_relationships(self, rels: list[GraphRelationship]) -> None:
-        """Insert relationships by matching source and target nodes."""
-        for rel in rels:
-            self._insert_relationship(rel)
+        """Insert relationships by matching source and target nodes.
+
+        Batched in one transaction with a prepared statement reused per
+        source/target table pair; atomic and error-surfacing exactly like
+        :meth:`add_nodes`.
+        """
+        self._write_batch(rels, self._insert_relationship)
+
+    def _write_batch(self, items: list[Any], insert_one: Callable[[Any], None]) -> None:
+        """Run ``insert_one`` over ``items`` inside one explicit transaction.
+
+        On any error the transaction is rolled back and the original
+        exception re-raised, so a mid-batch failure leaves the database
+        untouched. An empty batch is a no-op (no transaction is opened).
+
+        Writes use the single ``self._conn`` handle and callers serialize
+        access through the external ``AsyncRWLock``, so no extra locking is
+        needed here.
+        """
+        if not items:
+            return
+        conn = self._conn
+        assert conn is not None
+        conn.execute("BEGIN TRANSACTION")
+        try:
+            for item in items:
+                insert_one(item)
+            conn.execute("COMMIT")
+        except BaseException:
+            self._rollback_quietly()
+            raise
+
+    def _rollback_quietly(self) -> None:
+        """Roll back the active write transaction, tolerating its absence.
+
+        A statement error inside a transaction auto-aborts it in Kuzu, so an
+        explicit ``ROLLBACK`` afterwards raises "No active transaction". That
+        is expected — the database is already reverted — so it is swallowed.
+        """
+        if self._conn is None:
+            return
+        try:
+            self._conn.execute("ROLLBACK")
+        except Exception:
+            pass
 
     def remove_nodes_by_file(self, file_path: str) -> int:
         """Delete all nodes whose ``file_path`` matches across every table.
@@ -1475,23 +1539,70 @@ class KuzuBackend:
                 # Index may already exist — that's fine.
                 pass
 
+    def _get_prepared(self, key: str, query: str) -> Any:
+        """Return a cached prepared statement for ``key``, preparing once.
+
+        The cache is bound to the current ``self._conn`` and cleared when
+        that connection is (re)created or closed. Preparing once per node
+        label / rel-table pair and reusing the statement across every row of
+        a batch is the core of the batched-insert speedup — the plan is
+        compiled once instead of on every ``execute``.
+        """
+        assert self._conn is not None
+        stmt = self._prepared.get(key)
+        if stmt is None:
+            # Kuzu 0.11.3 (final release — upstream is archived) warns that the
+            # separate prepare()+execute() API is deprecated in favour of a
+            # single execute() call. We deliberately prepare once and reuse the
+            # statement across a batch's rows, which is the whole point of this
+            # fast path, and the API will never be removed. Silence the
+            # unactionable warning at the call site (reads never prepare, so
+            # this narrow window cannot suppress other threads' warnings).
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="The use of separate prepare",
+                    category=DeprecationWarning,
+                )
+                stmt = self._conn.prepare(query)
+            self._prepared[key] = stmt
+        return stmt
+
     def _insert_node(self, node: GraphNode) -> None:
-        """INSERT a single node into the appropriate label table using parameterized query."""
+        """Upsert one node into its label table via a cached prepared statement.
+
+        Uses ``MERGE ... SET`` (keyed on the primary ``id``) rather than
+        ``CREATE`` so the insert is idempotent. The incremental re-index path
+        (:func:`~synaptiq.core.ingestion.pipeline.apply_reindex`) deletes only
+        the changed file's own nodes and then re-inserts the freshly parsed
+        graph, which re-includes *persistent* structural nodes — e.g. ancestor
+        ``Folder`` nodes whose ``file_path`` is the directory, not the changed
+        file, and so survive :meth:`remove_nodes_by_file`. ``CREATE`` raised a
+        duplicate-primary-key error on those every time (previously swallowed
+        per row, but fatal to a single batched transaction); ``MERGE`` matches
+        the existing node and refreshes its properties instead. On a fresh
+        database (the ``bulk_load`` fallback) every ``MERGE`` is a create, so
+        behaviour there is unchanged.
+
+        Runs inside :meth:`_write_batch`'s transaction; an unexpected execution
+        error propagates so the batch rolls back atomically. Nodes with an
+        unknown label are skipped (logged) exactly as before.
+        """
         assert self._conn is not None
         table = _LABEL_TO_TABLE.get(node.label.value)
         if table is None:
             logger.warning("Unknown label %s for node %s", node.label, node.id)
             return
 
-        query = (
-            f"CREATE (:{table} {{"
-            f"id: $id, name: $name, file_path: $file_path, "
-            f"start_line: $start_line, end_line: $end_line, "
-            f"content: $content, signature: $signature, "
-            f"language: $language, class_name: $class_name, "
-            f"is_dead: $is_dead, is_entry_point: $is_entry_point, "
-            f"is_exported: $is_exported, properties_json: $properties_json"
-            f"}})"
+        stmt = self._get_prepared(
+            f"node:{table}",
+            f"MERGE (n:{table} {{id: $id}}) "
+            f"SET n.name = $name, n.file_path = $file_path, "
+            f"n.start_line = $start_line, n.end_line = $end_line, "
+            f"n.content = $content, n.signature = $signature, "
+            f"n.language = $language, n.class_name = $class_name, "
+            f"n.is_dead = $is_dead, n.is_entry_point = $is_entry_point, "
+            f"n.is_exported = $is_exported, n.properties_json = $properties_json",
         )
         params = {
             "id": node.id,
@@ -1508,13 +1619,17 @@ class KuzuBackend:
             "is_exported": node.is_exported,
             "properties_json": _serialize_properties(node.properties),
         }
-        try:
-            self._conn.execute(query, parameters=params)
-        except Exception:
-            logger.debug("Insert node failed for %s", node.id, exc_info=True)
+        self._conn.execute(stmt, parameters=params)
 
     def _insert_relationship(self, rel: GraphRelationship) -> None:
-        """MATCH source and target, then CREATE the relationship using parameterized query."""
+        """MATCH source and target, then CREATE the rel via a prepared statement.
+
+        Runs inside :meth:`_write_batch`'s transaction; an execution error
+        propagates so the batch can roll back atomically. A relationship
+        whose endpoints are not present simply matches nothing and creates
+        nothing (no error), and one whose ids don't resolve to a table is
+        skipped (logged) — both exactly as before.
+        """
         assert self._conn is not None
         src_table = _table_for_id(rel.source)
         tgt_table = _table_for_id(rel.target)
@@ -1528,7 +1643,8 @@ class KuzuBackend:
 
         props = rel.properties or {}
 
-        query = (
+        stmt = self._get_prepared(
+            f"rel:{src_table}:{tgt_table}",
             f"MATCH (a:{src_table}), (b:{tgt_table}) "
             f"WHERE a.id = $src AND b.id = $tgt "
             f"CREATE (a)-[:CodeRelation {{"
@@ -1539,7 +1655,7 @@ class KuzuBackend:
             f"strength: $strength, "
             f"co_changes: $co_changes, "
             f"symbols: $symbols"
-            f"}}]->(b)"
+            f"}}]->(b)",
         )
         params = {
             "src": rel.source,
@@ -1552,12 +1668,7 @@ class KuzuBackend:
             "co_changes": int(props.get("co_changes", 0)),
             "symbols": str(props.get("symbols", "")),
         }
-        try:
-            self._conn.execute(query, parameters=params)
-        except Exception:
-            logger.debug(
-                "Insert relationship failed: %s -> %s", rel.source, rel.target, exc_info=True
-            )
+        self._conn.execute(stmt, parameters=params)
 
     def _query_nodes(self, query: str, parameters: dict[str, Any] | None = None) -> list[GraphNode]:
         """Execute a query returning the node column list and convert to GraphNodes."""
