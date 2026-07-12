@@ -454,6 +454,19 @@ impact  -> "Tip: Review each affected symbol before making changes."
 | `synaptiq://dead-code` | Full dead code report |
 | `synaptiq://schema` | Graph schema reference for writing Cypher queries |
 
+### Index Freshness
+
+Every tool response (and the `synaptiq://overview` resource) ends with a compact freshness trailer, so an agent can tell at a glance whether the graph it just queried might be stale — without a separate round trip to `synaptiq status`:
+
+```
+[index: 4m old · embeddings: complete]
+[index: 12s old · embeddings: encoding 12431/26203]
+[index: 2h old · embeddings: failed]
+[index: age unknown]
+```
+
+It reads `last_indexed_at` from `meta.json` for the index age and `.synaptiq/embeddings_state.json` (written by the background embedding worker — see "Background embeddings" above) for the vector state, falling back to the stored vector count when no worker has run. The trailer is omitted entirely when there's no index yet, so the existing "no index found" errors are unaffected. Set `SYNAPTIQ_MCP_FRESHNESS=0` to disable it.
+
 ---
 
 ## 🔄 Multi-Agent Concurrency
