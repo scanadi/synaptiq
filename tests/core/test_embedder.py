@@ -17,7 +17,12 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
-from synaptiq.core.embeddings.embedder import EMBEDDABLE_LABELS, _get_model, embed_graph
+from synaptiq.core.embeddings.embedder import (
+    EMBEDDABLE_LABELS,
+    _get_model,
+    embed_graph,
+    partition_embeddings,
+)
 from synaptiq.core.graph.graph import KnowledgeGraph
 from synaptiq.core.graph.model import GraphNode, NodeLabel
 from synaptiq.core.storage.base import NodeEmbedding
@@ -579,3 +584,140 @@ class TestIncrementalReuse:
         assert by_id[changed_id].text_sha != "stale-sha"
         for e in first[1:]:
             assert by_id[e.node_id].embedding == e.embedding
+
+
+# ---------------------------------------------------------------------------
+# Tests — partition_embeddings (W4.1b)
+# ---------------------------------------------------------------------------
+
+
+class TestPartitionEmbeddings:
+    """partition_embeddings splits reused vs. pending without touching ONNX.
+
+    It must always agree with the reused/pending split embed_graph computes
+    internally (they share one implementation, ``_partition_texts``) — these
+    tests pin that equivalence on a fixture rather than just re-testing
+    embed_graph's own behaviour.
+    """
+
+    @patch("fastembed.TextEmbedding")
+    def test_never_loads_model(
+        self, mock_te_cls: MagicMock, sample_graph: KnowledgeGraph
+    ) -> None:
+        """Even with nothing to reuse, partition_embeddings never creates the
+        ONNX model — that's the whole point of exposing it separately from
+        embed_graph."""
+        reused, pending_count = partition_embeddings(sample_graph)
+
+        mock_te_cls.assert_not_called()
+        assert reused == []
+        assert pending_count == 2  # function + class; folder is skipped
+
+    def test_empty_graph_returns_empty(self) -> None:
+        graph = KnowledgeGraph()
+        reused, pending_count = partition_embeddings(graph)
+        assert reused == []
+        assert pending_count == 0
+
+    def test_graph_with_only_non_embeddable_returns_empty(self) -> None:
+        graph = KnowledgeGraph()
+        graph.add_node(GraphNode(id="folder::src", label=NodeLabel.FOLDER, name="src"))
+        reused, pending_count = partition_embeddings(graph)
+        assert reused == []
+        assert pending_count == 0
+
+    def test_no_previous_makes_everything_pending(self, sample_graph: KnowledgeGraph) -> None:
+        reused, pending_count = partition_embeddings(sample_graph, previous=None)
+        assert reused == []
+        assert pending_count == 2
+
+    @patch("fastembed.TextEmbedding")
+    def test_matches_embed_graph_full_reuse_split(
+        self, mock_te_cls: MagicMock, sample_graph: KnowledgeGraph
+    ) -> None:
+        """Full reuse: partition_embeddings' reused set is exactly what
+        embed_graph(previous=...) would itself reuse (same ids, vectors, shas)."""
+        mock_model = MagicMock()
+        mock_model.embed.return_value = iter(
+            [np.array([0.1, 0.2, 0.3]), np.array([0.4, 0.5, 0.6])]
+        )
+        mock_te_cls.return_value = mock_model
+
+        first = embed_graph(sample_graph)
+        previous = {e.node_id: (e.text_sha, e.embedding) for e in first}
+
+        reused, pending_count = partition_embeddings(sample_graph, previous)
+
+        assert pending_count == 0
+        assert {r.node_id: r.embedding for r in reused} == {
+            e.node_id: e.embedding for e in first
+        }
+        assert {r.node_id: r.text_sha for r in reused} == {
+            e.node_id: e.text_sha for e in first
+        }
+
+    @patch("fastembed.TextEmbedding")
+    def test_matches_embed_graph_partial_reuse_split(
+        self, mock_te_cls: MagicMock, sample_graph: KnowledgeGraph
+    ) -> None:
+        """One stale text_sha: partition_embeddings and embed_graph agree on
+        exactly which node is pending vs. reused, and on the reused vectors."""
+        mock_model = MagicMock()
+        mock_model.embed.return_value = iter(
+            [np.array([0.1, 0.2, 0.3]), np.array([0.4, 0.5, 0.6])]
+        )
+        mock_te_cls.return_value = mock_model
+
+        first = embed_graph(sample_graph)
+        previous = {e.node_id: (e.text_sha, e.embedding) for e in first}
+        changed_id = first[0].node_id
+        previous[changed_id] = ("stale-sha", previous[changed_id][1])
+
+        reused, pending_count = partition_embeddings(sample_graph, previous)
+
+        assert pending_count == 1
+        reused_ids = {r.node_id for r in reused}
+        assert changed_id not in reused_ids
+        assert reused_ids == {e.node_id for e in first if e.node_id != changed_id}
+
+        # Ask embed_graph to do the real encode with the same `previous` —
+        # it must re-encode exactly the one node partition_embeddings flagged
+        # pending, and its own reused vectors must match ours exactly.
+        _get_model.cache_clear()
+        fresh_model = MagicMock()
+        fresh_model.embed.return_value = iter([np.array([0.7, 0.8, 0.9])])
+        mock_te_cls.reset_mock()
+        mock_te_cls.return_value = fresh_model
+
+        second = embed_graph(sample_graph, previous=previous)
+        texts_encoded = fresh_model.embed.call_args.args[0]
+        assert len(texts_encoded) == pending_count
+
+        by_id = {e.node_id: e for e in second}
+        for r in reused:
+            assert by_id[r.node_id].embedding == r.embedding
+            assert by_id[r.node_id].text_sha == r.text_sha
+
+    @patch("fastembed.TextEmbedding")
+    def test_reused_plus_pending_equals_total_nodes(
+        self, mock_te_cls: MagicMock, all_label_graph: KnowledgeGraph
+    ) -> None:
+        embeddable_count = 7
+        mock_model = MagicMock()
+        mock_model.embed.return_value = iter(
+            [np.array([0.1, 0.2, 0.3]) for _ in range(embeddable_count)]
+        )
+        mock_te_cls.return_value = mock_model
+
+        first = embed_graph(all_label_graph)
+        previous = {e.node_id: (e.text_sha, e.embedding) for e in first}
+        # Invalidate two of the seven so the split is neither 0 nor total.
+        stale_ids = [first[0].node_id, first[3].node_id]
+        for nid in stale_ids:
+            previous[nid] = ("stale-sha", previous[nid][1])
+
+        reused, pending_count = partition_embeddings(all_label_graph, previous)
+
+        assert pending_count == 2
+        assert len(reused) == embeddable_count - 2
+        assert len(reused) + pending_count == embeddable_count

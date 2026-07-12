@@ -66,6 +66,71 @@ def embeddable_node_count(graph: KnowledgeGraph) -> int:
     return sum(1 for n in graph.iter_nodes() if n.label in EMBEDDABLE_LABELS)
 
 
+def _partition_texts(
+    graph: KnowledgeGraph,
+    previous: dict[str, tuple[str, list[float]]] | None,
+) -> tuple[list, list[str], list[str], list[NodeEmbedding | None], list[int]]:
+    """Compute nodes/texts/``text_sha``s and split into reused vs. pending.
+
+    Single implementation shared by :func:`embed_graph` (which goes on to
+    encode the pending indices) and :func:`partition_embeddings` (which only
+    needs the split) — the reused/pending decision can never drift between
+    the two callers.
+
+    Returns:
+        ``(nodes, texts, shas, results, pending)`` where *results* has one
+        slot per node — a :class:`NodeEmbedding` built straight from
+        *previous* when its ``text_sha`` matches, else ``None`` — and
+        *pending* lists the indices that still need the ONNX model.
+    """
+    nodes = [n for n in graph.iter_nodes() if n.label in EMBEDDABLE_LABELS]
+    if not nodes:
+        return [], [], [], [], []
+
+    class_method_idx = build_class_method_index(graph)
+    texts = [generate_text(node, graph, class_method_idx) for node in nodes]
+    shas = [hashlib.sha256(text.encode("utf-8")).hexdigest() for text in texts]
+
+    results: list[NodeEmbedding | None] = [None] * len(nodes)
+    pending: list[int] = []
+    for i, (node, sha) in enumerate(zip(nodes, shas)):
+        prev = previous.get(node.id) if previous else None
+        if prev is not None and prev[0] == sha:
+            results[i] = NodeEmbedding(node_id=node.id, embedding=list(prev[1]), text_sha=sha)
+        else:
+            pending.append(i)
+    return nodes, texts, shas, results, pending
+
+
+def partition_embeddings(
+    graph: KnowledgeGraph,
+    previous: dict[str, tuple[str, list[float]]] | None = None,
+) -> tuple[list[NodeEmbedding], int]:
+    """Split *graph*'s embeddable nodes into reused vectors and a pending count.
+
+    Runs the exact same text/``text_sha`` comparison :func:`embed_graph` uses
+    internally to decide what needs re-encoding, but never loads the ONNX
+    model. Callers that only need to know what changed — e.g.
+    ``analyze --embeddings lazy``, which stores the reused vectors
+    immediately and hands the rest to a background worker — get the answer
+    at generate-text cost instead of encode cost.
+
+    Args:
+        graph: The knowledge graph whose nodes would be embedded.
+        previous: ``{node_id: (text_sha, vector)}`` from the prior index
+            (see ``LadybugBackend.load_embeddings``).  ``None`` or ``{}``
+            makes everything pending.
+
+    Returns:
+        ``(reused, pending_count)``: *reused* holds one :class:`NodeEmbedding`
+        per node whose freshly generated text hashes to the same
+        ``text_sha`` as *previous*; *pending_count* is how many embeddable
+        nodes still need encoding.
+    """
+    _, _, _, results, pending = _partition_texts(graph, previous)
+    return [r for r in results if r is not None], len(pending)
+
+
 def embed_graph(
     graph: KnowledgeGraph,
     model_name: str = "BAAI/bge-small-en-v1.5",
@@ -100,23 +165,9 @@ def embed_graph(
         each carrying the node's ID, its vector, and the SHA-256 of the
         text that produced it.
     """
-    nodes = [n for n in graph.iter_nodes() if n.label in EMBEDDABLE_LABELS]
-
+    nodes, texts, shas, results, pending = _partition_texts(graph, previous)
     if not nodes:
         return []
-
-    class_method_idx = build_class_method_index(graph)
-    texts = [generate_text(node, graph, class_method_idx) for node in nodes]
-    shas = [hashlib.sha256(text.encode("utf-8")).hexdigest() for text in texts]
-
-    results: list[NodeEmbedding | None] = [None] * len(nodes)
-    pending: list[int] = []
-    for i, (node, sha) in enumerate(zip(nodes, shas)):
-        prev = previous.get(node.id) if previous else None
-        if prev is not None and prev[0] == sha:
-            results[i] = NodeEmbedding(node_id=node.id, embedding=list(prev[1]), text_sha=sha)
-        else:
-            pending.append(i)
 
     reused = len(nodes) - len(pending)
     if progress_callback is not None:

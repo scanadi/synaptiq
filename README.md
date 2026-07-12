@@ -335,6 +335,10 @@ synaptiq status               # → Embeddings: encoding 12,431/26,203
   running `serve`/`watch` daemon for the database — if the index is busy it
   defers, and the next `analyze`/rebuild encodes. `serve`/`watch` themselves
   always embed synchronously.
+- Repeat `analyze` runs reuse unchanged vectors instead of re-encoding
+  everything: only symbols whose text actually changed hit the ONNX model, so
+  a small edit re-encodes a handful of vectors in the background — or none at
+  all, in which case no background worker even starts.
 
 ---
 

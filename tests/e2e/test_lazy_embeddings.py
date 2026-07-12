@@ -72,11 +72,25 @@ def _build_committed_index(repo: Path) -> tuple[Path, Path]:
     return data_dir, db_path
 
 
-def _poll_state(data_dir: Path, *, timeout: float = 120.0) -> dict | None:
+def _poll_state(
+    data_dir: Path, *, timeout: float = 120.0, expect_pid: int | None = None
+) -> dict | None:
+    """Poll ``embeddings_state.json`` until a terminal state settles.
+
+    When *expect_pid* is given, a terminal state whose ``pid`` doesn't match
+    it is a stale leftover from an EARLIER worker (e.g. a previous analyze
+    cycle in the same test) and polling continues — otherwise, on a repo with
+    two lazy cycles, this could return the first cycle's "complete" before
+    the second cycle's worker has even started overwriting the file.
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         state = lazy_worker.read_state(data_dir)
-        if state is not None and state.get("state") in ("complete", "failed", "deferred"):
+        if (
+            state is not None
+            and state.get("state") in ("complete", "failed", "deferred")
+            and (expect_pid is None or state.get("pid") == expect_pid)
+        ):
             return state
         time.sleep(0.5)
     return lazy_worker.read_state(data_dir)
@@ -164,6 +178,152 @@ class TestLazyAnalyzeEndToEnd:
             # meta.json carries the final embedding count.
             meta = json.loads((data_dir / "meta.json").read_text(encoding="utf-8"))
             assert meta["stats"]["embeddings"] == state["total"]
+        finally:
+            _kill(worker_pid)
+
+
+# ---------------------------------------------------------------------------
+# Cross-rebuild vector reuse (W4.1b)
+# ---------------------------------------------------------------------------
+
+
+class TestLazyCrossRebuildReuse:
+    """Lazy mode reuses vectors across rebuilds instead of re-encoding the
+    full set every time.
+
+    Closes W4.1's documented deviation: ``bulk_load`` used to wipe the
+    Embedding table before the background worker ever got a chance to
+    snapshot it, so every lazy ``analyze`` — even a no-op rebuild — re-encoded
+    every symbol in the background. These exercise the real detached worker
+    end-to-end, like ``TestLazyAnalyzeEndToEnd`` above.
+    """
+
+    def test_partial_change_reuses_most_vectors_synchronously(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, embedding_model
+    ) -> None:
+        repo = tmp_path / "repo"
+        _tiny_repo(repo)
+        monkeypatch.chdir(repo)
+        data_dir = repo / ".synaptiq"
+
+        # Spy (not mock) spawn_lazy_worker so both cycles' real PIDs are
+        # known — _poll_state needs the SECOND cycle's PID to avoid reading
+        # the first cycle's still-"complete" state as if it were fresh (the
+        # second worker can take a couple of seconds just to start up and
+        # overwrite the file).
+        spawned_pids: list[int] = []
+        original_spawn = lazy_worker.spawn_lazy_worker
+
+        def _spy_spawn(rp):
+            pid = original_spawn(rp)
+            if pid is not None:
+                spawned_pids.append(pid)
+            return pid
+
+        monkeypatch.setattr("synaptiq.core.embeddings.lazy_worker.spawn_lazy_worker", _spy_spawn)
+
+        worker_pid: int | None = None
+        try:
+            # First full lazy cycle: commit, then wait for the worker so the
+            # index holds a complete, real embedding table to reuse from.
+            result = runner.invoke(app, ["analyze", ".", "--embeddings", "lazy"])
+            assert result.exit_code == 0, result.output
+            assert len(spawned_pids) == 1
+            state = _poll_state(data_dir, expect_pid=spawned_pids[0])
+            assert state is not None and state["state"] == "complete", state
+            worker_pid = state.get("pid")
+            first_total = state["total"]
+            assert first_total > 0
+
+            # Touch ONE file: append a brand-new, self-contained function.
+            # Every existing symbol's generated text is untouched except
+            # util.py's FILE node (its `defines:` list gains a name) — a
+            # small, deterministic, mostly-reused delta.
+            (repo / "src" / "util.py").write_text(
+                "def format_name(name):\n    return name.strip().title()\n\n\n"
+                "def extra():\n    return 1\n",
+                encoding="utf-8",
+            )
+
+            result = runner.invoke(app, ["analyze", ".", "--embeddings", "lazy"])
+            assert result.exit_code == 0, result.output
+            assert "Index ready" in result.output
+            assert "vectors reused" in result.output
+            assert len(spawned_pids) == 2
+            assert spawned_pids[1] != spawned_pids[0]
+
+            # Reused vectors are stored SYNCHRONOUSLY — already readable, and
+            # already searchable via a real vector query, before the (maybe
+            # still-running) worker has touched anything. helper()'s text
+            # never changed, so its vector must already be exactly the one
+            # from the first cycle.
+            storage = LadybugBackend()
+            storage.initialize(data_dir / "kuzu", read_only=True)
+            try:
+                stored_now = storage.load_embeddings()
+                # At minimum every unchanged node from the first cycle is
+                # already here — the worker can only ever ADD to this count,
+                # so this holds no matter how the two processes interleave.
+                assert len(stored_now) >= first_total - 1
+                helper_id = "function:src/main.py:helper"
+                assert helper_id in stored_now
+
+                from synaptiq.core.search.hybrid import hybrid_search
+
+                probe = list(stored_now[helper_id][1])
+                results = hybrid_search("helper", storage, query_embedding=probe, limit=5)
+                assert any(r.node_id == helper_id for r in results)
+            finally:
+                storage.close()
+
+            # The background worker (handling the small delta) finishes and
+            # settles the index at the new, larger total.
+            state = _poll_state(data_dir, expect_pid=spawned_pids[1])
+            assert state is not None, "worker never published a state file"
+            worker_pid = state.get("pid", worker_pid)
+            assert state["state"] == "complete", state
+            assert state["total"] == state["done"] == first_total + 1
+
+            storage = LadybugBackend()
+            storage.initialize(data_dir / "kuzu", read_only=True)
+            try:
+                assert len(storage.load_embeddings()) == first_total + 1
+            finally:
+                storage.close()
+        finally:
+            _kill(worker_pid)
+
+    def test_unchanged_repo_second_analyze_needs_no_worker(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, embedding_model
+    ) -> None:
+        repo = tmp_path / "repo"
+        _tiny_repo(repo)
+        monkeypatch.chdir(repo)
+        data_dir = repo / ".synaptiq"
+
+        worker_pid: int | None = None
+        try:
+            result = runner.invoke(app, ["analyze", ".", "--embeddings", "lazy"])
+            assert result.exit_code == 0, result.output
+            state = _poll_state(data_dir)
+            assert state is not None and state["state"] == "complete", state
+            worker_pid = state.get("pid")
+            first_total = state["total"]
+
+            # No file changes at all — every text_sha matches the first cycle.
+            result = runner.invoke(app, ["analyze", ".", "--embeddings", "lazy"])
+            assert result.exit_code == 0, result.output
+            assert "Index ready" in result.output
+            assert "vectors reused" in result.output
+            # Zero-change analyze must not spawn a no-op background worker.
+            assert "in the background" not in result.output
+
+            storage = LadybugBackend()
+            storage.initialize(data_dir / "kuzu", read_only=True)
+            try:
+                assert len(storage.load_embeddings()) == first_total
+            finally:
+                storage.close()
         finally:
             _kill(worker_pid)
 
