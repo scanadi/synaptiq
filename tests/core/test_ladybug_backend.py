@@ -421,6 +421,140 @@ class TestRecoveryAndRebuildSafety:
         finally:
             storage.close()
 
+    def test_reraises_schema_mismatch_read_only_without_wiping(
+        self, tmp_path: Path
+    ) -> None:
+        """A read-only open of an older-synaptiq index (schema mismatch) must
+        re-raise WITHOUT wiping — it's a valid database that needs a rebuild,
+        not corruption. Regression for review F1/F15: the old code wiped the
+        index on any non-lock open error, silently destroying it."""
+        import ladybug as engine
+
+        from synaptiq.core.storage.ladybug_backend import open_with_recovery
+
+        db = tmp_path / "kuzu"
+        meta = tmp_path / "meta.json"
+        meta.write_text("{}", encoding="utf-8")
+        # Pre-upgrade database: the first node table (File) with the old
+        # 12-column schema (no properties_json), which _verify_schema rejects
+        # in read-only mode with a clear "older synaptiq version" error.
+        old_props = (
+            "id STRING, name STRING, file_path STRING, start_line INT64, "
+            "end_line INT64, content STRING, signature STRING, language STRING, "
+            "class_name STRING, is_dead BOOL, is_entry_point BOOL, "
+            "is_exported BOOL, PRIMARY KEY (id)"
+        )
+        d = engine.Database(str(db))
+        conn = engine.Connection(d)
+        conn.execute(f"CREATE NODE TABLE File({old_props})")
+        conn.close()
+        d.close()
+        assert db.exists()
+
+        with pytest.raises(RuntimeError, match="older synaptiq version"):
+            open_with_recovery(db, meta, read_only=True)
+
+        # The index and its meta file must be UNTOUCHED.
+        assert db.exists()
+        assert meta.exists()
+
+    def test_reraises_unknown_error_without_wiping(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unrecognized open failure (disk quota, OOM, ...) propagates
+        unchanged and leaves the index in place — only verified-corruption
+        signatures may wipe (review F1/F15)."""
+        from synaptiq.core.storage.ladybug_backend import open_with_recovery
+
+        db = tmp_path / "kuzu"
+        healthy = LadybugBackend()  # a real index that must survive the failure
+        healthy.initialize(db)
+        healthy.close()
+        assert db.exists()
+
+        def boom_init(self, path, *, read_only=False, _build_fts_indexes=True):
+            raise RuntimeError("disk quota exceeded")
+
+        monkeypatch.setattr(LadybugBackend, "initialize", boom_init)
+
+        with pytest.raises(RuntimeError, match="disk quota exceeded"):
+            open_with_recovery(db, tmp_path / "meta.json")
+
+        assert db.exists()  # never wiped on an unknown error
+
+    def test_lock_error_propagates_without_wiping(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A lock conflict is not corruption: it propagates and the index is
+        left untouched so the daemon primary/proxy hand-off still works."""
+        from synaptiq.core.storage.ladybug_backend import open_with_recovery
+
+        db = tmp_path / "kuzu"
+        healthy = LadybugBackend()
+        healthy.initialize(db)
+        healthy.close()
+        assert db.exists()
+
+        def locked_init(self, path, *, read_only=False, _build_fts_indexes=True):
+            raise RuntimeError(
+                "Could not set lock on file : kuzu.lock. Lock is held by PID 999."
+            )
+
+        monkeypatch.setattr(LadybugBackend, "initialize", locked_init)
+
+        with pytest.raises(RuntimeError, match="Lock is held"):
+            open_with_recovery(db, tmp_path / "meta.json", read_only=True)
+
+        assert db.exists()  # lock conflict never wipes
+
+    def test_corrupt_file_signature_wipes_and_rebuilds(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A verified corruption signature ('not a valid Lbug database file')
+        wipes the derived index and rebuilds it in read-write mode."""
+        from synaptiq.core.storage.ladybug_backend import open_with_recovery
+
+        db = tmp_path / "kuzu"
+        calls = {"n": 0}
+        real_init = LadybugBackend.initialize
+
+        def flaky_init(self, path, *, read_only=False, _build_fts_indexes=True):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError(f"IO exception: {path} is not a valid Lbug database file.")
+            return real_init(
+                self, path, read_only=read_only, _build_fts_indexes=_build_fts_indexes
+            )
+
+        monkeypatch.setattr(LadybugBackend, "initialize", flaky_init)
+
+        storage = open_with_recovery(db, tmp_path / "meta.json")
+        try:
+            assert storage._db is not None  # rebuilt fresh after the wipe
+        finally:
+            storage.close()
+
+    def test_read_only_corruption_raises_not_bare_backend(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """After a legitimate corruption wipe, a read-only open raises a clear
+        error instead of returning a bare backend that would serve an empty
+        graph (review F1c)."""
+        from synaptiq.core.storage.ladybug_backend import open_with_recovery
+
+        db = tmp_path / "kuzu"
+        db.write_bytes(b"garbage")  # something for the wipe to remove
+
+        def corrupt_init(self, path, *, read_only=False, _build_fts_indexes=True):
+            raise RuntimeError(f"IO exception: {path} is not a valid Lbug database file.")
+
+        monkeypatch.setattr(LadybugBackend, "initialize", corrupt_init)
+
+        with pytest.raises(RuntimeError, match="corrupt and has been removed"):
+            open_with_recovery(db, tmp_path / "meta.json", read_only=True)
+
+        assert not db.exists()  # the corrupt index was wiped during recovery
+
     def test_failed_rebuild_leaves_live_index_intact(self, tmp_path: Path) -> None:
         """bulk_load builds aside and swaps — a failed build keeps old data."""
         from synaptiq.core.graph.model import GraphNode, NodeLabel

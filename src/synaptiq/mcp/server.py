@@ -108,12 +108,16 @@ def _get_storage() -> LadybugBackend:
     bare (uninitialised) backend is returned so that tools can still be
     called without crashing.
 
-    If the database cannot be opened (corruption from a mid-write kill, or an
-    index left behind by the former KuzuDB backend), it is deleted along with
-    meta.json so the next ``serve --watch`` or ``analyze`` invocation rebuilds
-    cleanly.
+    If the database is genuinely corrupt (a verified mid-write-kill signature,
+    or an index left behind by the former KuzuDB backend), ``open_with_recovery``
+    deletes it along with meta.json and — because this is a read-only open with
+    nothing left to serve — raises rather than returning an empty backend, so
+    the failure is loud instead of silently answering as if the repo had no
+    code. Any other open failure (schema mismatch, lock, ...) propagates
+    unchanged, leaving the index untouched. The next ``serve --watch`` or
+    ``analyze`` invocation rebuilds cleanly.
     """
-    from synaptiq.core.storage.ladybug_backend import open_with_recovery
+    from synaptiq.core.storage.ladybug_backend import is_lock_error, open_with_recovery
 
     global _storage  # noqa: PLW0603
     if _storage is None:
@@ -127,7 +131,7 @@ def _get_storage() -> LadybugBackend:
                 )
                 logger.info("Initialised storage (read-only) from %s", db_path)
             except RuntimeError as exc:
-                if "lock on file" in str(exc).lower() or "lock is held" in str(exc).lower():
+                if is_lock_error(exc):
                     # Another process holds the database read-write
                     # (e.g. ``synaptiq serve --watch``). LadybugDB allows
                     # read-only opens only when no writer exists.

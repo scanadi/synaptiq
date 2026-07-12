@@ -189,6 +189,58 @@ def _embedding_ddl(dim: int) -> str:
 _MAX_POOL_SIZE = 8
 
 
+def is_lock_error(exc: BaseException) -> bool:
+    """True for a LadybugDB file-lock conflict — another live process owns the DB.
+
+    A lock conflict is **not** corruption: the index must be left untouched and
+    the error propagated so the caller's lock handling and the daemon
+    primary/proxy hand-off still work.  Shared by :func:`open_with_recovery`,
+    the CLI, and the MCP server so all three classify a lock the same way
+    (previously three subtly divergent predicates).
+
+    Matches the verified messages ``"Could not set lock on file ..."`` and
+    ``"Lock is held by PID ..."``, with a broad ``"lock"`` fallback so a
+    reworded lock message is never misread as corruption (fail-safe: keep the
+    index rather than wipe it).
+    """
+    msg = str(exc).lower()
+    return "lock on file" in msg or "lock is held" in msg or "lock" in msg
+
+
+# Verified LadybugDB messages for a derived index that is genuinely unreadable
+# and safe to wipe + rebuild.  Kept as a strict ALLOWLIST (see
+# :func:`is_recoverable_corruption`) so an *unrecognized* failure never
+# destroys a still-good index.
+_RECOVERABLE_CORRUPTION_SIGNATURES = (
+    "not a valid lbug database file",  # corrupt/partial file from a mid-write kill
+    "database path cannot be a directory",  # stale KuzuDB-format index directory
+)
+
+
+def is_recoverable_corruption(exc: BaseException) -> bool:
+    """True when *exc* is a verified "the derived index is garbage" signature.
+
+    :func:`open_with_recovery` may heal these by wiping the ``.synaptiq`` index
+    (a rebuildable artifact) and reindexing from source.  This is a strict
+    ALLOWLIST — anything not listed (a schema mismatch from an older synaptiq,
+    OOM, disk quota, a transient native error) returns ``False`` and must be
+    re-raised, so a recoverable-but-unrecognized failure never wipes a good
+    index (review F1/F15).
+
+    Recoverable cases (verified against LadybugDB):
+
+    * ``IndexError`` from open — the stale-WAL / partially written read, where
+      the native layer's ``unordered_map::at`` surfaces as ``IndexError``.
+    * ``"not a valid Lbug database file"`` — corruption from a mid-write kill.
+    * ``"Database path cannot be a directory"`` — an index directory written by
+      the former KuzuDB backend (LadybugDB uses a single-file format).
+    """
+    if isinstance(exc, IndexError):
+        return True
+    msg = str(exc).lower()
+    return any(sig in msg for sig in _RECOVERABLE_CORRUPTION_SIGNATURES)
+
+
 def open_with_recovery(
     db_path: Path,
     meta_path: Path | None = None,
@@ -209,9 +261,18 @@ def open_with_recovery(
       with "Database path cannot be a directory", so an upgraded install
       transparently reindexes instead of crashing.
 
-    In read-write mode the empty database is re-initialised; in read-only mode
-    a bare (uninitialised) backend is returned since there is nothing left to
-    open.
+    Only the verified-corruption signatures above (see
+    :func:`is_recoverable_corruption`) trigger a wipe.  **Anything else** — a
+    schema mismatch from an older synaptiq (read-only opens raise a clear
+    "created by an older version" error), OOM, disk quota, a transient native
+    error — is re-raised **unchanged with the index left untouched**, so an
+    unrecognized failure never destroys a still-good index (review F1/F15).
+
+    After a legitimate corruption wipe: in read-write mode the empty database
+    is re-initialised and returned; in **read-only** mode there is nothing left
+    to open, so a clear ``RuntimeError`` is raised (rather than returning a bare
+    backend that would silently serve an empty graph) directing the caller to
+    ``synaptiq analyze``.
 
     A **lock conflict** (another process holds the database) is not corruption:
     it propagates unchanged so the caller's lock handling and the daemon
@@ -230,24 +291,39 @@ def open_with_recovery(
         storage.initialize(db_path, read_only=read_only, _build_fts_indexes=build_fts_indexes)
         return storage
     except (RuntimeError, IndexError) as exc:
-        # Any open failure is recoverable by wiping + rebuilding (the index is
-        # derived), EXCEPT a lock conflict — that means another live process
-        # owns the database and it must be left untouched.  Verified LadybugDB
-        # messages: stale kuzu-format dir → "Database path cannot be a
-        # directory"; corrupt/partial file → "not a valid Lbug database file";
-        # lock conflict → "Could not set lock on file ... Lock is held by PID".
-        if "lock" in str(exc).lower():
+        # Release any handle initialize opened before it failed (a read-only
+        # schema check raises after the connection is live). Safe on a
+        # fresh/partial backend; never deletes files.
+        storage.close()
+        # Lock conflict → another live process owns the DB; propagate so the
+        # caller's lock handling / daemon primary-proxy hand-off runs.
+        if is_lock_error(exc):
             raise
+        # Only verified-corruption signatures are healed by wiping the derived
+        # index. ANYTHING ELSE (schema mismatch, OOM, disk quota, a transient
+        # native error) is re-raised UNCHANGED, leaving the index untouched, so
+        # an unrecognized failure never destroys a still-good index (F1/F15).
+        if not is_recoverable_corruption(exc):
+            raise
+        # Fall through: a verified-corruption signature — wipe + rebuild.
 
     logger.warning("Unreadable index at %s — removing it and scheduling a rebuild", db_path)
-    storage.close()
     LadybugBackend._remove_db_files(db_path)
     if meta_path is not None:
         meta_path.unlink(missing_ok=True)
 
+    if read_only:
+        # Nothing left to open after a corruption wipe. Returning a bare,
+        # uninitialised backend would silently serve an empty graph (MCP tools
+        # answering as if the repo had no code); fail loudly instead so the
+        # operator rebuilds.
+        raise RuntimeError(
+            f"Index at {db_path} was corrupt and has been removed; "
+            "run `synaptiq analyze` to rebuild it"
+        )
+
     storage = LadybugBackend()
-    if not read_only:
-        storage.initialize(db_path, _build_fts_indexes=build_fts_indexes)
+    storage.initialize(db_path, _build_fts_indexes=build_fts_indexes)
     return storage
 
 

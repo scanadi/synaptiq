@@ -41,7 +41,7 @@ def _print_phase_timing_table(phase_timings: dict, total_seconds: float) -> None
 
 def _load_storage(repo_path: Path | None = None) -> "LadybugBackend":  # noqa: F821
     """Load the LadybugDB backend for the given or current repo."""
-    from synaptiq.core.storage.ladybug_backend import LadybugBackend
+    from synaptiq.core.storage.ladybug_backend import LadybugBackend, is_lock_error
 
     target = (repo_path or Path.cwd()).resolve()
     # The on-disk index path is kept as ``.synaptiq/kuzu`` deliberately: an
@@ -59,8 +59,7 @@ def _load_storage(repo_path: Path | None = None) -> "LadybugBackend":  # noqa: F
     try:
         storage.initialize(db_path, read_only=True)
     except RuntimeError as exc:
-        msg = str(exc).lower()
-        if "lock on file" in msg or "lock is held" in msg:
+        if is_lock_error(exc):
             console.print(
                 "[red]Error:[/red] The database is locked by a running "
                 "`synaptiq serve` instance and it could not be reached "
