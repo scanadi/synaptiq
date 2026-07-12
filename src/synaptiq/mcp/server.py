@@ -39,6 +39,7 @@ from synaptiq.mcp.resources import get_dead_code_list, get_overview, get_schema
 if TYPE_CHECKING:
     from synaptiq.core.daemon.socket_client import SocketClient
 
+from synaptiq.mcp.freshness import freshness_trailer
 from synaptiq.mcp.secret_scanner import redact as _redact_secrets
 from synaptiq.mcp.token_budget import truncate_response, wrap_with_metadata
 from synaptiq.mcp.tools import (
@@ -563,12 +564,28 @@ async def list_tools() -> list[Tool]:
     return TOOLS
 
 def _apply_response_pipeline(result: str, max_tokens: int | None = None) -> str:
-    """Apply secret scanning, token budgeting, and metadata to a tool response."""
+    """Apply secret scanning, token budgeting, freshness, and metadata to a tool response.
+
+    This is the single place every tool response passes through — called
+    directly by ``dispatch_tool``, which is in turn reached from the local
+    stdio session, the CLI's direct-storage fallback, *and* the primary
+    daemon's socket dispatch (serving proxy instances). The freshness
+    trailer is therefore added exactly once here rather than at each of
+    those call sites; see ``dispatch_tool`` for the proxy-mode note.
+
+    Appended after truncation (so a token-budget cut can never eat it) and
+    before ``wrap_with_metadata`` (so the ``--- tokens: N ---`` footer
+    :func:`~synaptiq.mcp.token_budget.strip_metadata` strips stays the very
+    last thing in the string, exactly as that regex requires).
+    """
     result, redacted_count = _redact_secrets(result)
     if redacted_count > 0:
         result += f"\n\nWARNING: {redacted_count} potential secret(s) redacted from response."
     if max_tokens and max_tokens > 0:
         result = truncate_response(result, max_tokens)
+    trailer = freshness_trailer()
+    if trailer:
+        result = f"{result}\n\n{trailer}"
     return wrap_with_metadata(result)
 
 
@@ -612,7 +629,17 @@ def _as_str_list(value: object) -> list[str] | None:
 
 
 def dispatch_tool(name: str, arguments: dict, storage: LadybugBackend) -> str:
-    """Synchronous tool dispatch — called directly or via ``asyncio.to_thread``."""
+    """Synchronous tool dispatch — called directly or via ``asyncio.to_thread``.
+
+    Proxy mode: a proxy instance's ``call_tool`` never reaches this function
+    for a forwarded request — it awaits ``_proxy_client.call_tool(...)`` and
+    returns that string as-is. But the *primary* daemon answers socket
+    requests from proxies by calling this same ``dispatch_tool`` (see the
+    ``dispatch()`` closure in ``cli.main._PrimaryRuntime.start``), so the
+    freshness trailer from ``_apply_response_pipeline`` is already baked
+    into the text the primary sends back — the proxy just relays it
+    unchanged. No proxy-side changes are needed for the trailer to appear.
+    """
     max_tokens = _as_int(arguments.get("max_tokens"), 0) or None
 
     if name == "synaptiq_list_repos":
@@ -738,7 +765,15 @@ async def list_resources() -> list[Resource]:
     ]
 
 def dispatch_resource(uri_str: str, storage: LadybugBackend) -> str:
-    """Synchronous resource dispatch."""
+    """Synchronous resource dispatch.
+
+    Like ``dispatch_tool``, this is the single place resource text flows
+    through for both the local session and the primary daemon's socket
+    dispatch, so proxy instances pick up the trailer for free (see
+    ``dispatch_tool``'s docstring). Per W4.5 scope, the freshness trailer is
+    only added to ``synaptiq://overview`` — ``dead-code`` and ``schema`` are
+    left untouched.
+    """
     if uri_str == "synaptiq://overview":
         result = get_overview(storage)
     elif uri_str == "synaptiq://dead-code":
@@ -750,6 +785,10 @@ def dispatch_resource(uri_str: str, storage: LadybugBackend) -> str:
     result, count = _redact_secrets(result)
     if count > 0:
         result += f"\n\nWARNING: {count} potential secret(s) redacted from response."
+    if uri_str == "synaptiq://overview":
+        trailer = freshness_trailer()
+        if trailer:
+            result = f"{result}\n\n{trailer}"
     return wrap_with_metadata(result)
 
 
