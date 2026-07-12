@@ -230,13 +230,51 @@ def apply_reindex(
 
     This is the I/O-intensive part that requires database access and
     MUST be called under an exclusive write lock.
+
+    Does NOT rebuild FTS (BM25) indexes.  ``rebuild_fts_indexes()`` drops and
+    recreates every searchable index from scratch (``DROP_FTS_INDEX`` +
+    ``CREATE_FTS_INDEX`` per table) -- an O(whole corpus) operation, so
+    calling it here would pay that cost on every single-file save (G3)
+    instead of O(one file).  A full rebuild always still happens at the
+    watcher's next debounced global phase: ``commit_full_index`` ->
+    ``storage.bulk_load()`` unconditionally rebuilds every FTS index from the
+    fresh graph (see ``KuzuBackend.bulk_load``), so no separate "FTS dirty"
+    flag is needed -- the global phase's existing change-tracking in
+    ``_GlobalPhaseScheduler`` (``watcher.py``) already gates it, and every
+    non-skipped rebuild it triggers rebuilds FTS as a side effect of
+    ``bulk_load``.
+
+    Staleness window and bound: between a save and that next global rebuild,
+    BM25 results are not actively refreshed by this function, so they may
+    lag behind the graph -- which IS updated immediately here, so exact-name
+    search and graph traversal are unaffected regardless of FTS freshness.
+    (In practice, ``QUERY_FTS_INDEX`` on the pinned ``kuzu==0.11.3`` already
+    reflects rows inserted/deleted on the same connection without an
+    explicit rebuild -- verified empirically, not a documented Kuzu
+    guarantee, so this function does not rely on it either way.)
+    ``KuzuBackend.fts_search`` catches query failures per-table, so a stale
+    or mid-mutation FTS index degrades results but never raises -- hybrid
+    search cannot error because of this.  The window is bounded by the same
+    ceiling that already governs embeddings (which have likewise never been
+    refreshed per-save): ``GLOBAL_PHASE_INTERVAL`` seconds of edit quiescence
+    (default 30s), or ``MAX_STALENESS_SECONDS`` under continuous churn that
+    never quiesces (default 600s) -- see ``watcher.py``.
+
+    Skip-if-clean interaction: ``_GlobalPhaseScheduler`` may skip a rebuild
+    whose accumulated-change fingerprint matches the last *committed*
+    fingerprint -- i.e. the pending changes reproduce content already
+    reflected in the last successful ``bulk_load``.  That's safe for FTS
+    too: the matching commit already rebuilt the indexes for that exact
+    content, so skipping repeats no stale state.  Any save whose content
+    actually differs from what was last committed yields a different
+    fingerprint, which always drives a real rebuild (and thus a real FTS
+    refresh).
     """
     for entry in file_entries:
         storage.remove_nodes_by_file(entry.path)
 
     storage.add_nodes(list(graph.iter_nodes()))
     storage.add_relationships(list(graph.iter_relationships()))
-    storage.rebuild_fts_indexes()
 
 
 def build_graph(repo_path: Path) -> KnowledgeGraph:
