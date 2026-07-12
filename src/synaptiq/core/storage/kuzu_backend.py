@@ -1206,13 +1206,21 @@ class KuzuBackend:
         self.initialize(live_path)
 
     def rebuild_fts_indexes(self) -> None:
-        """Drop and recreate all FTS indexes.
+        """Drop and recreate FTS indexes for every searchable node table.
 
         Must be called after any bulk data change so the BM25 indexes
-        reflect the current node contents.
+        reflect the current node contents. Only ``_SEARCHABLE_TABLES`` are
+        (re)indexed — Folder/Community/Process are never queried by
+        :meth:`fts_search`, :meth:`exact_name_search`, or
+        :meth:`fuzzy_search`, so building FTS indexes for them is pure
+        waste. Both the DROP and CREATE calls already tolerate failure,
+        so this is safe to run against a database whose indexes were
+        built by an older version that indexed all node tables — the
+        three extra pre-existing indexes are simply left in place,
+        un-rebuilt and unqueried.
         """
         assert self._conn is not None
-        for table in _NODE_TABLE_NAMES:
+        for table in _SEARCHABLE_TABLES:
             idx_name = f"{table.lower()}_fts"
             try:
                 self._conn.execute(f"CALL DROP_FTS_INDEX('{table}', '{idx_name}')")
@@ -1449,9 +1457,14 @@ class KuzuBackend:
         self._create_fts_indexes()
 
     def _create_fts_indexes(self) -> None:
-        """Create FTS indexes for every node table (idempotent)."""
+        """Create FTS indexes for every searchable node table (idempotent).
+
+        Scoped to ``_SEARCHABLE_TABLES`` rather than all node tables —
+        Folder/Community/Process are never queried by any search method,
+        so indexing them would waste build time for no benefit.
+        """
         assert self._conn is not None
-        for table in _NODE_TABLE_NAMES:
+        for table in _SEARCHABLE_TABLES:
             idx_name = f"{table.lower()}_fts"
             try:
                 self._conn.execute(
