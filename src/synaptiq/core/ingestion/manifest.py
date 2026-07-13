@@ -168,6 +168,15 @@ class FileManifest:
     symbol_sigs: dict[str, str] = field(default_factory=dict)
     #: Outbound resolver edges this file's resolution produced.
     out_edges: list[EdgeRef] = field(default_factory=list)
+    #: Import module strings this file referenced that did NOT resolve to any
+    #: project file at build time (external gems/stdlib — or the case this field
+    #: exists for: a module that does not exist *yet*). Captured from
+    #: ``process_imports`` for the added-file dependent closure: when a brand-new
+    #: file is later ADDED whose importable identity matches one of these, this
+    #: file is pulled into re-resolution so the import links up incrementally
+    #: instead of waiting for a consolidation (see ``plan_incremental`` and
+    #: ``imports.importable_identities``).
+    unresolved_imports: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -179,6 +188,10 @@ class IndexPending:
 
     affected_symbols: int = 0
     changed_files: int = 0
+    #: Incremental delta applies since the last consolidation (full rebuild).
+    #: One of the consolidation gates (design §9 "every N applies") — reset to 0
+    #: whenever a full build stamps a fresh manifest.
+    applies_since_consolidation: int = 0
     fts_dirty: bool = False
     hnsw_dirty: bool = False
     community_dirty: bool = False
@@ -255,6 +268,13 @@ def build_manifest(
             fm.content_sha = content_sha(node.content)
             if node.language:
                 fm.language = node.language
+            # Unresolved imports are stashed on the File node by process_imports
+            # (the only place with both the parsed imports and the resolution
+            # verdict); build_manifest is the by-product hook that lifts them
+            # into provenance. Absent/malformed → empty (never trust a stray).
+            raw_unresolved = node.properties.get("unresolved_imports")
+            if isinstance(raw_unresolved, (list, tuple)):
+                fm.unresolved_imports = [str(m) for m in raw_unresolved]
 
     for rel in graph.iter_relationships():
         if rel.type.value not in RESOLVER_REL_TYPES:
@@ -277,6 +297,7 @@ def build_manifest(
     for fm in files.values():
         fm.symbol_ids.sort()
         fm.out_edges.sort(key=lambda e: (e.rel_type, e.src, e.tgt, e.confidence))
+        fm.unresolved_imports = sorted(set(fm.unresolved_imports))
 
     index = IndexManifest(
         manifest_version=CURRENT_MANIFEST_VERSION,
@@ -417,6 +438,7 @@ FILE_MANIFEST_COLUMNS: tuple[str, ...] = (
     "symbol_ids",
     "symbol_sigs",
     "out_edges",
+    "unresolved_imports",
 )
 
 
@@ -433,6 +455,7 @@ def serialize_file_manifest(fm: FileManifest) -> list[str]:
         json.dumps(fm.symbol_ids),
         json.dumps(fm.symbol_sigs, sort_keys=True),
         json.dumps([[e.rel_type, e.src, e.tgt, e.confidence] for e in fm.out_edges]),
+        json.dumps(fm.unresolved_imports),
     ]
 
 
@@ -451,6 +474,7 @@ def serialize_index_manifest(im: IndexManifest) -> tuple[int, str]:
         "pending": {
             "affected_symbols": im.pending.affected_symbols,
             "changed_files": im.pending.changed_files,
+            "applies_since_consolidation": im.pending.applies_since_consolidation,
             "fts_dirty": im.pending.fts_dirty,
             "hnsw_dirty": im.pending.hnsw_dirty,
             "community_dirty": im.pending.community_dirty,
@@ -473,13 +497,17 @@ def _parse_file_manifest_row(row: list[Any]) -> FileManifest | None:
         symbol_ids = json.loads(row[3]) if row[3] else []
         symbol_sigs = json.loads(row[4]) if row[4] else {}
         raw_edges = json.loads(row[5]) if row[5] else []
+        # ``unresolved_imports`` was added after the first manifest schema; a row
+        # written before it (or a NULL from CSV COPY) has fewer than 7 cols —
+        # tolerate that with an empty list rather than treating it as corrupt.
+        raw_unresolved = json.loads(row[6]) if len(row) > 6 and row[6] else []
     except (IndexError, TypeError, ValueError, json.JSONDecodeError):
         return None
     if not isinstance(path, str) or not path:
         return None
     if not isinstance(symbol_ids, list) or not isinstance(symbol_sigs, dict):
         return None
-    if not isinstance(raw_edges, list):
+    if not isinstance(raw_edges, list) or not isinstance(raw_unresolved, list):
         return None
     out_edges: list[EdgeRef] = []
     for e in raw_edges:
@@ -497,6 +525,7 @@ def _parse_file_manifest_row(row: list[Any]) -> FileManifest | None:
         symbol_ids=[str(s) for s in symbol_ids],
         symbol_sigs={str(k): str(v) for k, v in symbol_sigs.items()},
         out_edges=out_edges,
+        unresolved_imports=[str(m) for m in raw_unresolved],
     )
 
 
@@ -527,6 +556,7 @@ def _parse_index_manifest(version_col: Any, data_col: Any) -> IndexManifest | No
     pending = IndexPending(
         affected_symbols=int(raw_pending.get("affected_symbols", 0) or 0),
         changed_files=int(raw_pending.get("changed_files", 0) or 0),
+        applies_since_consolidation=int(raw_pending.get("applies_since_consolidation", 0) or 0),
         fts_dirty=bool(raw_pending.get("fts_dirty", False)),
         hnsw_dirty=bool(raw_pending.get("hnsw_dirty", False)),
         community_dirty=bool(raw_pending.get("community_dirty", False)),

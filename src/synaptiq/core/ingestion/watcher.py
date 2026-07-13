@@ -42,6 +42,7 @@ import contextlib
 import hashlib
 import logging
 import os
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TypeVar
@@ -336,6 +337,7 @@ async def watch_repo(
     stop_event: asyncio.Event | None = None,
     rwlock: AsyncRWLock | None = None,
     rebuild_coordinator: RebuildCoordinator | None = None,
+    resident_manifest: list | None = None,
 ) -> None:
     """Main watch loop — monitor files and re-index on changes.
 
@@ -356,46 +358,123 @@ async def watch_repo(
         the socket ``reindex`` handler so the watcher's global phase and a
         socket-delivered reindex can never run two full builds concurrently.
         Defaults to a private guard when watching standalone.
+    resident_manifest:
+        Optional single-element ``[Manifest | None]`` cell holding the resident
+        manifest (D10) *shared with the socket reindex handler*, so a socket-side
+        consolidation can invalidate it (set ``[0] = None``) and the watcher
+        re-reads the freshly-stamped manifest instead of diffing against a stale
+        baseline. Defaults to a private cell when watching standalone.
     """
     import watchfiles
 
+    from synaptiq import __version__
+    from synaptiq.core.ingestion.coupling import current_git_head
     from synaptiq.core.ingestion.pipeline import (
         apply_reindex,
         build_full_index,
+        build_incremental_result,
         commit_full_index,
         load_previous_embeddings,
         parse_files,
+        run_incremental,
+        stamp_full_manifest,
         write_meta,
     )
 
     gitignore = load_gitignore(repo_path)
+    data_dir = repo_path / ".synaptiq"
     files_changed = 0
     coordinator = rebuild_coordinator if rebuild_coordinator is not None else RebuildCoordinator()
+
+    # Resident manifest (D10): held across bursts so the global phase's hot path
+    # never re-reads it from storage, and invalidated (set None) after a full
+    # rebuild so the next build reloads the freshly-stamped one. A list cell keeps
+    # it mutable from the _on_build closure; the caller may pass a shared cell so
+    # a socket reindex can invalidate it too.
+    if resident_manifest is None:
+        resident_manifest = [None]
 
     def _stopped() -> bool:
         return stop_event is not None and stop_event.is_set()
 
-    async def _on_build() -> bool:
-        """Build the full graph lock-free, then commit under the write lock.
-
-        Returns True once the commit lands, False if shutdown interrupted it.
-        Runs inside the shared :class:`RebuildCoordinator`, so it is guaranteed
-        single-flight against the socket reindex handler.
-        """
-        logger.info("Running global analysis phases...")
+    async def _on_full_build(reason: str) -> bool:
+        """The consolidation path — a full rebuild that refreshes every deferred
+        global phase and stamps a fresh manifest (incl. git_head). Unchanged from
+        the pre-incremental behaviour except for the git_head stamp + resident
+        invalidation."""
+        logger.info("Consolidating (full rebuild): %s", reason)
         # Snapshot current vectors first (plain read, no lock) so only changed
         # symbols are re-encoded.
-        previous = await asyncio.to_thread(load_previous_embeddings, storage)
+        previous_vecs = await asyncio.to_thread(load_previous_embeddings, storage)
         full_graph, embeddings, result = await asyncio.to_thread(
-            build_full_index, repo_path, previous_embeddings=previous
+            build_full_index, repo_path, previous_embeddings=previous_vecs
         )
         if _stopped():
             return False
-        await _run_under_write_lock(
-            rwlock, commit_full_index, storage, full_graph, embeddings
+        head = await asyncio.to_thread(current_git_head, repo_path)
+        await _run_under_write_lock(rwlock, commit_full_index, storage, full_graph, embeddings)
+        # Stamp git_head (bulk_load left it None) — the D8 gate's next baseline —
+        # then invalidate the resident manifest so the next build reloads it.
+        await asyncio.to_thread(
+            stamp_full_manifest, storage, full_graph, tool_version=__version__, git_head=head
         )
-        write_meta(repo_path / ".synaptiq", repo_path, result)
-        logger.info("Global phases completed")
+        resident_manifest[0] = None
+        write_meta(data_dir, repo_path, result, mode="full", reason=reason)
+        logger.info("Consolidation complete")
+        return True
+
+    def _apply_incremental(outcome) -> None:
+        """The only lock-held storage work on the incremental path — a surgical
+        ``apply_graph_delta`` + manifest write, far shorter than a full build."""
+        storage.apply_graph_delta(outcome.delta)
+        storage.write_manifest(outcome.new_manifest)
+
+    async def _on_build() -> bool:
+        """Global phase (D10): try an incremental delta, consolidate when due.
+
+        Returns True once the commit lands, False if shutdown interrupted it.
+        Runs inside the shared :class:`RebuildCoordinator`, so it is single-flight
+        against the socket reindex handler. ``repair_inbound=True`` re-resolves the
+        dependents of *every* changed file (not just identity-changed ones) so the
+        inbound edges the lossy per-file immediate tier DETACH-DELETEs are
+        restored — the price of keeping that tier as-is. The plan + delta are
+        computed lock-free (all read-only); only the surgical apply takes the lock.
+        """
+        head = await asyncio.to_thread(current_git_head, repo_path)
+        outcome = await asyncio.to_thread(
+            run_incremental,
+            repo_path,
+            storage,
+            tool_version=__version__,
+            repair_inbound=True,
+            previous=resident_manifest[0],
+            git_head=head,
+            now=time.time(),
+            apply=False,
+        )
+        if _stopped():
+            return False
+        if outcome.full_rebuild_required:
+            return await _on_full_build(outcome.reason)
+
+        await _run_under_write_lock(rwlock, _apply_incremental, outcome)
+        resident_manifest[0] = outcome.new_manifest
+        result = build_incremental_result(data_dir, outcome)
+        write_meta(
+            data_dir,
+            repo_path,
+            result,
+            mode="incremental",
+            reason=outcome.reason,
+            changed_files=outcome.changed_files,
+            dependents=outcome.dependents,
+            symbols_updated=outcome.symbols_updated,
+        )
+        logger.info(
+            "Incremental global apply: %d file(s), %d symbol(s) updated",
+            outcome.changed_files,
+            outcome.symbols_updated,
+        )
         return True
 
     scheduler = _GlobalPhaseScheduler(coordinator, _on_build, stopped=_stopped)

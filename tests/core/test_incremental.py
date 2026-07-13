@@ -21,7 +21,14 @@ import pytest
 from synaptiq.core.graph.graph import KnowledgeGraph
 from synaptiq.core.graph.model import GraphNode, NodeLabel, RelType, generate_id
 from synaptiq.core.ingestion.incremental import (
+    CONSOLIDATION_APPLY_LIMIT,
+    CONSOLIDATION_MAX_SECONDS,
+    CONSOLIDATION_SYMBOL_RATIO,
     FILE_RATIO_THRESHOLD,
+    REASON_CONSOLIDATE_APPLY_LIMIT,
+    REASON_CONSOLIDATE_GIT_HEAD,
+    REASON_CONSOLIDATE_STALENESS,
+    REASON_CONSOLIDATE_SYMBOL_RATIO,
     REASON_CORRUPT_MANIFEST,
     REASON_FILE_RATIO,
     REASON_INCREMENTAL,
@@ -32,12 +39,14 @@ from synaptiq.core.ingestion.incremental import (
     IncrementalPlan,
     build_current_manifest,
     plan_incremental,
+    should_consolidate,
 )
 from synaptiq.core.ingestion.manifest import (
     CURRENT_MANIFEST_VERSION,
     EdgeRef,
     FileManifest,
     IndexManifest,
+    IndexPending,
     Manifest,
     build_manifest,
     compute_fingerprint,
@@ -71,6 +80,7 @@ def _fm(
     sigs: dict[str, str],
     *,
     out_edges: list[EdgeRef] | None = None,
+    unresolved_imports: list[str] | None = None,
 ) -> FileManifest:
     """FileManifest with ``symbol_ids`` derived from ``sigs`` (build_manifest
     keeps them in lockstep, so synthetic rows must too)."""
@@ -80,6 +90,7 @@ def _fm(
         symbol_ids=sorted(sigs),
         symbol_sigs=dict(sigs),
         out_edges=list(out_edges or []),
+        unresolved_imports=list(unresolved_imports or []),
     )
 
 
@@ -859,3 +870,219 @@ def test_plan_is_incrementalplan_instance():
     """Guard the public return type."""
     curr = _manifest([_fm("src/a.py", "A1", {FILE_A: "s"})])
     assert isinstance(plan_incremental(None, curr), IncrementalPlan)
+
+
+# ===========================================================================
+# Added-file dependent closure (design's added-file-closure fix, W3.2e #5)
+# ===========================================================================
+
+
+def _filler(i: int, prefix: str = "src") -> FileManifest:
+    """A symbol-bearing filler file, so a lone added-file symbol never dominates
+    the symbol ratio and the closure logic (not the ratio gate) is what's tested."""
+    path = f"{prefix}/p{i}.py"
+    return _fm(path, f"p{i}v1", {generate_id(NodeLabel.FUNCTION, path, "fn"): "v"})
+
+
+def test_added_file_pulls_in_unchanged_importer_via_unresolved_import():
+    """An unchanged file whose recorded unresolved import matches a newly-ADDED
+    file's importable identity is pulled into re-resolution."""
+    imp_sigs = {generate_id(NodeLabel.FILE, "src/importer.py"): "s"}
+    prev = _manifest(
+        [_fm("src/importer.py", "I1", imp_sigs, unresolved_imports=["src.late"]),
+         *[_filler(i) for i in range(9)]]
+    )
+    # late.py is added; importer.py is otherwise unchanged.
+    late = _fm("src/late.py", "L1", {generate_id(NodeLabel.FILE, "src/late.py"): "s"})
+    curr = _manifest(
+        [_fm("src/importer.py", "I1", imp_sigs, unresolved_imports=["src.late"]),
+         late, *[_filler(i) for i in range(9)]]
+    )
+
+    plan = plan_incremental(prev, curr)
+
+    assert not plan.full_rebuild_required
+    assert "src/late.py" in plan.diff.added_files
+    assert plan.dependents == frozenset({"src/importer.py"})
+    assert "src/importer.py" in plan.files_to_reparse
+
+
+def test_added_file_does_not_pull_unrelated_unresolved_import():
+    """A non-matching unresolved import (external gem/stdlib) is never pulled in."""
+    imp_sigs = {generate_id(NodeLabel.FILE, "src/importer.py"): "s"}
+    prev = _manifest(
+        [_fm("src/importer.py", "I1", imp_sigs, unresolved_imports=["requests"]),
+         *[_filler(i) for i in range(9)]]
+    )
+    late = _fm("src/late.py", "L1", {generate_id(NodeLabel.FILE, "src/late.py"): "s"})
+    curr = _manifest(
+        [_fm("src/importer.py", "I1", imp_sigs, unresolved_imports=["requests"]),
+         late, *[_filler(i) for i in range(9)]]
+    )
+
+    plan = plan_incremental(prev, curr)
+
+    assert plan.dependents == frozenset()  # "requests" != any form of "src/late"
+
+
+def test_added_file_closure_matches_source_root_layout():
+    """src/pkg/late.py added matches an unchanged file that imported `pkg.late`."""
+    imp_sigs = {generate_id(NodeLabel.FILE, "app.py"): "s"}
+    prev = _manifest(
+        [_fm("app.py", "A1", imp_sigs, unresolved_imports=["pkg.late"]),
+         *[_filler(i) for i in range(9)]]
+    )
+    late = _fm("src/pkg/late.py", "L1", {generate_id(NodeLabel.FILE, "src/pkg/late.py"): "s"})
+    curr = _manifest(
+        [_fm("app.py", "A1", imp_sigs, unresolved_imports=["pkg.late"]),
+         late, *[_filler(i) for i in range(9)]]
+    )
+
+    plan = plan_incremental(prev, curr)
+    # importable_identities("src/pkg/late.py") includes "pkg/late"/"pkg.late".
+    assert plan.dependents == frozenset({"app.py"})
+
+
+# ===========================================================================
+# repair_inbound — the watcher re-resolves dependents of body-only files too
+# ===========================================================================
+
+
+def test_repair_inbound_pulls_dependents_of_body_only_files():
+    """With repair_inbound, an unchanged importer of a *body-only*-edited file is
+    re-resolved (to restore inbound edges the immediate tier DETACH-DELETEs)."""
+    a = _fm(
+        "src/a.py",
+        "A1",
+        {FILE_A: "s", FUNC_FOO: "f1"},
+        out_edges=[EdgeRef(CALLS, FUNC_FOO, FUNC_BAR)],
+    )
+    prev = _manifest([a, _fm("src/b.py", "B1", {FILE_B: "s", FUNC_BAR: "b1"})])
+    # b.py body-only (bar keeps its identity).
+    curr = _manifest(
+        [
+            _fm("src/a.py", "A1", {FILE_A: "s", FUNC_FOO: "f1"},
+                out_edges=[EdgeRef(CALLS, FUNC_FOO, FUNC_BAR)]),
+            _fm("src/b.py", "B2", {FILE_B: "s", FUNC_BAR: "b1"}),
+        ]
+    )
+
+    # Default (analyze): body-only ⇒ no closure.
+    assert plan_incremental(prev, curr).dependents == frozenset()
+    # repair_inbound (watcher): a.py is pulled in to repair its inbound edge.
+    repaired = plan_incremental(prev, curr, repair_inbound=True)
+    assert repaired.dependents == frozenset({"src/a.py"})
+    assert "src/a.py" in repaired.files_to_reparse
+
+
+# ===========================================================================
+# should_consolidate — the §7/§9 consolidation gates (D5, D8, N, staleness)
+# ===========================================================================
+
+
+def _consol_manifest(
+    *,
+    total_symbols: int = 100,
+    affected: int = 0,
+    applies: int = 0,
+    git_head: str | None = "head0",
+    consolidated_at: str = "",
+) -> Manifest:
+    """A previous manifest carrying pending counters for the consolidation gate.
+
+    ``total_symbols`` synthetic single-symbol files supply the symbol-ratio
+    denominator (via the plan's total_symbol_count)."""
+    files = [
+        _fm(f"src/s{i}.py", f"s{i}", {generate_id(NodeLabel.FUNCTION, f"src/s{i}.py", "fn"): "v"})
+        for i in range(total_symbols)
+    ]
+    idx = IndexManifest(
+        manifest_version=CURRENT_MANIFEST_VERSION,
+        git_head=git_head,
+        consolidated_at=consolidated_at,
+        pending=IndexPending(affected_symbols=affected, applies_since_consolidation=applies),
+        full_fingerprint=compute_fingerprint({f.path: f.content_sha for f in files}),
+    )
+    return Manifest(index=idx, files={f.path: f for f in files})
+
+
+def _incremental_plan(previous: Manifest, *, affected_this_burst: int = 0) -> IncrementalPlan:
+    """An incremental plan against ``previous`` whose this-burst affected count is
+    controllable (one identity-changed file with N single symbols)."""
+    files = list(previous.files.values())
+    # Perturb the first `affected_this_burst` files' single symbol identities.
+    curr_files = []
+    for i, fm in enumerate(files):
+        sigs = dict(fm.symbol_sigs)
+        if i < affected_this_burst:
+            (sid,) = sigs
+            curr_files.append(_fm(fm.path, f"{fm.content_sha}-v2", {sid: "v2"}))
+        else:
+            curr_files.append(_fm(fm.path, fm.content_sha, sigs))
+    plan = plan_incremental(previous, _manifest(curr_files))
+    assert not plan.full_rebuild_required
+    return plan
+
+
+def test_consolidate_when_git_head_moved():
+    """D8: git HEAD moved ⇒ consolidate (coupling stale), highest precedence."""
+    prev = _consol_manifest(git_head="head0")
+    plan = _incremental_plan(prev, affected_this_burst=1)
+    do, why = should_consolidate(prev, plan, git_head_moved=True)
+    assert do and why == REASON_CONSOLIDATE_GIT_HEAD
+
+
+def test_consolidate_when_symbol_ratio_crossed():
+    """D5: cumulative affected-symbol ratio over the threshold ⇒ consolidate."""
+    # 100 symbols; pending already 10 affected; this burst adds 5 → 15/100 = 0.15 > 0.12.
+    prev = _consol_manifest(total_symbols=100, affected=10)
+    plan = _incremental_plan(prev, affected_this_burst=5)
+    do, why = should_consolidate(prev, plan, git_head_moved=False)
+    assert do and why == REASON_CONSOLIDATE_SYMBOL_RATIO
+
+
+def test_no_consolidate_under_symbol_ratio():
+    """Just under the D5 threshold stays incremental."""
+    # pending 5 + this burst 2 = 7/100 = 0.07 < 0.12.
+    prev = _consol_manifest(total_symbols=100, affected=5)
+    plan = _incremental_plan(prev, affected_this_burst=2)
+    do, why = should_consolidate(prev, plan, git_head_moved=False)
+    assert not do and why == ""
+
+
+def test_consolidate_after_n_applies():
+    """N applies since last consolidation ⇒ consolidate (design's N gate)."""
+    prev = _consol_manifest(total_symbols=1000, applies=CONSOLIDATION_APPLY_LIMIT - 1)
+    plan = _incremental_plan(prev, affected_this_burst=1)  # tiny — ratio gate quiet
+    do, why = should_consolidate(prev, plan, git_head_moved=False)
+    assert do and why == REASON_CONSOLIDATE_APPLY_LIMIT
+
+
+def test_consolidate_after_staleness_ceiling():
+    """Unconsolidated past the wall-clock ceiling ⇒ consolidate."""
+    from datetime import datetime, timedelta, timezone
+
+    stale = datetime.now(timezone.utc) - timedelta(seconds=CONSOLIDATION_MAX_SECONDS + 60)
+    prev = _consol_manifest(total_symbols=1000, consolidated_at=stale.isoformat())
+    plan = _incremental_plan(prev, affected_this_burst=1)
+    now = datetime.now(timezone.utc).timestamp()
+    do, why = should_consolidate(prev, plan, git_head_moved=False, now=now)
+    assert do and why == REASON_CONSOLIDATE_STALENESS
+
+
+def test_no_consolidate_when_all_gates_quiet():
+    """Small change, HEAD unchanged, few applies, recently consolidated ⇒ delta."""
+    from datetime import datetime, timezone
+
+    fresh = datetime.now(timezone.utc).isoformat()
+    prev = _consol_manifest(total_symbols=1000, affected=1, applies=1, consolidated_at=fresh)
+    plan = _incremental_plan(prev, affected_this_burst=1)
+    now = datetime.now(timezone.utc).timestamp()
+    do, why = should_consolidate(prev, plan, git_head_moved=False, now=now)
+    assert not do and why == ""
+
+
+def test_consolidation_thresholds_match_design():
+    assert CONSOLIDATION_SYMBOL_RATIO == 0.12
+    assert CONSOLIDATION_APPLY_LIMIT == 50
+    assert CONSOLIDATION_MAX_SECONDS == 600

@@ -36,9 +36,12 @@ pure function of two manifests. W3.2e wires ``storage.read_manifest()`` →
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 from synaptiq.core.graph.graph import KnowledgeGraph
+from synaptiq.core.ingestion.imports import _module_forms, importable_identities
 from synaptiq.core.ingestion.manifest import (
     CURRENT_MANIFEST_VERSION,
     RESOLVER_REL_TYPES,
@@ -57,15 +60,23 @@ from synaptiq.core.ingestion.walker import FileEntry
 __all__ = [
     "FILE_RATIO_THRESHOLD",
     "SYMBOL_RATIO_THRESHOLD",
+    "CONSOLIDATION_SYMBOL_RATIO",
+    "CONSOLIDATION_APPLY_LIMIT",
+    "CONSOLIDATION_MAX_SECONDS",
     "REASON_NO_MANIFEST",
     "REASON_VERSION_MISMATCH",
     "REASON_CORRUPT_MANIFEST",
     "REASON_FILE_RATIO",
     "REASON_SYMBOL_RATIO",
     "REASON_INCREMENTAL",
+    "REASON_CONSOLIDATE_SYMBOL_RATIO",
+    "REASON_CONSOLIDATE_APPLY_LIMIT",
+    "REASON_CONSOLIDATE_STALENESS",
+    "REASON_CONSOLIDATE_GIT_HEAD",
     "IncrementalPlan",
     "plan_incremental",
     "build_current_manifest",
+    "should_consolidate",
 ]
 
 # ---------------------------------------------------------------------------
@@ -86,6 +97,31 @@ FILE_RATIO_THRESHOLD = 0.30
 SYMBOL_RATIO_THRESHOLD = 0.40
 
 # ---------------------------------------------------------------------------
+# Consolidation policy (design §7, §9 / D5, D8)
+# ---------------------------------------------------------------------------
+#
+# Incremental applies defer the genuinely-global phases (communities, processes,
+# FTS, HNSW) and leave coupling untouched. A *consolidation* — the existing full
+# rebuild, which recomputes all of them and stamps a fresh manifest (a free
+# consolidator) — is forced when the cumulative structural change since the last
+# consolidation crosses a symbol-ratio threshold (D5), after N applies, once the
+# index has been unconsolidated for too long, or when git HEAD moved (coupling
+# depends solely on git history — D8). All env-overridable, mirroring W1.1's
+# MAX_STALENESS_SECONDS (design §12 W3.2e risk note).
+
+#: Cumulative affected-symbol ratio since last consolidation that forces one (D5).
+CONSOLIDATION_SYMBOL_RATIO = float(
+    os.environ.get("SYNAPTIQ_CONSOLIDATION_SYMBOL_RATIO", "0.12")
+)
+#: Incremental applies since last consolidation that force one (design's "N").
+CONSOLIDATION_APPLY_LIMIT = int(os.environ.get("SYNAPTIQ_CONSOLIDATION_APPLIES", "50"))
+#: Wall-clock ceiling (seconds) since the last consolidation (mirrors W1.1's
+#: MAX_STALENESS_SECONDS default so the two staleness bounds agree).
+CONSOLIDATION_MAX_SECONDS = float(
+    os.environ.get("SYNAPTIQ_CONSOLIDATION_MAX_SECONDS", "600")
+)
+
+# ---------------------------------------------------------------------------
 # Full-rebuild reason codes (surfaced for diagnostics / status / tests)
 # ---------------------------------------------------------------------------
 
@@ -103,6 +139,14 @@ REASON_FILE_RATIO = "file_ratio_exceeded"
 REASON_SYMBOL_RATIO = "symbol_ratio_exceeded"
 #: Change is small enough to apply as a scoped delta — the happy path.
 REASON_INCREMENTAL = "incremental"
+#: Consolidation forced: cumulative affected-symbol ratio crossed D5 (§9).
+REASON_CONSOLIDATE_SYMBOL_RATIO = "consolidate_symbol_ratio"
+#: Consolidation forced: N incremental applies elapsed since the last one (§9).
+REASON_CONSOLIDATE_APPLY_LIMIT = "consolidate_apply_limit"
+#: Consolidation forced: index unconsolidated past the staleness ceiling (§9).
+REASON_CONSOLIDATE_STALENESS = "consolidate_staleness"
+#: Consolidation forced: git HEAD moved, so coupling is stale (§9 / D8).
+REASON_CONSOLIDATE_GIT_HEAD = "consolidate_git_head"
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +260,7 @@ def plan_incremental(
     *,
     file_ratio_threshold: float = FILE_RATIO_THRESHOLD,
     symbol_ratio_threshold: float = SYMBOL_RATIO_THRESHOLD,
+    repair_inbound: bool = False,
 ) -> IncrementalPlan:
     """Plan the scoped incremental work from ``previous`` → ``current`` manifests.
 
@@ -266,28 +311,51 @@ def plan_incremental(
     affected_symbol_count = len(affected_ids)
 
     # --- depth-1 dependent closure (the design's core; §5.2, §5.4-5.5) ------
-    # Only identity-changed and deleted files project a "changed symbol" set;
-    # body-only edits contribute nothing, so they pull in no dependents.
+    # A changed file's symbols become re-resolution *targets* when its identity
+    # set moved (design economy) — or, under `repair_inbound`, whenever its
+    # content changed at all. `repair_inbound` is for the watcher, whose lossy
+    # per-file immediate tier (`apply_reindex` DETACH-DELETEs the whole changed
+    # file) destroys inbound edges even for a body-only edit; re-resolving the
+    # changed file's dependents is what restores them. The one-shot analyze path
+    # has no immediate tier — its surgical delta never DETACH-DELETEs a surviving
+    # symbol — so it keeps the body-only economy (`repair_inbound=False`).
+    target_files = set(diff.identity_changed_files) | set(diff.deleted_files)
+    if repair_inbound:
+        target_files |= set(diff.body_only_files)
     affected_targets: set[str] = set()
-    for path in diff.identity_changed_files:
-        affected_targets.update(previous.files[path].symbol_ids)
-    for path in diff.deleted_files:
+    for path in target_files:
         affected_targets.update(previous.files[path].symbol_ids)
 
+    # Added-file closure (design's added-file-closure fix): a brand-new file has
+    # no prior symbols to be an edge *target*, so the reverse-edge lookup above
+    # can never pull its importers in. Instead, match each unchanged file's
+    # recorded *unresolved* imports against the added files' importable identity
+    # — an import that failed to resolve only because its target did not exist
+    # yet now links up, so that importer must be re-resolved.
+    added_identities: set[str] = set()
+    for path in diff.added_files:
+        added_identities |= importable_identities(path)
+
     dependents: set[str] = set()
-    if affected_targets:
-        # Reverse resolver-edge lookup over the PREVIOUS manifest's out_edges:
-        # an unchanged file whose imports/calls/heritage/types edge targets one
-        # of the affected symbols must be re-resolved. Restricting to unchanged
-        # files keeps `dependents` the *pure* closure — changed/added files are
-        # already reparsed for their own edits, and deleted files are gone.
-        for path, fm in previous.files.items():
-            if path not in diff.unchanged_files:
-                continue
+    # Single pass over unchanged files, unioning both closure sources. Restricting
+    # to unchanged files keeps `dependents` the *pure* closure — changed/added
+    # files are already reparsed for their own edits, and deleted files are gone.
+    for path, fm in previous.files.items():
+        if path not in diff.unchanged_files:
+            continue
+        pulled = False
+        if affected_targets:
             for edge in fm.out_edges:
                 if edge.rel_type in RESOLVER_REL_TYPES and edge.tgt in affected_targets:
-                    dependents.add(path)
+                    pulled = True
                     break
+        if not pulled and added_identities and fm.unresolved_imports:
+            for module in fm.unresolved_imports:
+                if _module_forms(module) & added_identities:
+                    pulled = True
+                    break
+        if pulled:
+            dependents.add(path)
 
     files_to_reparse = set(diff.changed) | set(diff.added_files) | dependents
     files_unchanged_to_carry = set(diff.unchanged_files) - dependents
@@ -330,6 +398,73 @@ def plan_incremental(
 
 
 # ---------------------------------------------------------------------------
+# Consolidation gate (pure) — design §7, §9
+# ---------------------------------------------------------------------------
+
+
+def _consolidated_age_seconds(consolidated_at: str, now: float) -> float | None:
+    """Seconds between an ISO-8601 ``consolidated_at`` and ``now`` (unix time)."""
+    try:
+        dt = datetime.fromisoformat(consolidated_at)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return now - dt.timestamp()
+
+
+def should_consolidate(
+    previous: Manifest,
+    plan: IncrementalPlan,
+    *,
+    git_head_moved: bool = False,
+    now: float | None = None,
+    symbol_ratio: float = CONSOLIDATION_SYMBOL_RATIO,
+    apply_limit: int = CONSOLIDATION_APPLY_LIMIT,
+    max_seconds: float = CONSOLIDATION_MAX_SECONDS,
+) -> tuple[bool, str]:
+    """Should this incremental apply instead consolidate (run a full rebuild)?
+
+    Pure — the caller (W3.2e watcher / analyze) supplies ``git_head_moved`` (a
+    cheap ``git rev-parse HEAD`` compared to ``previous.index.git_head``) and
+    ``now`` (``time.time()``). Consolidation = the existing full rebuild, which
+    recomputes every deferred global phase and stamps a fresh manifest, so this
+    is the single place the design's §9 gates live:
+
+    * **git HEAD moved** ⇒ coupling is stale (D8).
+    * **cumulative affected-symbol ratio** (this burst included) crossed D5.
+    * **N applies** elapsed since the last consolidation.
+    * **staleness ceiling** — unconsolidated longer than ``max_seconds``.
+
+    Returns ``(should_consolidate, reason_code)`` — reason is ``""`` when a
+    scoped incremental apply is fine. Assumes ``plan`` is an incremental plan
+    (``full_rebuild_required is False``); a full-rebuild plan already consolidates
+    for its own reason, so callers check that first.
+    """
+    if git_head_moved:
+        return True, REASON_CONSOLIDATE_GIT_HEAD
+
+    pending = previous.index.pending
+    total = plan.total_symbol_count
+    # Fold in THIS burst so the gate fires *before* applying a delta that crosses
+    # the line, not one apply late.
+    projected_affected = pending.affected_symbols + plan.affected_symbol_count
+    if total > 0 and projected_affected / total > symbol_ratio:
+        return True, REASON_CONSOLIDATE_SYMBOL_RATIO
+
+    if pending.applies_since_consolidation + 1 >= apply_limit:
+        return True, REASON_CONSOLIDATE_APPLY_LIMIT
+
+    consolidated_at = previous.index.consolidated_at
+    if consolidated_at and now is not None:
+        age = _consolidated_age_seconds(consolidated_at, now)
+        if age is not None and age > max_seconds:
+            return True, REASON_CONSOLIDATE_STALENESS
+
+    return False, ""
+
+
+# ---------------------------------------------------------------------------
 # Current-manifest assembly from a walk + reparse (the walk-results consumer)
 # ---------------------------------------------------------------------------
 
@@ -340,6 +475,7 @@ def build_current_manifest(
     *,
     tool_version: str = "",
     git_head: str | None = None,
+    carry_from: Manifest | None = None,
 ) -> Manifest:
     """Assemble the ``current`` :class:`Manifest` from a walk + a partial reparse.
 
@@ -353,9 +489,19 @@ def build_current_manifest(
     Caller contract (honored by W3.2e): ``reparsed`` MUST cover every file whose
     content changed and every added file. A content-changed file missing from
     ``reparsed`` would carry empty ``symbol_sigs`` and its symbols would look
-    spuriously removed. Unchanged files are intentionally *not* in ``reparsed``;
-    they carry ``content_sha`` only, which is all the diff's content-hash
-    short-circuit reads for them.
+    spuriously removed.
+
+    ``carry_from`` controls what an unchanged (not-reparsed) file carries:
+
+    * ``None`` (the *planning* input): a bare ``content_sha``-only row — the diff
+      short-circuits on the matching hash and never reads its provenance.
+    * a previous :class:`Manifest` (the *persisted* new manifest, passed by
+      :func:`~synaptiq.core.ingestion.incremental_build.build_incremental_delta`):
+      the unchanged file inherits its FULL prior provenance (``symbol_ids`` /
+      ``symbol_sigs`` / ``out_edges`` / ``unresolved_imports``). This is what
+      keeps the stored manifest complete across incremental cycles — the storage
+      write is a full replace, so a bare row would erase the provenance the
+      *next* diff's dependent-closure and removal sets depend on.
 
     Pure — reuses :func:`~synaptiq.core.ingestion.manifest.build_manifest` for
     the reparsed graph's symbol/edge provenance and
@@ -374,9 +520,24 @@ def build_current_manifest(
             if not reparsed_fm.language:
                 reparsed_fm.language = entry.language
             files[entry.path] = reparsed_fm
+            continue
+
+        carried = carry_from.files.get(entry.path) if carry_from is not None else None
+        if carried is not None and carried.content_sha == sha:
+            # Unchanged file, persisted-manifest mode: carry full provenance so
+            # the stored manifest stays complete for the next cycle's diff.
+            files[entry.path] = FileManifest(
+                path=entry.path,
+                content_sha=sha,
+                language=carried.language or entry.language,
+                symbol_ids=list(carried.symbol_ids),
+                symbol_sigs=dict(carried.symbol_sigs),
+                out_edges=list(carried.out_edges),
+                unresolved_imports=list(carried.unresolved_imports),
+            )
         else:
-            # Unchanged file: content hash only — symbol_sigs are never read for
-            # it (the diff short-circuits on the matching content_sha).
+            # Planning-input mode (or a carry-miss): content hash only — the diff
+            # short-circuits on the matching content_sha and reads no provenance.
             files[entry.path] = FileManifest(
                 path=entry.path, content_sha=sha, language=entry.language
             )

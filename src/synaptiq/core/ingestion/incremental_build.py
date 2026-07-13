@@ -349,9 +349,13 @@ def build_incremental_delta(
         dead_recount=dead_recount,
     )
 
-    # --- 8. new manifest: re-parsed provenance + carried content hashes --------
+    # --- 8. new manifest: re-parsed provenance + carried-forward provenance ----
+    # carry_from=previous so every UNCHANGED file inherits its full prior
+    # provenance (symbol_ids / out_edges / unresolved_imports), not just a content
+    # hash. The storage write is a full replace, so the persisted manifest must be
+    # complete or the *next* cycle's dependent closure and removal sets break.
     new_manifest = build_current_manifest(
-        walk, clean_graph, tool_version=tool_version, git_head=git_head
+        walk, clean_graph, tool_version=tool_version, git_head=git_head, carry_from=previous
     )
 
     return delta, new_manifest

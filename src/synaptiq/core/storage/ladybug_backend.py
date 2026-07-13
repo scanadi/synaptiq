@@ -215,6 +215,7 @@ _FILE_MANIFEST_DDL = (
     f"CREATE NODE TABLE IF NOT EXISTS {_MANIFEST_FILE_TABLE}("
     "path STRING, content_sha STRING, language STRING, "
     "symbol_ids STRING, symbol_sigs STRING, out_edges STRING, "
+    "unresolved_imports STRING, "
     "PRIMARY KEY(path))"
 )
 _INDEX_MANIFEST_DDL = (
@@ -2329,7 +2330,7 @@ class LadybugBackend:
             f"MERGE (m:{_MANIFEST_FILE_TABLE} {{path: $path}}) "
             "SET m.content_sha = $content_sha, m.language = $language, "
             "m.symbol_ids = $symbol_ids, m.symbol_sigs = $symbol_sigs, "
-            "m.out_edges = $out_edges"
+            "m.out_edges = $out_edges, m.unresolved_imports = $unresolved_imports"
         )
         for row in rows:
             self._conn.execute(
@@ -2341,6 +2342,7 @@ class LadybugBackend:
                     "symbol_ids": row[3],
                     "symbol_sigs": row[4],
                     "out_edges": row[5],
+                    "unresolved_imports": row[6],
                 },
             )
 
@@ -2387,7 +2389,7 @@ class LadybugBackend:
                     conn.execute(
                         f"MATCH (m:{_MANIFEST_FILE_TABLE}) RETURN "
                         "m.path, m.content_sha, m.language, m.symbol_ids, "
-                        "m.symbol_sigs, m.out_edges"
+                        "m.symbol_sigs, m.out_edges, m.unresolved_imports"
                     )
                 )
         except Exception:
