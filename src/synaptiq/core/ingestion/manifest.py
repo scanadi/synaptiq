@@ -29,12 +29,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
 from synaptiq.core.graph.graph import KnowledgeGraph
 from synaptiq.core.graph.model import GraphNode, NodeLabel, RelType
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Versioning
@@ -494,9 +497,25 @@ def _parse_file_manifest_row(row: list[Any]) -> FileManifest | None:
         path = row[0]
         content = row[1] or ""
         language = row[2] or ""
-        symbol_ids = json.loads(row[3]) if row[3] else []
-        symbol_sigs = json.loads(row[4]) if row[4] else {}
-        raw_edges = json.loads(row[5]) if row[5] else []
+        # ``symbol_ids`` / ``symbol_sigs`` / ``out_edges`` are ALWAYS serialized
+        # as non-empty JSON (``"[]"`` / ``"{}"``; see serialize_file_manifest), so
+        # a NULL/empty value in any of them is not "no symbols" — it means the
+        # storage layer silently DROPPED the field (the ladybug bug where large
+        # string columns are corrupted when written into a node table that
+        # previously had rows DETACH DELETEd, which 2.0.3 fixes at the source).
+        # Treating that as empty provenance is the worst outcome: invisible
+        # incremental blindness. So fail LOUD — a dropped field poisons the row
+        # (caller -> None -> full rebuild), never silent partial provenance.
+        if not row[3] or not row[4] or not row[5]:
+            logger.warning(
+                "manifest row for %r has empty symbol provenance (dropped by "
+                "storage); treating the whole manifest as corrupt -> full rebuild",
+                path,
+            )
+            return None
+        symbol_ids = json.loads(row[3])
+        symbol_sigs = json.loads(row[4])
+        raw_edges = json.loads(row[5])
         # ``unresolved_imports`` was added after the first manifest schema; a row
         # written before it (or a NULL from CSV COPY) has fewer than 7 cols —
         # tolerate that with an empty list rather than treating it as corrupt.
@@ -600,6 +619,12 @@ def load_manifest_from_rows(
     for row in file_rows:
         fm = _parse_file_manifest_row(row)
         if fm is None:
+            path = row[0] if row else "<unknown>"
+            logger.warning(
+                "corrupt manifest file row (%r); manifest is untrustworthy -> "
+                "forcing a full rebuild",
+                path,
+            )
             return None
         files[fm.path] = fm
     return Manifest(index=index, files=files)

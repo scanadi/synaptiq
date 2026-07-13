@@ -48,6 +48,7 @@ except ImportError:  # pragma: no cover - exercised in CSV-only environments
 from synaptiq.core.graph.graph import KnowledgeGraph
 from synaptiq.core.graph.model import GraphNode, GraphRelationship, NodeLabel
 from synaptiq.core.ingestion.manifest import (
+    FILE_MANIFEST_COLUMNS,
     Manifest,
     build_manifest,
     load_manifest_from_rows,
@@ -2290,21 +2291,87 @@ class LadybugBackend:
         except Exception:
             logger.debug("manifest table creation skipped", exc_info=True)
 
+    def _reset_manifest_file_table(self) -> None:
+        """DROP + re-CREATE the FileManifest table for FRESH string storage.
+
+        The crux of the 2.0.3 manifest-persistence fix. LadybugDB silently drops
+        the values of large STRING columns when rows are written into a node
+        table that previously had rows removed via ``DETACH DELETE`` — verified on
+        a real 3,563-file repo where the SECOND manifest write lost 533 rows /
+        5,397 symbol ids, size-correlated (the files with the most symbols first),
+        *identically* through CSV COPY, in-memory Arrow COPY, and parameterized
+        MERGE. The corruption lives in the table's reused string storage, not in
+        any one writer; only never-deleted-from storage round-trips losslessly.
+        ``bulk_load`` stamps the first manifest into a pristine ``.rebuild`` table
+        (always fine); the losses were in the SECOND write onward — the
+        ``stamp_full_manifest`` after coupling and every incremental
+        consolidation reused the populated live table. Dropping and recreating
+        gives every write a pristine table, which round-trips losslessly.
+        """
+        assert self._conn is not None
+        try:
+            self._conn.execute(f"DROP TABLE IF EXISTS {_MANIFEST_FILE_TABLE}")
+        except Exception:
+            logger.debug("manifest file-table drop skipped", exc_info=True)
+        self._conn.execute(_FILE_MANIFEST_DDL)
+
+    def _reset_manifest_index_table(self) -> None:
+        """DROP + re-CREATE the IndexManifest table (drops the prior singleton)."""
+        assert self._conn is not None
+        try:
+            self._conn.execute(f"DROP TABLE IF EXISTS {_MANIFEST_INDEX_TABLE}")
+        except Exception:
+            logger.debug("manifest index-table drop skipped", exc_info=True)
+        self._conn.execute(_INDEX_MANIFEST_DDL)
+
+    def _refresh_write_conn(self) -> None:
+        """Recreate the write connection to drop LadybugDB's stale caches after DDL.
+
+        LadybugDB caches prepared statements (keyed by query string) and table
+        catalog entries per connection, and does NOT invalidate them when a table
+        is ``DROP``ped and re-``CREATE``d underneath. Re-running a parameterized
+        statement (the index-singleton ``CREATE``, the ``CREATE`` row fallback) or
+        a ``MATCH``-based query against a just-reset table on the SAME connection
+        then crashes with ``unordered_map::at: key not found`` /
+        ``Cannot find table catalog entry``. Manifest writes reuse one write
+        connection across incremental consolidations and the daemon's lifetime, so
+        after resetting the manifest tables we swap in a fresh connection whose
+        caches are empty — the light, targeted analogue of what the ``bulk_load``
+        swap gets for free by calling :meth:`initialize`. The DB handle is
+        untouched (cheap); pending manifest DDL already auto-committed, so nothing
+        is lost. ``self._prepared`` (this backend's own per-connection cache) is
+        cleared for the same reason it is in :meth:`initialize`.
+        """
+        assert self._db is not None
+        old = self._conn
+        self._conn = ladybug.Connection(self._db)
+        self._prepared = {}
+        if old is not None:
+            try:
+                old.close()
+            except Exception:
+                logger.debug("closing prior write connection failed", exc_info=True)
+
     def write_manifest(self, manifest: Manifest) -> None:
         """Persist *manifest* into the current DB, replacing any prior manifest.
 
-        Full replace: clears both manifest tables, bulk-writes the per-file rows,
-        then writes the index singleton **last** as a completion marker (a
-        partial/crashed write leaves no singleton, so :meth:`read_manifest`
-        reports "no manifest" and the caller does a full rebuild). Not wrapped in
-        an explicit transaction — it mirrors the COPY-based bulk path and is
-        crash-safe by riding :meth:`bulk_load`'s ``.rebuild`` swap. Uses the
+        Full replace via DROP + re-CREATE of both manifest tables (see
+        :meth:`_reset_manifest_file_table` for why fresh storage is mandatory),
+        then bulk-writes the per-file rows, then writes the index singleton
+        **last** as a completion marker: resetting the index table removes the
+        prior singleton, so throughout the rewrite there is no completion marker —
+        a partial/crashed write leaves none, :meth:`read_manifest` reports "no
+        manifest", and the caller does a full rebuild. Not wrapped in an explicit
+        transaction (DDL auto-commits) — crash-safety rides the singleton-last
+        marker and, for the ``bulk_load`` write, the ``.rebuild`` swap. Uses the
         write connection, so callers serialize via the external lock.
         """
         assert self._conn is not None
-        self._create_manifest_tables()
-        self._conn.execute(f"MATCH (m:{_MANIFEST_FILE_TABLE}) DETACH DELETE m")
-        self._conn.execute(f"MATCH (im:{_MANIFEST_INDEX_TABLE}) DETACH DELETE im")
+        self._reset_manifest_file_table()
+        self._reset_manifest_index_table()
+        # Drop LadybugDB's per-connection caches staled by the resets above,
+        # before any cached/parameterized DML runs on this connection.
+        self._refresh_write_conn()
         rows = [serialize_file_manifest(fm) for fm in manifest.files.values()]
         if rows:
             self._write_manifest_file_rows(rows)
@@ -2315,22 +2382,60 @@ class LadybugBackend:
         )
 
     def _write_manifest_file_rows(self, rows: list[list[Any]]) -> None:
-        """Insert FileManifest rows via CSV COPY, falling back to row MERGE.
+        """Bulk-write FileManifest rows into the freshly-reset (empty) table.
 
-        Mirrors the node bulk path: COPY is fast at repo scale, and the MERGE
-        fallback keeps the write working in COPY-unavailable environments.
+        The table is pristine (``write_manifest`` reset it), so this only ever
+        INSERTs. Prefers the in-memory Arrow COPY (pyarrow is a core dep; native
+        arbitrary-size strings, no temp file), falls back to CSV COPY, then to
+        row-by-row ``CREATE`` for COPY-unavailable environments. ``CREATE`` — not
+        ``MERGE`` — because LadybugDB raises a stale-catalog error on a
+        MATCH-based ``MERGE`` executed against a just-DROP+CREATEd table, and a
+        fresh empty table never needs upsert semantics. Each fallback first
+        re-resets the file table so a COPY that failed after partial progress
+        cannot leave duplicate/torn rows behind.
         """
         assert self._conn is not None
+        if _HAS_PYARROW:
+            try:
+                self._write_manifest_file_rows_arrow(rows)
+                return
+            except Exception:
+                logger.debug("manifest Arrow COPY failed; trying CSV COPY", exc_info=True)
+                self._reset_manifest_file_table()
+                self._refresh_write_conn()
         try:
             self._csv_copy(_MANIFEST_FILE_TABLE, rows)
             return
         except Exception:
-            logger.debug("manifest CSV COPY failed; falling back to row inserts", exc_info=True)
+            logger.debug("manifest CSV COPY failed; falling back to row CREATE", exc_info=True)
+            self._reset_manifest_file_table()
+            self._refresh_write_conn()
+        self._write_manifest_file_rows_create(rows)
+
+    def _write_manifest_file_rows_arrow(self, rows: list[list[Any]]) -> None:
+        """COPY FileManifest rows from an in-memory pyarrow table (native strings).
+
+        Columns are built in :data:`FILE_MANIFEST_COLUMNS` order — contractual
+        with the DDL and the read query. Values are stored verbatim (no
+        empty→NULL coercion): the JSON columns are never empty, and preserving
+        them exactly keeps the reader's loud empty-provenance gate meaningful.
+        """
+        assert self._conn is not None
+        arrow_tbl = pa.table(
+            {
+                name: pa.array([row[i] for row in rows], type=pa.string())
+                for i, name in enumerate(FILE_MANIFEST_COLUMNS)
+            }
+        )
+        self._arrow_copy(_MANIFEST_FILE_TABLE, arrow_tbl)
+
+    def _write_manifest_file_rows_create(self, rows: list[list[Any]]) -> None:
+        """Row-by-row ``CREATE`` fallback for COPY-unavailable environments."""
+        assert self._conn is not None
         stmt = (
-            f"MERGE (m:{_MANIFEST_FILE_TABLE} {{path: $path}}) "
-            "SET m.content_sha = $content_sha, m.language = $language, "
-            "m.symbol_ids = $symbol_ids, m.symbol_sigs = $symbol_sigs, "
-            "m.out_edges = $out_edges, m.unresolved_imports = $unresolved_imports"
+            f"CREATE (m:{_MANIFEST_FILE_TABLE} {{path: $path, content_sha: $content_sha, "
+            "language: $language, symbol_ids: $symbol_ids, symbol_sigs: $symbol_sigs, "
+            "out_edges: $out_edges, unresolved_imports: $unresolved_imports}})"
         )
         for row in rows:
             self._conn.execute(
