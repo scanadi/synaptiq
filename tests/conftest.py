@@ -7,6 +7,22 @@ import pytest
 from synaptiq.core import resources
 
 
+def pytest_collection_modifyitems(config, items):
+    """Exclude the ``equivalence_soak`` (100-script) suite unless it is selected.
+
+    The soak is a heavy opt-in (design §11 / W3.2f): it runs only when the marker
+    is named explicitly (``-m equivalence_soak``); otherwise it is skipped so the
+    default suite — including ``uv run pytest tests/core/`` — stays fast.
+    """
+    markexpr = config.getoption("-m", default="")
+    if "equivalence_soak" in markexpr:
+        return
+    skip = pytest.mark.skip(reason="soak excluded by default; select with -m equivalence_soak")
+    for item in items:
+        if "equivalence_soak" in item.keywords:
+            item.add_marker(skip)
+
+
 @pytest.fixture(autouse=True)
 def _reset_resource_profile():
     """Make tests hermetic against the process-global resource profile.

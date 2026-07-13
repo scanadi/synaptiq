@@ -23,12 +23,10 @@ link):
 
 from __future__ import annotations
 
-import json
-
 import pytest
 
 from synaptiq.core.graph.graph import KnowledgeGraph
-from synaptiq.core.graph.model import GraphNode, NodeLabel, RelType, generate_id
+from synaptiq.core.graph.model import NodeLabel, RelType, generate_id
 from synaptiq.core.ingestion.incremental import build_current_manifest, plan_incremental
 from synaptiq.core.ingestion.incremental_build import (
     _reconstruct_stub,
@@ -40,6 +38,12 @@ from synaptiq.core.ingestion.pipeline import run_pipeline
 from synaptiq.core.ingestion.structure import process_structure
 from synaptiq.core.ingestion.walker import FileEntry, walk_repo
 from synaptiq.core.storage.ladybug_backend import LadybugBackend
+from tests.core.incremental_equivalence_utils import (
+    assert_strict_equivalence as _assert_strict_equivalence,
+)
+from tests.core.incremental_equivalence_utils import (
+    edge_set as _edge_set,
+)
 
 # ---------------------------------------------------------------------------
 # Multi-language fixture (Python + TypeScript + Go), rich in cross-file edges
@@ -263,85 +267,11 @@ def _edited_repo(tmp_path, files: dict[str, str]):
 
 
 # --- comparison utilities ---------------------------------------------------
-
-# Genuinely-global / deferred artifacts — the D9 bounded-stale fringe. Excluded
-# from the strict equivalence assertions (they converge only at consolidation).
-_FRINGE_NODE_LABELS = frozenset({NodeLabel.COMMUNITY, NodeLabel.PROCESS})
-_STRICT_EDGE_TYPES = (
-    RelType.CONTAINS,
-    RelType.DEFINES,
-    RelType.IMPORTS,
-    RelType.EXTENDS,
-    RelType.IMPLEMENTS,
-    RelType.MIXES_IN,
-    RelType.USES_TYPE,
-)
-
-
-def _strict_node_props(node: GraphNode):
-    """Parse/heritage-derived, delta-strict node fields.
-
-    Excludes ``is_dead`` (recount is local-in-degree only; the global
-    false-positive passes are deferred) and ``is_entry_point`` (processes phase
-    deferred) — both D9 fringe.
-    """
-    return (
-        node.label,
-        node.name,
-        node.file_path,
-        node.class_name,
-        node.signature,
-        node.start_line,
-        node.end_line,
-        node.content,
-        node.language,
-        node.is_exported,
-        json.dumps(node.properties, sort_keys=True),
-    )
-
-
-def _edge_set(graph: KnowledgeGraph, rel_type: RelType, min_conf: float | None = None):
-    out: set[tuple[str, str]] = set()
-    for rel in graph.iter_relationships():
-        if rel.type is not rel_type:
-            continue
-        if min_conf is not None:
-            conf = rel.properties.get("confidence", 1.0)
-            if conf is None or conf < min_conf:
-                continue
-        out.add((rel.source, rel.target))
-    return out
-
-
-def _assert_strict_equivalence(incremental: KnowledgeGraph, full: KnowledgeGraph) -> None:
-    """Assert the delta-applied graph == a full rebuild on the strict core."""
-    inc_nodes = {n.id: n for n in incremental.iter_nodes() if n.label not in _FRINGE_NODE_LABELS}
-    full_nodes = {n.id: n for n in full.iter_nodes() if n.label not in _FRINGE_NODE_LABELS}
-
-    assert set(inc_nodes) == set(full_nodes), (
-        f"node id set diverged; "
-        f"only-incremental={set(inc_nodes) - set(full_nodes)}, "
-        f"only-full={set(full_nodes) - set(inc_nodes)}"
-    )
-    for nid, full_node in full_nodes.items():
-        assert _strict_node_props(inc_nodes[nid]) == _strict_node_props(full_node), (
-            f"node properties diverged for {nid}"
-        )
-
-    for rel_type in _STRICT_EDGE_TYPES:
-        inc_edges = _edge_set(incremental, rel_type)
-        full_edges = _edge_set(full, rel_type)
-        assert inc_edges == full_edges, (
-            f"{rel_type.value} edges diverged; "
-            f"only-incremental={inc_edges - full_edges}, only-full={full_edges - inc_edges}"
-        )
-
-    inc_calls = _edge_set(incremental, RelType.CALLS, min_conf=0.8)
-    full_calls = _edge_set(full, RelType.CALLS, min_conf=0.8)
-    assert inc_calls == full_calls, (
-        f"CALLS>=0.8 diverged; "
-        f"only-incremental={inc_calls - full_calls}, only-full={full_calls - inc_calls}"
-    )
+#
+# The strict-core comparator (``_assert_strict_equivalence`` / ``_edge_set``) is
+# the single shared one in ``tests.core.incremental_equivalence_utils``, imported
+# at module top — the W3.2f equivalence harness reuses the exact same D9 exact-match
+# set, so there is one source of truth rather than drifting copies.
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +439,28 @@ def test_file_deletion_removes_symbols_and_owned_edges(base_index, tmp_path):
     assert (HANDLE_FN, generate_id(NodeLabel.CLASS, "py/service.py", "Service")) in remove_pairs
 
 
+def test_deleting_last_file_in_dir_removes_emptied_folder(base_index, tmp_path):
+    """Deleting the sole file in a directory removes its now-empty Folder node.
+
+    ``process_structure`` emits a Folder node only for a dir that still holds a
+    file, so a full rebuild has no ``folder:go/models`` once its only file is
+    gone. The delta must drop that orphan (its CONTAINS edges cascade on the by-id
+    DETACH DELETE) or Folder/CONTAINS drift off the strict core — folders are not
+    manifest-tracked, so the cleanup is derived from the walk in
+    ``build_incremental_delta``. Regression for the emptied-directory cleanup.
+    """
+    _, _, previous = base_index
+    # go/models holds only user.go; go/ keeps main.go, so only go/models empties.
+    edited = _edited_repo(tmp_path, _apply_edit(BASE_FILES, delete=["go/models/user.go"]))
+
+    _, plan, delta, _ = _plan_and_delta(edited, previous)
+
+    assert not plan.full_rebuild_required
+    removed = set(delta.nodes_remove)
+    assert generate_id(NodeLabel.FOLDER, "go/models") in removed  # emptied → removed
+    assert generate_id(NodeLabel.FOLDER, "go") not in removed  # still holds go/main.go
+
+
 def test_file_addition_resolves_outbound_against_global_index(base_index, tmp_path):
     _, _, previous = base_index
     # New leaf module that imports+calls an EXISTING (unchanged) symbol.
@@ -570,6 +522,9 @@ def _edited_files(scenario: str) -> dict[str, str]:
         )
     if scenario == "delete":
         return _apply_edit(BASE_FILES, delete=["py/handler.py"])
+    if scenario == "delete_empties_dir":
+        # go/models holds only user.go → deleting it empties that directory.
+        return _apply_edit(BASE_FILES, delete=["go/models/user.go"])
     if scenario == "add_same_folder":
         extra = "from py.models import make_user\n\n\ndef spawn():\n    return make_user('z')\n"
         return _apply_edit(BASE_FILES, set_={"py/extra.py": extra})
@@ -581,7 +536,15 @@ def _edited_files(scenario: str) -> dict[str, str]:
 
 @pytest.mark.parametrize(
     "scenario",
-    ["body_only", "add_symbol", "rename", "delete", "add_same_folder", "add_new_folder"],
+    [
+        "body_only",
+        "add_symbol",
+        "rename",
+        "delete",
+        "delete_empties_dir",
+        "add_same_folder",
+        "add_new_folder",
+    ],
 )
 def test_delta_equivalent_to_full_rebuild(base_index, tmp_path, scenario):
     _, base_graph, previous = base_index
