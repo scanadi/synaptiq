@@ -580,3 +580,40 @@ class TestPidAlive:
         assert lazy_worker.pid_alive(-5) is False
 
 
+# ---------------------------------------------------------------------------
+# stamp_inline_complete (2.0.4, BUG 2)
+# ---------------------------------------------------------------------------
+
+
+class TestStampInlineComplete:
+    def test_writes_complete_state(self, tmp_path: Path) -> None:
+        lazy_worker.stamp_inline_complete(tmp_path, 42)
+        state = lazy_worker.read_state(tmp_path)
+        assert state is not None
+        assert state["state"] == "complete"
+        assert state["done"] == 42
+        assert state["total"] == 42
+
+    def test_overwrites_a_stale_deferred_sentinel(self, tmp_path: Path) -> None:
+        """The empirical bug: a dead lazy worker's `deferred` sentinel must
+        not survive a later inline embed-store, byte-identical."""
+        lazy_worker.write_state(
+            tmp_path, "deferred", total=999, detail="index locked; re-run `synaptiq analyze`"
+        )
+        lazy_worker.stamp_inline_complete(tmp_path, 7)
+        state = lazy_worker.read_state(tmp_path)
+        assert state["state"] == "complete"
+        assert state["total"] == 7
+        assert state["done"] == 7
+
+    def test_zero_count_is_honest_not_omitted(self, tmp_path: Path) -> None:
+        """An inline embed of a repo with zero embeddable nodes still stamps
+        a real `complete` state (matching the lazy worker's own zero-node
+        handling) rather than silently leaving a stale sentinel in place."""
+        lazy_worker.write_state(tmp_path, "failed", error="boom")
+        lazy_worker.stamp_inline_complete(tmp_path, 0)
+        state = lazy_worker.read_state(tmp_path)
+        assert state["state"] == "complete"
+        assert state["total"] == 0
+
+

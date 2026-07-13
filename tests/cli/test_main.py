@@ -691,6 +691,75 @@ class TestAnalyzeLazyReuse:
             after.close()
         assert len(stored_after) == total_before - 1
 
+    # -----------------------------------------------------------------
+    # 2.0.4 (BUG 2): inline embed-store paths stamp embeddings_state.json
+    # themselves — only the lazy worker used to, so a stale sentinel from an
+    # earlier lazy run could survive a later successful inline embed.
+    # -----------------------------------------------------------------
+
+    def test_sync_analyze_clears_stale_deferred_sentinel(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Empirical repro (field-verified): a prior lazy worker run left
+        `deferred` on disk with a dead pid; a later `analyze --embeddings
+        sync` must overwrite it with an honest `complete`, not leave the
+        stale sentinel byte-identical."""
+        repo = tmp_path / "repo"
+        self._repo_with_two_files(repo)
+        self._seed_with_sync_analyze(repo, monkeypatch)
+
+        state_path = repo / ".synaptiq" / "embeddings_state.json"
+        state_path.write_text(
+            json.dumps(
+                {
+                    "state": "deferred",
+                    "detail": "index locked; re-run `synaptiq analyze` to encode",
+                    "total": 999,
+                    "pid": 99999999,
+                    "updated_at": "2020-01-01T00:00:00+00:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        monkeypatch.chdir(repo)
+        result = runner.invoke(app, ["analyze", "--embeddings", "sync"])
+        assert result.exit_code == 0, result.output
+
+        state = json.loads(state_path.read_text())
+        assert state["state"] == "complete"
+        assert state["total"] == state["done"] > 0
+
+    def test_unchanged_repo_lazy_reuse_stamps_state_complete(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """BUG 2: the lazy path's 'everything reused, no worker spawned'
+        branch must stamp its own `complete` sentinel — nothing else will,
+        since no worker ever runs on this path."""
+        repo = tmp_path / "repo"
+        self._repo_with_two_files(repo)
+        self._seed_with_sync_analyze(repo, monkeypatch)
+
+        # Simulate a stale sentinel left by an unrelated earlier lazy attempt.
+        state_path = repo / ".synaptiq" / "embeddings_state.json"
+        state_path.write_text(
+            json.dumps({"state": "deferred", "detail": "x", "total": 999}), encoding="utf-8"
+        )
+
+        monkeypatch.chdir(repo)
+        spawned = {"n": 0}
+        monkeypatch.setattr(
+            "synaptiq.core.embeddings.lazy_worker.spawn_lazy_worker",
+            lambda rp: spawned.__setitem__("n", spawned["n"] + 1),
+        )
+
+        result = runner.invoke(app, ["analyze"])  # lazy default, repo unchanged -> all reused
+        assert result.exit_code == 0, result.output
+        assert spawned["n"] == 0  # nothing pending, so still no worker spawn
+
+        state = json.loads(state_path.read_text())
+        assert state["state"] == "complete"
+
 
 class TestStatus:
     """Tests for the status command."""

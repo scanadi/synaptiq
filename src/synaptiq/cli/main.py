@@ -137,7 +137,7 @@ def _run_analyze_incremental(
 
     from synaptiq import __version__
     from synaptiq.core.embeddings.embedder import embeddable_node_count
-    from synaptiq.core.embeddings.lazy_worker import spawn_lazy_worker
+    from synaptiq.core.embeddings.lazy_worker import spawn_lazy_worker, stamp_inline_complete
     from synaptiq.core.ingestion.coupling import current_git_head
     from synaptiq.core.ingestion.pipeline import (
         IncrementalOutcome,
@@ -199,6 +199,10 @@ def _run_analyze_incremental(
                 storage.store_embeddings(embeddings)
             result.embeddings = len(embeddings)
             result.embedding_model = tier_name
+            # 2.0.4 (BUG 2): an inline sync embed-store must not leave a stale
+            # deferred/failed/encoding sentinel from an earlier lazy worker run
+            # in place — it now lies about vectors that are, in fact, current.
+            stamp_inline_complete(data_dir, result.embeddings)
         except Exception:
             _stderr_console.print(
                 "[yellow]Warning:[/yellow] embedding generation failed; "
@@ -259,7 +263,10 @@ def _run_analyze_incremental(
                 )
         elif result.embeddings > 0:
             # Nothing changed that needs re-encoding — every stored vector is
-            # still valid (apply_graph_delta never wiped the table).
+            # still valid (apply_graph_delta never wiped the table). No worker
+            # will ever run for this analyze, so this IS the terminal state —
+            # stamp it now (2.0.4, BUG 2) rather than leaving a stale sentinel.
+            stamp_inline_complete(data_dir, result.embeddings)
             console.print()
             console.print(
                 f"[cyan]All {result.embeddings:,} vectors reused[/cyan] — nothing to encode."
@@ -487,7 +494,7 @@ def analyze(
         ensure_tier_available,
         partition_embeddings,
     )
-    from synaptiq.core.embeddings.lazy_worker import spawn_lazy_worker
+    from synaptiq.core.embeddings.lazy_worker import spawn_lazy_worker, stamp_inline_complete
     from synaptiq.core.ingestion.pipeline import (
         PipelineResult,
         load_previous_embeddings,
@@ -720,6 +727,10 @@ def analyze(
             elif reused_embeddings:
                 # Every embeddable node's text_sha matched the previous index —
                 # nothing to encode, so there is no delta to spawn a worker for.
+                # No worker will ever run for this analyze, so this IS the
+                # terminal state — stamp it now (2.0.4, BUG 2) rather than
+                # leaving a stale deferred/failed sentinel from an earlier run.
+                stamp_inline_complete(data_dir, len(reused_embeddings))
                 console.print()
                 console.print(
                     f"[cyan]All {len(reused_embeddings):,} vectors reused[/cyan] — "
@@ -1497,6 +1508,13 @@ class _PrimaryRuntime:
 
                 await asyncio.shield(_locked_commit())
                 _write_meta(data_dir, repo_path, result, mode="full", reason=reason)
+                if not skip_embeddings:
+                    # 2.0.4 (BUG 2): this daemon reindex just did a synchronous
+                    # embed-store (commit_full_index above) — a stale sentinel
+                    # from an earlier lazy worker run must not survive it.
+                    from synaptiq.core.embeddings.lazy_worker import stamp_inline_complete
+
+                    stamp_inline_complete(data_dir, result.embeddings)
                 return _reindex_stats_json(result, _time.monotonic() - start)
 
             return await rebuild_coordinator.run(_build_and_commit)

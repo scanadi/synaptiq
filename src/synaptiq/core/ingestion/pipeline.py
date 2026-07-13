@@ -289,11 +289,18 @@ def run_pipeline(
         if not skip_embeddings:
             with timed_phase("Generating embeddings"):
                 from synaptiq.core.embeddings.embedder import embed_graph
+                from synaptiq.core.embeddings.lazy_worker import stamp_inline_complete
 
                 embeddings = embed_graph(graph, tier=embedding_tier, previous=previous_embeddings)
                 if embeddings:
                     storage.store_embeddings(embeddings)
                 result.embeddings = len(embeddings)
+                # 2.0.4 (BUG 2): this is an inline (non-lazy-worker) embed-store —
+                # a stale deferred/failed/encoding sentinel from an earlier lazy
+                # worker run must not outlive the vectors it was waiting for.
+                data_dir = getattr(storage, "data_dir", None)
+                if data_dir is not None:
+                    stamp_inline_complete(data_dir, result.embeddings)
 
     result.symbols = sum(1 for n in graph.iter_nodes() if n.label in _SYMBOL_LABELS)
     result.relationships = graph.relationship_count
