@@ -1,6 +1,6 @@
 [project]
 name = "synaptiq"
-version = "1.5.1"
+version = "2.0.0"
 description = "Graph-powered code intelligence engine — indexes codebases into a knowledge graph, exposed via MCP tools for AI agents and a CLI for developers."
 readme = "README.md"
 license = "MIT"
