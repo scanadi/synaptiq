@@ -13,9 +13,15 @@ jobs:
       - uses: astral-sh/setup-uv@v8.2.0
         with:
           python-version: "3.11"
-      - run: uv sync --extra dev
-      - run: uv run pytest -x -q
-        timeout-minutes: 10
+      # --all-extras matches the environment every local gate runs in
+      # (fast-embeddings/model2vec incl.); the soak marker is a local-only
+      # deep-verification suite (100 randomized equivalence scripts) far too
+      # slow for a release gate — the default 10-script property test still
+      # runs. Runner is ~2 cores and downloads embedding models on first
+      # use, so the timeout is sized for that, not for dev-machine speed.
+      - run: uv sync --all-extras
+      - run: uv run pytest -x -q -m "not equivalence_soak"
+        timeout-minutes: 60
 
   publish:
     needs: test

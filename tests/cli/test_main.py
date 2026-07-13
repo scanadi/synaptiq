@@ -393,6 +393,10 @@ class TestAnalyzeEmbeddingModelFlag:
     def test_fast_tier_persisted_and_stores_256dim_vectors(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # The encode itself uses _FakeStaticModel, but analyze's eager
+        # ensure_tier_available() does a real find_spec("model2vec") that a
+        # monkeypatch can't satisfy — skip in environments without the extra.
+        pytest.importorskip("model2vec")
         repo = tmp_path / "repo"
         self._tiny_repo(repo)
         monkeypatch.chdir(repo)
