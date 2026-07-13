@@ -175,11 +175,23 @@ class TestEncodeAndStore:
             storage.close()
 
     def test_encoding_progress_is_published(self, indexed_repo, monkeypatch) -> None:
-        """The progress callback surfaces intermediate ``encoding`` states."""
+        """The progress callback surfaces intermediate ``encoding`` states, and
+        ``total`` is the PENDING count (3 here), not the full embeddable count —
+        embed_graph reports done against the full count and the worker re-bases
+        it onto the pending delta (see W4.1 progress-honesty fix)."""
         repo, data_dir, _ = indexed_repo
         seen: list[dict] = []
 
+        # Force a known split: 0 reused, 3 pending — regardless of the real graph.
+        monkeypatch.setattr(
+            "synaptiq.core.embeddings.embedder.partition_embeddings",
+            lambda graph, previous=None, tier="quality": ([], 3),
+        )
+
         def fake_embed(graph, tier=None, previous=None, progress_callback=None):
+            # embed_graph's first callback carries the reused count (0), then one
+            # per batch: done = reused + encoded against the FULL count (3 here).
+            progress_callback(0, 3)
             progress_callback(1, 3)
             seen.append(lazy_worker.read_state(data_dir))
             progress_callback(3, 3)
@@ -192,6 +204,45 @@ class TestEncodeAndStore:
         assert seen[0]["done"] == 1
         assert seen[0]["total"] == 3
         assert lazy_worker.read_state(data_dir)["state"] == "complete"
+        assert lazy_worker.read_state(data_dir)["total"] == 3
+
+    def test_total_is_pending_not_full_embeddable(self, indexed_repo, monkeypatch) -> None:
+        """The bug: with mostly-reused vectors, ``total`` must be the small pending
+        delta (honest ``synaptiq status``), while meta reflects ALL stored vectors."""
+        repo, data_dir, _ = indexed_repo
+
+        reused = [
+            NodeEmbedding(
+                node_id=f"function:src/x.py:f{i}", embedding=[0.1] * 384, text_sha=f"s{i}"
+            )
+            for i in range(25)
+        ]
+        # 25 reused, 2 pending — the honest progress denominator is 2, not 27.
+        monkeypatch.setattr(
+            "synaptiq.core.embeddings.embedder.partition_embeddings",
+            lambda graph, previous=None, tier="quality": (list(reused), 2),
+        )
+
+        def fake_embed(graph, tier=None, previous=None, progress_callback=None):
+            progress_callback(25, 27)  # reused marker (done=reused, total=full)
+            progress_callback(27, 27)  # both pending encoded
+            new = [
+                NodeEmbedding(
+                    node_id=f"function:src/y.py:g{i}", embedding=[0.2] * 384, text_sha=f"n{i}"
+                )
+                for i in range(2)
+            ]
+            return list(reused) + new
+
+        monkeypatch.setattr("synaptiq.core.embeddings.embedder.embed_graph", fake_embed)
+        lazy_worker.run_lazy_embedding_worker(repo)
+
+        state = lazy_worker.read_state(data_dir)
+        assert state["state"] == "complete"
+        assert state["total"] == 2, "progress total must be the pending delta, not full count"
+        assert state["done"] == 2
+        # meta reflects every stored vector (reused + newly encoded), not just pending.
+        assert _read_meta(data_dir)["stats"]["embeddings"] == 27
 
     def test_complete_zero_when_nothing_embeddable(self, indexed_repo, monkeypatch) -> None:
         from synaptiq.core.graph.graph import KnowledgeGraph

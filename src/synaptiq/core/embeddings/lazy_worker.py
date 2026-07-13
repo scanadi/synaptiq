@@ -342,6 +342,7 @@ def _encode_and_store(data_dir: Path, db_path: Path, started_at: str) -> None:
     from synaptiq.core.embeddings.embedder import (
         embed_graph,
         embeddable_node_count,
+        partition_embeddings,
         tier_from_meta,
     )
 
@@ -369,16 +370,53 @@ def _encode_and_store(data_dir: Path, db_path: Path, started_at: str) -> None:
             return
         graph, previous = loaded
 
-        total = embeddable_node_count(graph)
-        if total == 0:
+        if embeddable_node_count(graph) == 0:
             _update_meta_embeddings(data_dir, 0, expect_anchor=anchor)
             write_state(data_dir, "complete", done=0, total=0, started_at=started_at)
             return
 
-        write_state(data_dir, "encoding", done=0, total=total, started_at=started_at)
+        # Only the PENDING delta is actually encoded — embed_graph reuses every
+        # unchanged vector and runs the model on just the new/changed symbols. So
+        # report progress against the pending count, not the full embeddable-node
+        # count: a one-file change must read "encoding 3/12", never
+        # "encoding 0/26,909". partition_embeddings runs the same split
+        # embed_graph does but never loads the model (generate-text cost), so this
+        # is cheap next to the encode it precedes.
+        reused_vecs, pending = partition_embeddings(graph, previous, tier=tier.name)
+        reused = len(reused_vecs)
+        if pending == 0:
+            # Nothing new to encode (everything reused). Still store the reused
+            # set so meta reflects the true vector count, but there is no work to
+            # show progress for.
+            embeddings = reused_vecs
+            if _read_meta_timestamp(data_dir) != anchor:
+                continue
+            if _store_with_retry(db_path, embeddings):
+                _update_meta_embeddings(data_dir, len(embeddings), expect_anchor=anchor)
+                write_state(data_dir, "complete", done=0, total=0, started_at=started_at)
+            else:
+                write_state(
+                    data_dir,
+                    "deferred",
+                    done=0,
+                    total=0,
+                    started_at=started_at,
+                    detail="index locked; re-run `synaptiq analyze` to encode",
+                )
+            return
 
-        def _on_progress(done: int, tot: int) -> None:
-            write_state(data_dir, "encoding", done=done, total=tot, started_at=started_at)
+        write_state(data_dir, "encoding", done=0, total=pending, started_at=started_at)
+
+        def _on_progress(done: int, _full: int) -> None:
+            # embed_graph reports done = reused + encoded-so-far against the full
+            # embeddable count; re-base onto the pending delta for honest status.
+            write_state(
+                data_dir,
+                "encoding",
+                done=max(0, min(done - reused, pending)),
+                total=pending,
+                started_at=started_at,
+            )
 
         embeddings = embed_graph(
             graph, tier=tier.name, previous=previous, progress_callback=_on_progress
@@ -393,16 +431,18 @@ def _encode_and_store(data_dir: Path, db_path: Path, started_at: str) -> None:
             )
             continue
 
-        # (f) Store under the single-writer lock (retry → deferred).
+        # (f) Store under the single-writer lock (retry → deferred). Progress is
+        # reported against the pending delta (see above), so a completed encode
+        # reads "pending/pending".
         if _store_with_retry(db_path, embeddings):
             _update_meta_embeddings(data_dir, len(embeddings), expect_anchor=anchor)
-            write_state(data_dir, "complete", done=total, total=total, started_at=started_at)
+            write_state(data_dir, "complete", done=pending, total=pending, started_at=started_at)
         else:
             write_state(
                 data_dir,
                 "deferred",
-                done=total,
-                total=total,
+                done=pending,
+                total=pending,
                 started_at=started_at,
                 detail="index locked; re-run `synaptiq analyze` to encode",
             )
