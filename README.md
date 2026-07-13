@@ -9,16 +9,18 @@
 ```
 $ synaptiq analyze .
 
-Phase 1:  Walking files...               142 files found
-Phase 3:  Parsing code...                142/142
-Phase 5:  Tracing calls...               847 calls resolved
-Phase 7:  Analyzing types...             234 type relationships
-Phase 8:  Detecting communities...       8 clusters found
-Phase 9:  Detecting execution flows...   34 processes found
-Phase 10: Finding dead code...           12 unreachable symbols
-Phase 11: Analyzing git history...       18 coupled file pairs
+Index ready.                             3,514 files — 22,689 symbols, 115k edges
+Encoding 26,909 embeddings in the background — run synaptiq status to check.
 
-Done in 4.2s — 623 symbols, 1,847 edges, 8 clusters, 34 flows
+Done in 16.1s   # 790k-LOC monorepo, cold start
+
+$ vim src/api/billing.py                 # ...edit one file...
+$ synaptiq analyze .
+
+Index ready.
+Incremental: 2 file(s) re-analyzed (1 changed + 1 dependent), 14 symbol(s) updated
+
+Done in 0.5s
 ```
 
 Most code intelligence tools treat your codebase as flat text. Synaptiq builds a **structural graph** — every function, class, import, call, type reference, and execution flow becomes a node or edge in a queryable knowledge graph. AI agents using Synaptiq don't just search for keywords; they understand how your code is connected.
@@ -43,8 +45,30 @@ Most code intelligence tools treat your codebase as flat text. Synaptiq builds a
 
 ---
 
+## ⚡ Performance
+
+All numbers measured on a 790k-LOC production monorepo (3,514 files / 22,689 symbols / ~27k embeddings), 10-core Apple Silicon laptop, v2.0.0 vs v1.5.1. Full methodology and raw data: [`docs/plans/benchmarks/2026-07-baseline.md`](docs/plans/benchmarks/2026-07-baseline.md).
+
+| Scenario | v1.5.1 | v2.0.0 | Change |
+|---|---|---|---|
+| Full analyze → **usable index** | 726s | **16.1s** | **45× faster** (embeddings continue in background) |
+| Re-analyze, nothing changed | 726s | **1.4s** | **534× faster** (incremental engine) |
+| Re-analyze, one file changed | 726s | **~0.5s + background delta encode** | incremental + vector reuse |
+| Storage load (no-embeddings full build) | 5.99s* | 2.58s* | −57% — Arrow COPY on LadybugDB |
+| Watcher save-time cost | O(whole repo) FTS rebuild | O(file) | per-save full-text rebuild eliminated |
+| Incremental insert path | 13.9s / 1k nodes | 0.29s | ~47× — transactions + prepared statements |
+| Embedding encode (optional `fast` tier) | 237 texts/s | 43,385 texts/s | 183× — model2vec static vectors |
+| Index size on disk | 385 MB | 239 MB | −38% (single-file format) |
+
+<sub>*measured on the synaptiq repo itself (122 files); other rows on the 790k-LOC monorepo.</sub>
+
+**Correctness guarantees behind the speed:** incremental results are property-tested equivalent to a full rebuild (50-seed randomized edit-script soak, strict-core graph equality); 1,599-test suite; every optimization landed with a frozen-reference equivalence test against the code it replaced.
+
+---
+
 ## Table of Contents
 
+- [Performance](#-performance)
 - [Features](#-features)
 - [Supported Languages](#-supported-languages)
 - [Installation](#-installation)

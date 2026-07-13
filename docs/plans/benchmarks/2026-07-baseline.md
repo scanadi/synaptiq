@@ -82,3 +82,18 @@ extra remains as a deprecated no-op alias for install-command compatibility.)
 | 3. Warm re-run, with embeddings | **15.8s** | 2.4 | text_sha reuse: 26k vectors reused, embed phase 619.6s → 4.4s; index file 385MB → 239MB (−38%) |
 
 **Conclusions:** (1) the non-ML pipeline is effectively solved at this scale (~11s for 790k LOC); (2) warm full re-analysis at ~16s makes `analyze` a viable everyday command; (3) cold-start embedding encode is now >98% of first-index time — **W4.1 lazy background embeddings is the single remaining product lever** (index usable in ~11s, vectors fill in behind); W4.4 fast-embeddings would attack the same 620s.
+
+---
+
+# Final validation — lvlp-app, complete 2.0.0 stack (all waves + review fixes)
+
+Gate: **1599 tests passed** (full suite, soak deselected), ruff clean.
+
+| Scenario | v1.5.1 | 2.0.0 | Notes |
+|---|---|---|---|
+| Full analyze → usable index | 726s | **16.1s** (12.3s pipeline) | lazy default: 26,909 embeddings encode in background; CPU 20.3s user over 16.1s real |
+| No-change re-analyze (incremental) | 726s | **1.36s** | walk + manifest diff + "0 files re-analyzed" |
+| 1-file incremental (synaptiq repo) | — | 0.5s vs 4.1s full (~8×) | measured by W3.2e; lvlp-app content-edit not measured (owner's working tree left untouched) |
+| Equivalence guarantee | — | 50-seed property soak green | incremental ≡ full on the strict core; found+fixed 1 real bug pre-release (folder-orphan, seed 9) |
+
+Headline: **usable index 45× faster; no-change re-analyze 534× faster.** Embedding tiers: quality (default) or `--embedding-model fast` (model2vec, 183× encode rate) for CI/low-power.
