@@ -549,3 +549,134 @@ class TestGlobalPhaseScheduler:
         finally:
             await _cancel(churn_task)
             await _cancel(task)
+
+
+# ---------------------------------------------------------------------------
+# Watcher incremental global tier (W3.2e) — the two-tier interaction
+# ---------------------------------------------------------------------------
+
+
+class TestWatcherIncrementalTier:
+    """The watcher keeps the lossy per-file immediate tier (apply_reindex) and
+    layers a *scoped* incremental global tier on top. The crux this proves:
+    even though apply_reindex DETACH-DELETEs a changed file (destroying inbound
+    edges to it), the global tier's ``repair_inbound=True`` incremental apply
+    restores them, so the result matches a full rebuild on the strict core.
+    """
+
+    _MODELS = (
+        "class Account:\n"
+        "    def save(self):\n"
+        "        return 1\n"
+        "\n\n"
+        "def make_user(name):\n"
+        "    acct = Account()\n"
+        "    return acct\n"
+    )
+    _SERVICE = (
+        "from pkg.models import make_user, Account\n"
+        "\n\n"
+        "class Service(Account):\n"
+        "    def run(self):\n"
+        "        return make_user('x')\n"
+    )
+    _REPORT = "from pkg.models import make_user\n\n\ndef report():\n    return make_user('y')\n"
+
+    def _build_repo(self, root: Path) -> None:
+        files = {
+            "pkg/models.py": self._MODELS,
+            "pkg/service.py": self._SERVICE,
+            "pkg/report.py": self._REPORT,
+        }
+        for i in range(12):  # fillers keep a 1-file edit under the ratio gates
+            files[f"pkg/f{i}.py"] = f"def fn{i}():\n    return {i}\n"
+        for rel, content in files.items():
+            p = root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+
+    def test_immediate_tier_plus_incremental_global_equals_full_rebuild(self, tmp_path):
+        from synaptiq.core.graph.model import NodeLabel, RelType, generate_id
+        from synaptiq.core.ingestion.pipeline import (
+            run_incremental,
+            stamp_full_manifest,
+        )
+
+        root = tmp_path / "repo"
+        self._build_repo(root)
+
+        # 1. Full index into a backend + stamp the manifest.
+        backend = LadybugBackend()
+        backend.initialize(tmp_path / "watch_db")
+        base_graph, _ = run_pipeline(root, None, skip_embeddings=True)
+        backend.bulk_load(base_graph)
+        stamp_full_manifest(backend, base_graph, tool_version="test", git_head="head0")
+
+        make_user = generate_id(NodeLabel.FUNCTION, "pkg/models.py", "make_user")
+        service_run = generate_id(NodeLabel.METHOD, "pkg/service.py", "Service.run")
+
+        def _inbound_calls_make_user() -> set[str]:
+            g = backend.load_graph()
+            return {
+                r.source
+                for r in g.iter_relationships()
+                if r.type is RelType.CALLS and r.target == make_user
+            }
+
+        assert service_run in _inbound_calls_make_user()  # baseline inbound edge
+
+        # 2. Body-only edit on disk.
+        (root / "pkg/models.py").write_text(
+            self._MODELS.replace("acct = Account()", "acct = Account()  # tweak"),
+            encoding="utf-8",
+        )
+
+        # 3. Immediate tier (per-file): parse + apply_reindex — the LOSSY tier
+        #    that DETACH-DELETEs models.py and drops the inbound CALLS edge.
+        entries = [read_file(root, root / "pkg/models.py")]
+        graph = parse_files(entries, root)
+        apply_reindex(entries, backend, graph)
+        assert service_run not in _inbound_calls_make_user()  # damage confirmed
+
+        # 4. Global tier: the watcher's incremental apply (repair_inbound=True).
+        outcome = run_incremental(
+            root, backend, tool_version="test", repair_inbound=True, git_head="head0"
+        )
+        assert not outcome.full_rebuild_required
+        # The inbound edge the immediate tier destroyed is restored.
+        assert service_run in _inbound_calls_make_user()
+
+        incremental_graph = backend.load_graph()
+        backend.close()
+
+        # 5. Oracle: a full rebuild of the edited tree — strict-core equal.
+        full_backend = LadybugBackend()
+        full_backend.initialize(tmp_path / "watch_full_db")
+        full_graph, _ = run_pipeline(root, None, skip_embeddings=True)
+        full_backend.bulk_load(full_graph)
+        full_loaded = full_backend.load_graph()
+        full_backend.close()
+
+        fringe = frozenset({NodeLabel.COMMUNITY, NodeLabel.PROCESS})
+        inc_nodes = {n.id for n in incremental_graph.iter_nodes() if n.label not in fringe}
+        full_nodes = {n.id for n in full_loaded.iter_nodes() if n.label not in fringe}
+        assert inc_nodes == full_nodes
+
+        def _edges(g, rt):
+            return {(r.source, r.target) for r in g.iter_relationships() if r.type is rt}
+
+        for rt in (RelType.CONTAINS, RelType.IMPORTS, RelType.EXTENDS, RelType.DEFINES):
+            assert _edges(incremental_graph, rt) == _edges(full_loaded, rt), rt.value
+        # Inbound + outbound high-confidence CALLS match too (no duplicates,
+        # nothing lost) — the whole point of the repair.
+        inc_calls = {
+            (r.source, r.target)
+            for r in incremental_graph.iter_relationships()
+            if r.type is RelType.CALLS and (r.properties.get("confidence", 1.0) or 0) >= 0.8
+        }
+        full_calls = {
+            (r.source, r.target)
+            for r in full_loaded.iter_relationships()
+            if r.type is RelType.CALLS and (r.properties.get("confidence", 1.0) or 0) >= 0.8
+        }
+        assert inc_calls == full_calls

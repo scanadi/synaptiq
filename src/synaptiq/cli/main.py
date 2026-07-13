@@ -56,11 +56,215 @@ class EmbeddingModelTier(str, Enum):
     fast = "fast"
 
 
-def _write_meta(data_dir: Path, repo_path: Path, result: object) -> None:
-    """Write meta.json with index stats (shared implementation in pipeline)."""
+def _write_meta(data_dir: Path, repo_path: Path, result: object, **kwargs) -> None:
+    """Write meta.json with index stats (shared implementation in pipeline).
+
+    ``**kwargs`` forwards the W3.2e last-index fields (``mode``/``reason``/
+    ``changed_files``/...) so callers can record whether the last update was
+    incremental or full.
+    """
     from synaptiq.core.ingestion.pipeline import write_meta
 
-    write_meta(data_dir, repo_path, result)
+    write_meta(data_dir, repo_path, result, **kwargs)
+
+
+#: A change to the embedding tier re-encodes every vector (different width) but
+#: is not a file change, so the scoped delta would miss it — force the full path.
+REASON_TIER_CHANGED = "embedding_tier_changed"
+
+
+def _reason_phrase(reason: str) -> str:
+    """Human phrase for a REASON_* code, for the analyze output line (W3.2e)."""
+    from synaptiq.core.ingestion.incremental import (
+        REASON_CONSOLIDATE_APPLY_LIMIT,
+        REASON_CONSOLIDATE_GIT_HEAD,
+        REASON_CONSOLIDATE_STALENESS,
+        REASON_CONSOLIDATE_SYMBOL_RATIO,
+        REASON_CORRUPT_MANIFEST,
+        REASON_FILE_RATIO,
+        REASON_SYMBOL_RATIO,
+        REASON_VERSION_MISMATCH,
+    )
+    from synaptiq.core.ingestion.pipeline import REASON_FORCED_FULL, REASON_NO_MANIFEST
+
+    return {
+        REASON_FORCED_FULL: "forced with --full",
+        REASON_NO_MANIFEST: "no prior index",
+        REASON_VERSION_MISMATCH: "manifest version mismatch",
+        REASON_CORRUPT_MANIFEST: "manifest inconsistent",
+        REASON_FILE_RATIO: "too many files changed",
+        REASON_SYMBOL_RATIO: "too many symbols changed",
+        REASON_TIER_CHANGED: "embedding model changed",
+        REASON_CONSOLIDATE_SYMBOL_RATIO: "consolidation due (accumulated changes)",
+        REASON_CONSOLIDATE_APPLY_LIMIT: "consolidation due (apply count)",
+        REASON_CONSOLIDATE_STALENESS: "consolidation due (staleness)",
+        REASON_CONSOLIDATE_GIT_HEAD: "consolidation due (git HEAD moved)",
+    }.get(reason, reason)
+
+
+def _stored_embedding_model(data_dir: Path) -> str:
+    """The embedding tier the current index was built with (from meta.json)."""
+    meta_path = data_dir / "meta.json"
+    if not meta_path.exists():
+        return ""
+    try:
+        return str(json.loads(meta_path.read_text(encoding="utf-8")).get("stats", {}).get(
+            "embedding_model", "") or "")
+    except (ValueError, OSError):
+        return ""
+
+
+def _run_analyze_incremental(
+    repo_path: Path,
+    data_dir: Path,
+    storage,
+    *,
+    full: bool,
+    mode: "EmbeddingsMode",
+    tier_name: str,
+    profile: bool,
+):
+    """Attempt the incremental analyze path (D2), returning the IncrementalOutcome.
+
+    On a full-rebuild verdict (``--full``, no/invalid manifest, ratio blowout, or
+    a due consolidation) this does no storage work and returns the outcome for the
+    caller to run its own full path. Otherwise the scoped delta has already been
+    applied + the manifest persisted (by ``run_incremental``); here we finish the
+    job — embeddings per mode, meta, the output line, and (lazy) the worker spawn —
+    close storage, and return, so the caller returns without touching the full path.
+    """
+    import time as _time
+
+    from synaptiq import __version__
+    from synaptiq.core.embeddings.embedder import embeddable_node_count
+    from synaptiq.core.embeddings.lazy_worker import spawn_lazy_worker
+    from synaptiq.core.ingestion.coupling import current_git_head
+    from synaptiq.core.ingestion.pipeline import (
+        IncrementalOutcome,
+        build_incremental_result,
+        load_previous_embeddings,
+        run_incremental,
+    )
+
+    # A tier switch re-encodes every vector but is not a file change, so the
+    # scoped delta would miss it — route to the full path (matches the full
+    # rebuild's tier-salted partition, which reuses nothing across a switch).
+    if mode is not EmbeddingsMode.off:
+        stored_model = _stored_embedding_model(data_dir)
+        if stored_model and stored_model != tier_name:
+            return IncrementalOutcome(full_rebuild_required=True, reason=REASON_TIER_CHANGED)
+
+    head = current_git_head(repo_path)
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+        transient=True,
+    ) as progress:
+        task = progress.add_task("Starting...", total=None)
+
+        def on_progress(phase: str, pct: float) -> None:
+            progress.update(task, description=f"{phase} ({pct:.0%})")
+
+        outcome = run_incremental(
+            repo_path,
+            storage,
+            tool_version=__version__,
+            repair_inbound=False,
+            force_full=full,
+            git_head=head,
+            now=_time.time(),
+            apply=True,
+            progress_callback=on_progress,
+        )
+
+    if outcome.full_rebuild_required:
+        return outcome  # caller runs the full path
+
+    # --- incremental branch: embeddings per mode -----------------------------
+    result = build_incremental_result(data_dir, outcome)
+    pending_embeddings = 0
+    if mode is EmbeddingsMode.sync:
+        # Inline re-encode of only the changed texts, matching a full rebuild's
+        # vectors: load the full post-delta graph, reuse every unchanged vector
+        # by text_sha, encode the rest. apply_graph_delta never wiped the table,
+        # so `previous` carries every still-valid vector.
+        from synaptiq.core.embeddings.embedder import embed_graph
+
+        previous_vecs = load_previous_embeddings(storage)
+        full_graph = storage.load_graph()
+        try:
+            embeddings = embed_graph(full_graph, tier=tier_name, previous=previous_vecs)
+            if embeddings:
+                storage.store_embeddings(embeddings)
+            result.embeddings = len(embeddings)
+            result.embedding_model = tier_name
+        except Exception:
+            _stderr_console.print(
+                "[yellow]Warning:[/yellow] embedding generation failed; "
+                "vector search may be stale until the next successful analyze."
+            )
+    elif mode is EmbeddingsMode.lazy:
+        # Unchanged vectors are still in the DB — only the changed/added symbols
+        # need (re)encoding, so the background worker's job is exactly the delta.
+        pending_embeddings = embeddable_node_count(outcome.upsert_graph())
+
+    _write_meta(
+        data_dir,
+        repo_path,
+        result,
+        mode="incremental",
+        reason=outcome.reason,
+        changed_files=outcome.changed_files,
+        dependents=outcome.dependents,
+        symbols_updated=outcome.symbols_updated,
+    )
+
+    console.print()
+    console.print(
+        "[bold green]Index ready.[/bold green]"
+        if mode is EmbeddingsMode.lazy
+        else "[bold green]Indexing complete.[/bold green]"
+    )
+    reparse = len(outcome.plan.files_to_reparse) if outcome.plan else outcome.changed_files
+    dependents = outcome.dependents
+    changed = reparse - dependents
+    console.print(
+        f"[cyan]Incremental:[/cyan] {reparse} file(s) re-analyzed "
+        f"({changed} changed + {dependents} dependent), "
+        f"{outcome.symbols_updated} symbol(s) updated"
+    )
+    if profile and outcome.phase_timings:
+        console.print()
+        _print_phase_timing_table(outcome.phase_timings, sum(outcome.phase_timings.values()))
+
+    # Release the DB handle BEFORE spawning the worker (its read-only open must
+    # not collide with this process's write handle) — mirrors the full path.
+    storage.close()
+
+    if mode is EmbeddingsMode.lazy:
+        if pending_embeddings > 0:
+            pid = spawn_lazy_worker(repo_path)
+            console.print()
+            if pid is not None:
+                console.print(
+                    f"[cyan]Encoding {pending_embeddings:,} changed embedding(s) in the "
+                    f"background[/cyan] (PID {pid}) — run [bold]synaptiq status[/bold] "
+                    "to check progress."
+                )
+            else:
+                _stderr_console.print(
+                    "[yellow]Warning:[/yellow] could not start the background embedding "
+                    "worker; run `synaptiq analyze --embeddings sync` to encode vectors."
+                )
+        elif result.embeddings > 0:
+            # Nothing changed that needs re-encoding — every stored vector is
+            # still valid (apply_graph_delta never wiped the table).
+            console.print()
+            console.print(
+                f"[cyan]All {result.embeddings:,} vectors reused[/cyan] — nothing to encode."
+            )
+    return outcome
 
 
 def _print_phase_timing_table(phase_timings: dict, total_seconds: float) -> None:
@@ -378,6 +582,19 @@ def analyze(
         # on this initial open would be pure waste (~2s on LadybugDB).
         storage = open_with_recovery(db_path, data_dir / "meta.json", build_fts_indexes=False)
 
+        # W3.2e (D2): incremental by default. When a valid manifest exists and the
+        # change is small, apply a scoped delta and return; a full-rebuild verdict
+        # (--full, no/invalid manifest, ratio blowout, or a due consolidation)
+        # falls through to the full path below with its reason surfaced.
+        incremental_outcome = _run_analyze_incremental(
+            repo_path, data_dir, storage, full=full, mode=mode,
+            tier_name=tier_name, profile=profile,
+        )
+        if not incremental_outcome.full_rebuild_required:
+            return
+        full_reason = incremental_outcome.reason
+        console.print(f"[dim]Full rebuild: {_reason_phrase(full_reason)}[/dim]")
+
         # Lazy mode: snapshot whatever embeddings the PREVIOUS index holds
         # before run_pipeline's bulk_load wipes the Embedding table — mirrors
         # the ordering run_pipeline itself uses for sync mode (see
@@ -437,7 +654,16 @@ def analyze(
             else:
                 pending_embeddings = embeddable_node_count(graph)
 
-        _write_meta(data_dir, repo_path, result)
+        # W3.2e: stamp the manifest's git_head (bulk_load left it None) so the D8
+        # coupling gate has a baseline, and record that this run took the full path.
+        from synaptiq import __version__ as _tool_version
+        from synaptiq.core.ingestion.coupling import current_git_head
+        from synaptiq.core.ingestion.pipeline import stamp_full_manifest
+
+        stamp_full_manifest(
+            storage, graph, tool_version=_tool_version, git_head=current_git_head(repo_path)
+        )
+        _write_meta(data_dir, repo_path, result, mode="full", reason=full_reason)
 
         console.print()
         if mode is EmbeddingsMode.lazy:
@@ -584,6 +810,24 @@ def status() -> None:
     console.print(f"[bold]Index status for[/bold] {repo_path}")
     console.print(f"  Version:        {meta.get('version', '?')}")
     console.print(f"  Last indexed:   {meta.get('last_indexed_at', '?')}")
+
+    # W3.2e: which path the last update took (incremental vs full).
+    last_index = meta.get("last_index")
+    if isinstance(last_index, dict):
+        last_mode = last_index.get("mode", "full")
+        if last_mode == "incremental":
+            detail = f"incremental ({last_index.get('changed_files', 0)} files"
+            dependents = last_index.get("dependents", 0)
+            if dependents:
+                detail += f" + {dependents} dependent"
+            detail += ")"
+        else:
+            detail = "full"
+            reason = last_index.get("reason")
+            if reason:
+                detail += f" ({_reason_phrase(reason)})"
+        console.print(f"  Last analyze:   {detail}")
+
     console.print(f"  Files:          {stats.get('files', '?')}")
     console.print(f"  Symbols:        {stats.get('symbols', '?')}")
     console.print(f"  Relationships:  {stats.get('relationships', '?')}")
@@ -1138,6 +1382,11 @@ class _PrimaryRuntime:
         # concurrently in this process (G10).
         rebuild_coordinator = RebuildCoordinator()
 
+        # Resident manifest cell (D10) shared with the watcher: a socket reindex
+        # consolidates (full rebuild) and invalidates it, so the watcher re-reads
+        # the freshly-stamped manifest instead of diffing a stale baseline.
+        resident_manifest: list = [None]
+
         def dispatch(method: str, params: dict) -> str:
             if method == "ping":
                 return "pong"
@@ -1165,14 +1414,23 @@ class _PrimaryRuntime:
             """
             import time as _time
 
+            from synaptiq import __version__ as _tool_version
+            from synaptiq.core.ingestion.coupling import current_git_head
             from synaptiq.core.ingestion.pipeline import (
                 build_full_index,
                 commit_full_index,
                 load_previous_embeddings,
+                stamp_full_manifest,
             )
 
             async def _build_and_commit() -> str:
+                # A socket reindex always CONSOLIDATES (full rebuild): it is an
+                # explicit "refresh everything" request, and it also invalidates
+                # the watcher's resident manifest so the two never disagree. The
+                # `full` flag is carried to build_full_index either way; the fast
+                # incremental path is the watcher's continuous job (design §10).
                 start = _time.monotonic()
+                reason = "forced_full" if params.get("full", True) else "consolidate_socket"
                 skip_embeddings = params.get("skip_embeddings", False)
                 previous = (
                     {}
@@ -1190,6 +1448,7 @@ class _PrimaryRuntime:
                     # meta.json, same as the watcher's own routine rebuilds.
                     tier=params.get("embedding_model"),
                 )
+                head = await asyncio.to_thread(current_git_head, repo_path)
 
                 async def _locked_commit() -> None:
                     # Generous acquisition timeout: a single read dispatch may
@@ -1197,9 +1456,20 @@ class _PrimaryRuntime:
                     # 120s budget — the default 60s would discard the whole build.
                     async with rwlock.writer(timeout=300.0):
                         await asyncio.to_thread(commit_full_index, storage, graph, embeddings)
+                        # Stamp git_head (bulk_load left it None) + invalidate the
+                        # shared resident manifest, both under the write lock so the
+                        # watcher never observes a half-updated state.
+                        await asyncio.to_thread(
+                            stamp_full_manifest,
+                            storage,
+                            graph,
+                            tool_version=_tool_version,
+                            git_head=head,
+                        )
+                        resident_manifest[0] = None
 
                 await asyncio.shield(_locked_commit())
-                _write_meta(data_dir, repo_path, result)
+                _write_meta(data_dir, repo_path, result, mode="full", reason=reason)
                 return _reindex_stats_json(result, _time.monotonic() - start)
 
             return await rebuild_coordinator.run(_build_and_commit)
@@ -1219,6 +1489,7 @@ class _PrimaryRuntime:
                 stop_event=stop_event,
                 rwlock=rwlock,
                 rebuild_coordinator=rebuild_coordinator,
+                resident_manifest=resident_manifest,
             )
         )
         watch_task.add_done_callback(_report_watch_death)

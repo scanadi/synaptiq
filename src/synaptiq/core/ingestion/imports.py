@@ -28,6 +28,55 @@ logger = logging.getLogger(__name__)
 _JS_TS_EXTENSIONS = (".ts", ".js", ".tsx", ".jsx", ".mjs", ".cjs")
 _RUBY_EXTENSIONS = (".rb", ".rake", ".ru", ".gemspec", ".rbi")
 
+#: Extensions whose stem forms a module name (stripped before computing forms).
+_MODULE_EXTENSIONS = frozenset({".py", ".go", *_JS_TS_EXTENSIONS, *_RUBY_EXTENSIONS})
+#: Basenames that name their *package* (parent dir) rather than a leaf module.
+_PACKAGE_INIT_STEMS = frozenset({"__init__", "index"})
+
+
+def _module_forms(spec: str) -> set[str]:
+    """Normalize an import spec (or a path stem) into comparable module forms.
+
+    Reuses the resolution normalization (dots↔slashes) so the added-file closure
+    (:func:`~synaptiq.core.ingestion.incremental.plan_incremental`) can match an
+    unchanged file's *unresolved* import string against a newly-added file's
+    :func:`importable_identities`. Dots become slashes (Python dotted → path),
+    leading relative markers are stripped, and every trailing path *suffix* is
+    emitted (both slashed and dotted) so a source-root layout — ``src/pkg/foo``
+    imported as ``pkg.foo`` — still matches. Deliberately over-broad: extra forms
+    only cost a cheap, correct re-resolution, a missed form costs staleness.
+    """
+    if not spec:
+        return set()
+    normalized = spec.replace(".", "/").replace("\\", "/").strip("/")
+    segments = [s for s in normalized.split("/") if s]
+    forms: set[str] = set()
+    for i in range(len(segments)):
+        suffix = segments[i:]
+        forms.add("/".join(suffix))
+        forms.add(".".join(suffix))
+    return forms
+
+
+def importable_identities(path: str) -> set[str]:
+    """Module forms an import could use to resolve to *path*.
+
+    The inverse of :func:`resolve_import_path`, used by the incremental planner's
+    added-file dependent closure: when *path* is a brand-new file, any unchanged
+    file whose recorded ``unresolved_imports`` normalize (via :func:`_module_forms`)
+    to one of these forms must be re-resolved so the now-satisfiable import links
+    up. ``__init__.py`` / ``index.ts`` additionally name their parent package.
+    """
+    pure = PurePosixPath(path)
+    noext = str(pure.with_suffix("")) if pure.suffix.lower() in _MODULE_EXTENSIONS else str(pure)
+    forms = _module_forms(noext)
+    if pure.stem in _PACKAGE_INIT_STEMS:
+        parent = str(pure.parent)
+        if parent and parent != ".":
+            forms |= _module_forms(parent)
+    return forms
+
+
 def build_file_index(graph: KnowledgeGraph) -> dict[str, str]:
     """Build an index mapping file paths to their graph node IDs.
 
@@ -163,12 +212,21 @@ def process_imports(
 
     for fpd in parse_data:
         source_file_id = generate_id(NodeLabel.FILE, fpd.file_path)
+        # Import module strings that resolved to no project file — stashed on the
+        # File node so the manifest can record them (added-file closure fix). Only
+        # this loop has both the parsed import and the resolution verdict, so it
+        # is the one place that can capture "referenced but not present (yet)".
+        unresolved: list[str] = []
 
         for imp in fpd.parse_result.imports:
             target_ids = _resolve_import_targets(
                 fpd.file_path, imp, file_index, source_roots,
                 ruby_basename_index, go_package_index,
             )
+            if not target_ids:
+                if imp.module:
+                    unresolved.append(imp.module)
+                continue
             for target_id in target_ids:
                 # A Go package fans out to every file in its directory; never
                 # link a file to itself.
@@ -190,6 +248,11 @@ def process_imports(
                         properties={"symbols": ",".join(imp.names)},
                     )
                 )
+
+        if unresolved:
+            source_node = graph.get_node(source_file_id)
+            if source_node is not None:
+                source_node.properties["unresolved_imports"] = sorted(set(unresolved))
 
 def _detect_language(file_path: str) -> str:
     """Infer language from a file's extension."""

@@ -40,6 +40,33 @@ from synaptiq.core.graph.model import (
 
 logger = logging.getLogger(__name__)
 
+
+def current_git_head(repo_path: Path) -> str | None:
+    """Return the current ``git rev-parse HEAD`` sha, or ``None`` if unavailable.
+
+    The cheap coupling-staleness gate for incremental indexing (design §9 / D8):
+    ``COUPLED_WITH`` depends solely on git history, so an incremental apply can
+    reuse the stored coupling as long as HEAD has not moved. Stamped into
+    ``IndexManifest.git_head`` on a full build and compared here on the next
+    consolidation decision. ``None`` for a non-git repo, a fresh repo with no
+    commits, or a missing ``git`` binary — treated by callers as "unknown", which
+    conservatively lets a consolidation proceed rather than trusting stale edges.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        logger.debug("git rev-parse HEAD failed for %s — not a git repo?", repo_path)
+        return None
+    head = result.stdout.strip()
+    return head or None
+
+
 def parse_git_log(
     repo_path: Path,
     since_months: int = 6,
