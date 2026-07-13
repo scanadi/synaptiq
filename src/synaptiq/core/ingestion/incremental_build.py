@@ -99,6 +99,7 @@ faithfully resolves whatever ``plan.files_to_reparse`` names and no more.
 from __future__ import annotations
 
 import re
+from pathlib import PurePosixPath
 
 from synaptiq.core.graph.graph import KnowledgeGraph
 from synaptiq.core.graph.model import (
@@ -325,6 +326,27 @@ def build_incremental_delta(
     nodes_remove_set = set(plan.symbols_to_remove)
     for path in deleted_paths:
         nodes_remove_set.add(generate_id(NodeLabel.FILE, path))
+    # Emptied-directory cleanup: deleting the last file in a directory leaves its
+    # Folder node (and the CONTAINS edge into it) with nothing under it, but a full
+    # rebuild's ``process_structure`` only emits a folder for a dir that still holds
+    # a file — so those orphans must be removed or CONTAINS/Folder drift off the
+    # strict core. Folders are not manifest-tracked (§4.3 excludes them), so the
+    # symbol diff cannot surface this; derive it from the walk instead: an ancestor
+    # dir of a deleted file that no longer contains any surviving file is emptied.
+    # Adding the Folder id to ``nodes_remove`` lets the by-id DETACH DELETE cascade
+    # its CONTAINS edges (both the parent→folder and folder→child edges).
+    if deleted_paths:
+        surviving_dirs = {
+            str(parent)
+            for entry in walk
+            for parent in PurePosixPath(entry.path).parents
+            if str(parent) != "."
+        }
+        for path in deleted_paths:
+            for parent in PurePosixPath(path).parents:
+                dir_str = str(parent)
+                if dir_str != "." and dir_str not in surviving_dirs:
+                    nodes_remove_set.add(generate_id(NodeLabel.FOLDER, dir_str))
     nodes_remove = sorted(nodes_remove_set)
 
     # --- 7. dead_recount: symbols whose incoming-CALLS in-degree may have moved -

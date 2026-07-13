@@ -92,4 +92,5 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
     "benchmark: marks tests as benchmarks (deselect with '-m \"not benchmark\"')",
+    "equivalence_soak: 100-script incremental-equivalence soak (opt-in; excluded by default, run with '-m equivalence_soak')",
 ]
