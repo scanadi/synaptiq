@@ -368,6 +368,7 @@ async def watch_repo(
     import watchfiles
 
     from synaptiq import __version__
+    from synaptiq.core.embeddings.lazy_worker import stamp_inline_complete
     from synaptiq.core.ingestion.coupling import current_git_head
     from synaptiq.core.ingestion.pipeline import (
         apply_reindex,
@@ -420,6 +421,11 @@ async def watch_repo(
         )
         resident_manifest[0] = None
         write_meta(data_dir, repo_path, result, mode="full", reason=reason)
+        # 2.0.4 (BUG 2): the watcher's global phase always embeds synchronously
+        # (commit_full_index above) — a stale sentinel from an earlier lazy
+        # worker run (e.g. an `analyze --embeddings lazy` that deferred before
+        # this daemon started) must not survive this successful store.
+        stamp_inline_complete(data_dir, result.embeddings)
         logger.info("Consolidation complete")
         return True
 

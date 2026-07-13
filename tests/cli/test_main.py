@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -690,6 +691,75 @@ class TestAnalyzeLazyReuse:
             after.close()
         assert len(stored_after) == total_before - 1
 
+    # -----------------------------------------------------------------
+    # 2.0.4 (BUG 2): inline embed-store paths stamp embeddings_state.json
+    # themselves — only the lazy worker used to, so a stale sentinel from an
+    # earlier lazy run could survive a later successful inline embed.
+    # -----------------------------------------------------------------
+
+    def test_sync_analyze_clears_stale_deferred_sentinel(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Empirical repro (field-verified): a prior lazy worker run left
+        `deferred` on disk with a dead pid; a later `analyze --embeddings
+        sync` must overwrite it with an honest `complete`, not leave the
+        stale sentinel byte-identical."""
+        repo = tmp_path / "repo"
+        self._repo_with_two_files(repo)
+        self._seed_with_sync_analyze(repo, monkeypatch)
+
+        state_path = repo / ".synaptiq" / "embeddings_state.json"
+        state_path.write_text(
+            json.dumps(
+                {
+                    "state": "deferred",
+                    "detail": "index locked; re-run `synaptiq analyze` to encode",
+                    "total": 999,
+                    "pid": 99999999,
+                    "updated_at": "2020-01-01T00:00:00+00:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        monkeypatch.chdir(repo)
+        result = runner.invoke(app, ["analyze", "--embeddings", "sync"])
+        assert result.exit_code == 0, result.output
+
+        state = json.loads(state_path.read_text())
+        assert state["state"] == "complete"
+        assert state["total"] == state["done"] > 0
+
+    def test_unchanged_repo_lazy_reuse_stamps_state_complete(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """BUG 2: the lazy path's 'everything reused, no worker spawned'
+        branch must stamp its own `complete` sentinel — nothing else will,
+        since no worker ever runs on this path."""
+        repo = tmp_path / "repo"
+        self._repo_with_two_files(repo)
+        self._seed_with_sync_analyze(repo, monkeypatch)
+
+        # Simulate a stale sentinel left by an unrelated earlier lazy attempt.
+        state_path = repo / ".synaptiq" / "embeddings_state.json"
+        state_path.write_text(
+            json.dumps({"state": "deferred", "detail": "x", "total": 999}), encoding="utf-8"
+        )
+
+        monkeypatch.chdir(repo)
+        spawned = {"n": 0}
+        monkeypatch.setattr(
+            "synaptiq.core.embeddings.lazy_worker.spawn_lazy_worker",
+            lambda rp: spawned.__setitem__("n", spawned["n"] + 1),
+        )
+
+        result = runner.invoke(app, ["analyze"])  # lazy default, repo unchanged -> all reused
+        assert result.exit_code == 0, result.output
+        assert spawned["n"] == 0  # nothing pending, so still no worker spawn
+
+        state = json.loads(state_path.read_text())
+        assert state["state"] == "complete"
+
 
 class TestStatus:
     """Tests for the status command."""
@@ -747,7 +817,12 @@ class TestStatus:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.chdir(tmp_path)
-        self._write_index(tmp_path, {"state": "encoding", "done": 12431, "total": 26203})
+        # A live pid (this test process itself) — a real state file always has
+        # one (write_state defaults it to os.getpid()); see the reconciliation
+        # tests below for the dead-pid "stalled" case this would otherwise hit.
+        self._write_index(
+            tmp_path, {"state": "encoding", "done": 12431, "total": 26203, "pid": os.getpid()}
+        )
         result = runner.invoke(app, ["status"])
         assert result.exit_code == 0
         assert "encoding 12,431/26,203" in _plain(result.output)
@@ -800,6 +875,88 @@ class TestStatus:
         result = runner.invoke(app, ["status"])
         assert "Embeddings:" in _plain(result.output)
         assert "17" in _plain(result.output)
+
+    # -----------------------------------------------------------------
+    # 2.0.4 (BUG 1): reconciliation against meta.json ground truth —
+    # field-verified: a dead worker's stale sentinel must never outrank a
+    # meta.json that has already caught up to what it was waiting for.
+    # -----------------------------------------------------------------
+
+    def test_status_reconciles_stale_deferred_when_meta_caught_up(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Empirical repro: state says `deferred` (dead pid, hours-old
+        updated_at) while meta.stats.embeddings == state.total — every
+        vector is actually present. Status must say complete, not lie."""
+        monkeypatch.chdir(tmp_path)
+        data_dir = self._write_index(
+            tmp_path,
+            {
+                "state": "deferred",
+                "detail": "index locked; re-run `synaptiq analyze` to encode",
+                "total": 42,
+                "pid": 99999999,
+                "updated_at": "2020-01-01T00:00:00+00:00",
+            },
+            embeddings=42,
+        )
+        result = runner.invoke(app, ["status"])
+        assert result.exit_code == 0
+        output = _plain(result.output)
+        assert "42 (complete)" in output
+        assert "deferred" not in output.lower()
+
+        # CLI-only self-heal: the stale sentinel is rewritten on disk too, so
+        # a later call (or the read-only MCP freshness reader) sees complete
+        # directly without needing to reconcile again.
+        state = json.loads((data_dir / "embeddings_state.json").read_text())
+        assert state["state"] == "complete"
+
+    def test_status_reconciles_stale_failed_when_meta_caught_up(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        self._write_index(
+            tmp_path,
+            {"state": "failed", "error": "onnx exploded", "total": 10},
+            embeddings=10,
+        )
+        result = runner.invoke(app, ["status"])
+        output = _plain(result.output)
+        assert "10 (complete)" in output
+        assert "onnx exploded" not in output
+
+    def test_status_reports_stalled_when_encoding_pid_dead_and_meta_short(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A dead worker frozen mid-encode must not show a progress line
+        that can never move again."""
+        monkeypatch.chdir(tmp_path)
+        self._write_index(
+            tmp_path,
+            {"state": "encoding", "done": 10, "total": 100, "pid": 99999999},
+            embeddings=10,
+        )
+        result = runner.invoke(app, ["status"])
+        output = _plain(result.output)
+        assert "stalled" in output
+        assert "encoding 10/100" not in output
+
+    def test_status_encoding_with_live_pid_and_short_meta_is_unchanged(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A worker genuinely still running must never be second-guessed —
+        unchanged behaviour even though meta hasn't caught up yet."""
+        monkeypatch.chdir(tmp_path)
+        self._write_index(
+            tmp_path,
+            {"state": "encoding", "done": 10, "total": 100, "pid": os.getpid()},
+            embeddings=10,
+        )
+        result = runner.invoke(app, ["status"])
+        output = _plain(result.output)
+        assert "encoding 10/100" in output
+        assert "stalled" not in output.lower()
 
 
 class TestListRepos:
@@ -1073,6 +1230,42 @@ class TestWatch:
         result = runner.invoke(app, ["watch", "--help"])
         assert result.exit_code == 0
         assert "Watch mode" in _plain(result.output) or "re-index" in _plain(result.output).lower()
+
+    def test_watch_runs_embedding_self_heal_before_watching(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """2.0.4 (BUG 3b) wiring: the standalone `watch` command must
+        self-heal a pending embed before entering its (here, faked-out
+        immediate-return) watch loop — with no rwlock, since nothing else
+        can be touching storage yet at this point in startup."""
+        monkeypatch.chdir(tmp_path)
+        data_dir = tmp_path / ".synaptiq"
+        data_dir.mkdir()
+        meta = {
+            "version": "1.0.0",
+            "stats": {"files": 1, "symbols": 2, "relationships": 3, "embeddings": 0},
+            "last_indexed_at": "2026-07-12T10:00:00+00:00",
+        }
+        (data_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+
+        calls: list[tuple] = []
+
+        async def _fake_self_heal(data_dir_arg, storage_arg, rwlock_arg=None):
+            calls.append((data_dir_arg, rwlock_arg))
+
+        async def _fake_watch_repo(*a, **k):
+            return None  # returns immediately instead of watching forever
+
+        monkeypatch.setattr(
+            "synaptiq.cli.main._init_storage_with_index", lambda *a, **k: MagicMock()
+        )
+        monkeypatch.setattr("synaptiq.cli.main._self_heal_embeddings_on_startup", _fake_self_heal)
+        monkeypatch.setattr("synaptiq.core.ingestion.watcher.watch_repo", _fake_watch_repo)
+
+        result = runner.invoke(app, ["watch"])
+        assert result.exit_code == 0, result.output
+        assert len(calls) == 1
+        assert calls[0] == (data_dir, None)
 
     def test_diff_command_exists(self) -> None:
         """The diff command should be registered."""

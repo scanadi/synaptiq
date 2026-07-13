@@ -12,6 +12,7 @@ socket instead of just asserting it.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -123,7 +124,10 @@ class TestEmbeddingsFragment:
     def test_encoding_in_progress(self, tmp_path):
         data_dir = tmp_path / ".synaptiq"
         _write_meta(data_dir, last_indexed_at=_iso(10))
-        _write_state(data_dir, state="encoding", done=12431, total=26203)
+        # A live pid (this test process itself) — a real state file always has
+        # one (write_state defaults it to os.getpid()); see TestReconciliation
+        # below for the dead-pid "stalled" case this would otherwise trigger.
+        _write_state(data_dir, state="encoding", done=12431, total=26203, pid=os.getpid())
         assert "embeddings: encoding 12431/26203" in freshness_trailer(data_dir)
 
     def test_failed(self, tmp_path):
@@ -149,6 +153,79 @@ class TestEmbeddingsFragment:
         trailer = freshness_trailer(data_dir)
         assert trailer == "[index: 10s old]"
         assert "embeddings" not in trailer
+
+
+# ---------------------------------------------------------------------------
+# freshness_trailer() — reconciliation against meta.json (2.0.4, BUG 1)
+#
+# A dead or lock-losing lazy worker's last write can freeze `deferred` /
+# `failed` / `encoding` forever even after meta.json has since caught up (a
+# later sync analyze, a daemon rebuild, ...). meta wins whenever it has —
+# and unlike the CLI's `_format_embeddings_status`, this reader must never
+# write to the state file (proven explicitly below).
+# ---------------------------------------------------------------------------
+
+
+class TestReconciliation:
+    def test_deferred_reconciles_to_complete_when_meta_caught_up(self, tmp_path):
+        data_dir = tmp_path / ".synaptiq"
+        _write_meta(data_dir, last_indexed_at=_iso(10), stats={"embeddings": 42})
+        _write_state(
+            data_dir,
+            state="deferred",
+            detail="index locked; re-run `synaptiq analyze` to encode",
+            total=42,
+            pid=99999999,
+            updated_at="2020-01-01T00:00:00+00:00",
+        )
+        assert "embeddings: complete" in freshness_trailer(data_dir)
+
+    def test_failed_reconciles_to_complete_when_meta_caught_up(self, tmp_path):
+        data_dir = tmp_path / ".synaptiq"
+        _write_meta(data_dir, last_indexed_at=_iso(10), stats={"embeddings": 10})
+        _write_state(data_dir, state="failed", error="onnx exploded", total=10)
+        assert "embeddings: complete" in freshness_trailer(data_dir)
+
+    def test_deferred_stays_deferred_when_meta_still_short(self, tmp_path):
+        """Reconciliation must not fire just because SOME vectors exist —
+        only once meta has caught up to the full total the state file
+        recorded."""
+        data_dir = tmp_path / ".synaptiq"
+        _write_meta(data_dir, last_indexed_at=_iso(10), stats={"embeddings": 5})
+        _write_state(data_dir, state="deferred", detail="index locked", total=42)
+        assert "embeddings: deferred" in freshness_trailer(data_dir)
+
+    def test_encoding_dead_pid_meta_short_reports_stalled(self, tmp_path):
+        data_dir = tmp_path / ".synaptiq"
+        _write_meta(data_dir, last_indexed_at=_iso(10), stats={"embeddings": 10})
+        _write_state(data_dir, state="encoding", done=10, total=100, pid=99999999)
+        trailer = freshness_trailer(data_dir)
+        assert "embeddings: stalled 10/100" in trailer
+        assert "encoding" not in trailer
+
+    def test_encoding_live_pid_is_unchanged(self, tmp_path):
+        """A worker genuinely still running must never be second-guessed."""
+        data_dir = tmp_path / ".synaptiq"
+        _write_meta(data_dir, last_indexed_at=_iso(10), stats={"embeddings": 10})
+        _write_state(data_dir, state="encoding", done=10, total=100, pid=os.getpid())
+        trailer = freshness_trailer(data_dir)
+        assert "embeddings: encoding 10/100" in trailer
+        assert "stalled" not in trailer
+
+    def test_reader_never_writes_the_state_file(self, tmp_path):
+        """Unlike the CLI's status reader, this trailer is read-only even
+        when it detects and reconciles a stale sentinel — the file on disk
+        must come back byte-for-byte unchanged."""
+        data_dir = tmp_path / ".synaptiq"
+        _write_meta(data_dir, last_indexed_at=_iso(10), stats={"embeddings": 42})
+        _write_state(data_dir, state="deferred", detail="index locked", total=42, pid=99999999)
+        state_path = data_dir / "embeddings_state.json"
+        before = state_path.read_bytes()
+
+        trailer = freshness_trailer(data_dir)
+
+        assert "embeddings: complete" in trailer  # reconciliation did happen...
+        assert state_path.read_bytes() == before  # ...but left no trace on disk
 
 
 # ---------------------------------------------------------------------------

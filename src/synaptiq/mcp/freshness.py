@@ -94,20 +94,64 @@ def _read_json(path: Path) -> dict | None:
         return None
 
 
+def _pid_alive(pid: object) -> bool:
+    """Best-effort liveness probe for *pid* (2.0.4, BUG 1).
+
+    Deliberately reimplemented here rather than imported from
+    ``core.embeddings.lazy_worker`` (which has the identical ``pid_alive``)
+    to preserve this module's only-the-on-disk-JSON-shape contract with the
+    embeddings worker — see the module docstring. Mirrors
+    ``daemon.lock.LockInfo.is_stale``'s convention: gone -> dead, exists but
+    unsignalable -> alive, anything else (missing/invalid pid) -> dead.
+    """
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
 def _embeddings_fragment(data_dir: Path, meta: dict) -> str | None:
-    """``complete`` / ``encoding N/M`` / ``failed`` / ``deferred``.
+    """``complete`` / ``encoding N/M`` / ``failed`` / ``deferred`` / ``stalled N/M``.
 
     Prefers the live worker state file; falls back to the vector count
     stashed in ``meta.json`` by the last full index when the state file is
     absent or unreadable (pre-W4.1 index, or a worker that never ran).
     Returns ``None`` when there is nothing meaningful to report.
+
+    2.0.4 (BUG 1): reconciles the state file against ``meta.json`` before
+    trusting a ``deferred``/``failed``/``encoding`` sentinel — a dead or
+    lock-losing lazy worker's last write can freeze at a stale verdict
+    forever even after a LATER inline embed-store (a sync analyze, a daemon
+    rebuild, ...) has already caught meta up to (or past) what that state
+    file was waiting for. meta wins whenever it has caught up. Read-only by
+    design (unlike the CLI's ``_format_embeddings_status``, which may
+    rewrite the file once it detects this) — this trailer must never have a
+    filesystem write side effect.
     """
     state = _read_json(data_dir / _STATE_FILENAME)
     if state is not None:
         kind = state.get("state")
+        total = state.get("total", 0)
+        meta_stats = meta.get("stats")
+        meta_count = meta_stats.get("embeddings", 0) if isinstance(meta_stats, dict) else 0
+        if (
+            kind in ("encoding", "deferred", "failed")
+            and isinstance(total, int)
+            and total > 0
+            and meta_count >= total
+        ):
+            kind = "complete"
         if kind == "encoding":
             done = state.get("done", 0)
-            total = state.get("total", 0)
+            if not _pid_alive(state.get("pid")) and meta_count < total:
+                return f"stalled {done}/{total}"
             return f"encoding {done}/{total}"
         if kind in ("complete", "failed", "deferred"):
             return kind

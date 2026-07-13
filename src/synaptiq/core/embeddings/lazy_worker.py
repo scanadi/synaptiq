@@ -69,7 +69,13 @@ _MAX_GENERATIONS = 5
 
 # Read-write open retry schedule (seconds) when the DB is locked by a daemon or
 # a racing ``analyze``.  Give up after the last one with state="deferred".
-_STORE_RETRY_BACKOFF = (2.0, 5.0)
+# Widened from (2.0, 5.0) (2.0.4, BUG 3a): the original ~7s budget gives up
+# long before a `serve --watch` daemon's own rebuild (which can run for
+# minutes on a large repo) ever releases the write lock, so the worker went
+# permanently `deferred` even though the lock was only ever temporarily busy.
+# The daemon-startup self-heal (see `self_heal_pending_embeddings` below) is
+# the backstop for whatever this bounded retry still doesn't cover.
+_STORE_RETRY_BACKOFF = (2.0, 5.0, 15.0, 30.0, 60.0)
 
 
 def _now_iso() -> str:
@@ -127,6 +133,53 @@ def read_state(data_dir: Path) -> dict | None:
         return json.loads((data_dir / STATE_FILENAME).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def pid_alive(pid: object) -> bool:
+    """Best-effort liveness probe for *pid* (2.0.4, BUG 1/3b).
+
+    Mirrors ``daemon.lock.LockInfo.is_stale``'s convention: a
+    ``ProcessLookupError`` means the process is gone; a ``PermissionError``
+    means it exists but this process can't signal it (treated as alive, same
+    as the primary/proxy lock file's own check). Anything else — a missing,
+    non-int, or non-positive pid — is treated as dead so a corrupt or absent
+    state-file pid can never wedge status reporting or the daemon self-heal.
+    """
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def stamp_inline_complete(data_dir: Path, count: int) -> None:
+    """Stamp ``embeddings_state.json`` complete after a successful INLINE
+    embed-store — i.e. any embed-then-store that does NOT go through
+    :func:`run_lazy_embedding_worker` (2.0.4, BUG 2).
+
+    Only the lazy worker used to write this file, so a synchronous embed —
+    ``analyze --embeddings sync``, the CLI lazy path when every vector was
+    already reused (nothing pending, so no worker gets spawned), or a
+    daemon/watcher global rebuild's synchronous embed — left whatever
+    ``deferred``/``failed``/``encoding`` sentinel a PRIOR lazy worker run had
+    written completely untouched, byte-identical, even though the vectors it
+    describes are long since superseded by the store that just succeeded.
+
+    Call this right after ``storage.store_embeddings(...)`` succeeds (or is
+    skipped because there was nothing new to store — everything was already
+    reused) on every path that embeds outside the lazy worker, so the
+    sentinel always reflects the store that actually just happened. *count*
+    is the total number of vectors now known-current (reused + freshly
+    encoded) — used for both ``done`` and ``total``, since there is no
+    "pending" concept left once this is called: the store already happened.
+    """
+    write_state(data_dir, "complete", done=count, total=count)
 
 
 def _read_meta_timestamp(data_dir: Path) -> str | None:
@@ -458,3 +511,86 @@ def _encode_and_store(data_dir: Path, db_path: Path, started_at: str) -> None:
         started_at=started_at,
         detail="index changed repeatedly during encoding; re-run `synaptiq analyze`",
     )
+
+
+# ---------------------------------------------------------------------------
+# Daemon-startup self-heal (2.0.4, BUG 3b) — called by cli.main's
+# `_PrimaryRuntime.start()` (serve --watch) and the standalone `watch`
+# command, NOT by the detached worker itself.
+# ---------------------------------------------------------------------------
+
+
+def self_heal_pending_embeddings(data_dir: Path, storage) -> int | None:
+    """Finish a background embed a dead/stuck lazy worker left unresolved.
+
+    Meant to run once at ``serve``/``watch`` daemon startup, right after
+    storage opens read-write — the daemon already holds the single-writer
+    lock the lazy worker itself only ever gets to retry against (see
+    ``_STORE_RETRY_BACKOFF``), so it can encode and store directly instead of
+    waiting for a human to notice a permanently-stale ``synaptiq status`` and
+    re-run ``analyze`` by hand.
+
+    Reuses the exact ``embed_graph`` + ``store_embeddings`` combination the
+    daemon's own synchronous rebuilds already use (see
+    ``pipeline.build_full_index`` / ``commit_full_index``): passing the
+    already-stored vectors back in as ``previous`` means only the symbols
+    actually missing a vector hit the model, so this is cheap even on a large
+    graph — a bounded top-up, not a full re-embed.
+
+    Trigger: ``embeddings_state.json`` says ``deferred``/``failed``, or
+    ``encoding`` with a dead pid, AND ``meta.json``'s stored vector count
+    (``stats.embeddings``) is still short of what that run was encoding
+    (``state["total"]``). A live ``encoding`` worker (pid alive) is left
+    strictly alone — this never fights a worker that is still making
+    progress, mirroring the lazy worker's own single-writer courtesy.
+
+    Returns the number of vectors (re)stored, or ``None`` when there was
+    nothing to heal (no state file, an unrecognised/live state, already
+    caught up) or the attempt itself failed. Never raises — every failure
+    mode here degrades to exactly today's behaviour: the sentinel stays as it
+    was, and the next ``analyze`` or lazy worker run picks it up.
+    """
+    try:
+        state = read_state(data_dir)
+        if state is None:
+            return None
+        kind = state.get("state")
+        if kind not in ("deferred", "failed", "encoding"):
+            return None
+        if kind == "encoding" and pid_alive(state.get("pid")):
+            return None  # a worker is genuinely still running -- don't fight it
+
+        total = state.get("total", 0)
+        meta_path = data_dir / "meta.json"
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            meta = {}
+        meta_count = meta.get("stats", {}).get("embeddings", 0)
+        if not isinstance(total, int) or total <= 0 or meta_count >= total:
+            return None  # nothing actually pending
+
+        from synaptiq.core.embeddings.embedder import embed_graph, tier_from_meta
+        from synaptiq.core.ingestion.pipeline import load_previous_embeddings
+
+        anchor = meta.get("last_indexed_at")
+        tier = tier_from_meta(data_dir).name
+        previous = load_previous_embeddings(storage)
+        graph = storage.load_graph()
+        embeddings = embed_graph(graph, tier=tier, previous=previous)
+        if embeddings:
+            storage.store_embeddings(embeddings)
+        count = len(embeddings)
+
+        _update_meta_embeddings(data_dir, count, expect_anchor=anchor)
+        stamp_inline_complete(data_dir, count)
+        logger.info(
+            "Self-healed %d pending embedding(s) at startup (was %s, state.total=%d)",
+            count,
+            kind,
+            total,
+        )
+        return count
+    except Exception:
+        logger.warning("Embedding self-heal failed; continuing without it", exc_info=True)
+        return None

@@ -137,7 +137,7 @@ def _run_analyze_incremental(
 
     from synaptiq import __version__
     from synaptiq.core.embeddings.embedder import embeddable_node_count
-    from synaptiq.core.embeddings.lazy_worker import spawn_lazy_worker
+    from synaptiq.core.embeddings.lazy_worker import spawn_lazy_worker, stamp_inline_complete
     from synaptiq.core.ingestion.coupling import current_git_head
     from synaptiq.core.ingestion.pipeline import (
         IncrementalOutcome,
@@ -199,6 +199,10 @@ def _run_analyze_incremental(
                 storage.store_embeddings(embeddings)
             result.embeddings = len(embeddings)
             result.embedding_model = tier_name
+            # 2.0.4 (BUG 2): an inline sync embed-store must not leave a stale
+            # deferred/failed/encoding sentinel from an earlier lazy worker run
+            # in place — it now lies about vectors that are, in fact, current.
+            stamp_inline_complete(data_dir, result.embeddings)
         except Exception:
             _stderr_console.print(
                 "[yellow]Warning:[/yellow] embedding generation failed; "
@@ -259,7 +263,10 @@ def _run_analyze_incremental(
                 )
         elif result.embeddings > 0:
             # Nothing changed that needs re-encoding — every stored vector is
-            # still valid (apply_graph_delta never wiped the table).
+            # still valid (apply_graph_delta never wiped the table). No worker
+            # will ever run for this analyze, so this IS the terminal state —
+            # stamp it now (2.0.4, BUG 2) rather than leaving a stale sentinel.
+            stamp_inline_complete(data_dir, result.embeddings)
             console.print()
             console.print(
                 f"[cyan]All {result.embeddings:,} vectors reused[/cyan] — nothing to encode."
@@ -487,7 +494,7 @@ def analyze(
         ensure_tier_available,
         partition_embeddings,
     )
-    from synaptiq.core.embeddings.lazy_worker import spawn_lazy_worker
+    from synaptiq.core.embeddings.lazy_worker import spawn_lazy_worker, stamp_inline_complete
     from synaptiq.core.ingestion.pipeline import (
         PipelineResult,
         load_previous_embeddings,
@@ -720,6 +727,10 @@ def analyze(
             elif reused_embeddings:
                 # Every embeddable node's text_sha matched the previous index —
                 # nothing to encode, so there is no delta to spawn a worker for.
+                # No worker will ever run for this analyze, so this IS the
+                # terminal state — stamp it now (2.0.4, BUG 2) rather than
+                # leaving a stale deferred/failed sentinel from an earlier run.
+                stamp_inline_complete(data_dir, len(reused_embeddings))
                 console.print()
                 console.print(
                     f"[cyan]All {len(reused_embeddings):,} vectors reused[/cyan] — "
@@ -758,15 +769,42 @@ def _format_embeddings_status(data_dir: Path, stats: dict) -> str | None:
     Prefers the live worker state file (``embeddings_state.json``); falls back
     to the stored count in ``meta.json``.  Returns ``None`` when there is
     nothing meaningful to show.
-    """
-    from synaptiq.core.embeddings.lazy_worker import read_state
 
+    2.0.4 (BUG 1): reconciles the state file against ``meta.json`` before
+    honoring a ``deferred``/``failed``/``encoding`` sentinel. A lazy worker
+    that died mid-store (or lost a lock race and was never retried far
+    enough — see ``_STORE_RETRY_BACKOFF``) can leave a state file that
+    permanently under-reports a graph whose vectors are, in fact, fully
+    present: every inline embed-store since (a sync analyze, a daemon's
+    synchronous rebuild, ...) keeps ``meta.json`` current regardless of what
+    that worker last wrote. So: once meta's stored count has caught up to
+    what the state file was waiting for, meta wins — the stale sentinel is
+    rewritten to ``complete`` here (self-healing the file for next time; safe
+    in this reader only — the MCP freshness reader stays strictly read-only).
+    A live ``encoding`` worker is left alone; a dead one reports ``stalled``
+    instead of a progress line frozen mid-run forever.
+    """
+    from synaptiq.core.embeddings.lazy_worker import pid_alive, read_state, stamp_inline_complete
+
+    meta_count = stats.get("embeddings", 0)
     state = read_state(data_dir)
     if state is not None:
         kind = state.get("state")
+        total = state.get("total", 0)
+        if (
+            kind in ("deferred", "failed", "encoding")
+            and isinstance(total, int)
+            and total > 0
+            and meta_count >= total
+        ):
+            # The vectors this run was waiting for are already in meta — a
+            # dead/losing worker's sentinel no longer describes reality.
+            stamp_inline_complete(data_dir, meta_count)
+            kind = "complete"
         if kind == "encoding":
             done = state.get("done", 0)
-            total = state.get("total", 0)
+            if not pid_alive(state.get("pid")) and meta_count < total:
+                return "[red]stalled[/red] (worker died; re-run `synaptiq analyze` to encode)"
             return f"encoding {done:,}/{total:,}"
         if kind == "complete":
             count = stats.get("embeddings", state.get("total", 0))
@@ -1000,6 +1038,10 @@ def watch() -> None:
 
     try:
         storage = _init_storage_with_index(repo_path, data_dir)
+        # 2.0.4 (BUG 3b): self-heal a pending embed a dead lazy worker left
+        # behind before watching for changes — no rwlock needed here, nothing
+        # else can be touching storage yet at this point in startup.
+        asyncio.run(_self_heal_embeddings_on_startup(data_dir, storage))
         console.print(f"[bold]Watching[/bold] {repo_path} for changes (Ctrl+C to stop)")
 
         try:
@@ -1171,6 +1213,43 @@ def _init_storage_with_index(repo_path: Path, data_dir: Path, *, output=console)
         _write_meta(data_dir, repo_path, result)
 
     return storage
+
+
+async def _self_heal_embeddings_on_startup(data_dir: Path, storage, rwlock=None) -> None:
+    """Daemon-startup embedding self-heal (2.0.4, BUG 3b) — see
+    ``lazy_worker.self_heal_pending_embeddings`` for the actual reconcile
+    logic; this just wires it into the async daemon lifecycle and reports
+    the outcome. Shared by ``_PrimaryRuntime.start()`` (``serve --watch``,
+    and the proxy-promotion path that reuses it) and the standalone
+    ``watch`` command.
+
+    *rwlock*, when given, is held for the (usually no-op) encode+store the
+    same way any other synchronous embed-store in this codebase is — the
+    standalone ``watch`` command has no rwlock at this point in its startup
+    (nothing else can be touching storage yet), so ``None`` skips it.
+
+    Failures are caught and logged here too, on top of the helper's own
+    internal guard — belt and suspenders: this must never prevent
+    ``serve``/``watch`` from starting.
+    """
+    import asyncio
+    import logging
+
+    from synaptiq.core.embeddings.lazy_worker import self_heal_pending_embeddings
+
+    try:
+        if rwlock is not None:
+            async with rwlock.writer():
+                healed = await asyncio.to_thread(self_heal_pending_embeddings, data_dir, storage)
+        else:
+            healed = await asyncio.to_thread(self_heal_pending_embeddings, data_dir, storage)
+    except Exception:
+        logging.getLogger(__name__).warning("Embedding self-heal failed at startup", exc_info=True)
+        return
+    if healed:
+        _stderr_console.print(
+            f"[green]Self-healed[/green] {healed:,} pending embedding(s) from a previous run."
+        )
 
 
 def _reindex_via_server(
@@ -1377,6 +1456,15 @@ class _PrimaryRuntime:
         set_storage(storage)
         set_rwlock(rwlock)
 
+        # 2.0.4 (BUG 3b): self-heal a background embed a dead/stuck lazy
+        # worker left pending, before serving any traffic — so a stale
+        # deferred/failed/dead-pid-encoding sentinel never survives an entire
+        # daemon lifetime unnoticed. Runs under the writer lock like any
+        # other synchronous embed-store; guarded so a failure here can never
+        # prevent serve/watch from starting (self_heal_pending_embeddings
+        # itself never raises, but this is cheap insurance).
+        await _self_heal_embeddings_on_startup(data_dir, storage, rwlock)
+
         # Single-flight guard shared with the watcher's global phase so a
         # socket reindex and the watcher can never run two full CPU builds
         # concurrently in this process (G10).
@@ -1470,6 +1558,13 @@ class _PrimaryRuntime:
 
                 await asyncio.shield(_locked_commit())
                 _write_meta(data_dir, repo_path, result, mode="full", reason=reason)
+                if not skip_embeddings:
+                    # 2.0.4 (BUG 2): this daemon reindex just did a synchronous
+                    # embed-store (commit_full_index above) — a stale sentinel
+                    # from an earlier lazy worker run must not survive it.
+                    from synaptiq.core.embeddings.lazy_worker import stamp_inline_complete
+
+                    stamp_inline_complete(data_dir, result.embeddings)
                 return _reindex_stats_json(result, _time.monotonic() - start)
 
             return await rebuild_coordinator.run(_build_and_commit)
