@@ -1231,6 +1231,42 @@ class TestWatch:
         assert result.exit_code == 0
         assert "Watch mode" in _plain(result.output) or "re-index" in _plain(result.output).lower()
 
+    def test_watch_runs_embedding_self_heal_before_watching(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """2.0.4 (BUG 3b) wiring: the standalone `watch` command must
+        self-heal a pending embed before entering its (here, faked-out
+        immediate-return) watch loop — with no rwlock, since nothing else
+        can be touching storage yet at this point in startup."""
+        monkeypatch.chdir(tmp_path)
+        data_dir = tmp_path / ".synaptiq"
+        data_dir.mkdir()
+        meta = {
+            "version": "1.0.0",
+            "stats": {"files": 1, "symbols": 2, "relationships": 3, "embeddings": 0},
+            "last_indexed_at": "2026-07-12T10:00:00+00:00",
+        }
+        (data_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+
+        calls: list[tuple] = []
+
+        async def _fake_self_heal(data_dir_arg, storage_arg, rwlock_arg=None):
+            calls.append((data_dir_arg, rwlock_arg))
+
+        async def _fake_watch_repo(*a, **k):
+            return None  # returns immediately instead of watching forever
+
+        monkeypatch.setattr(
+            "synaptiq.cli.main._init_storage_with_index", lambda *a, **k: MagicMock()
+        )
+        monkeypatch.setattr("synaptiq.cli.main._self_heal_embeddings_on_startup", _fake_self_heal)
+        monkeypatch.setattr("synaptiq.core.ingestion.watcher.watch_repo", _fake_watch_repo)
+
+        result = runner.invoke(app, ["watch"])
+        assert result.exit_code == 0, result.output
+        assert len(calls) == 1
+        assert calls[0] == (data_dir, None)
+
     def test_diff_command_exists(self) -> None:
         """The diff command should be registered."""
         result = runner.invoke(app, ["diff", "--help"])

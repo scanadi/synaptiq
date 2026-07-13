@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 
 from synaptiq.core.embeddings import lazy_worker
+from synaptiq.core.embeddings.embedder import embeddable_node_count
 from synaptiq.core.storage.base import NodeEmbedding
 from synaptiq.core.storage.ladybug_backend import LadybugBackend
 
@@ -558,6 +559,21 @@ class TestSpawn:
 
 
 # ---------------------------------------------------------------------------
+# Store-retry backoff schedule (2.0.4, BUG 3a)
+# ---------------------------------------------------------------------------
+
+
+class TestBackoffSchedule:
+    def test_widened_backoff_sequence(self) -> None:
+        """The original ~7s budget (2, 5) gave up long before a `serve
+        --watch` daemon's own rebuild — which can run for minutes on a large
+        repo — ever released the write lock, so the worker went permanently
+        `deferred` even though the lock was only ever temporarily busy."""
+        assert lazy_worker._STORE_RETRY_BACKOFF == (2.0, 5.0, 15.0, 30.0, 60.0)
+        assert sum(lazy_worker._STORE_RETRY_BACKOFF) >= 100.0
+
+
+# ---------------------------------------------------------------------------
 # pid_alive (2.0.4, BUG 1 / BUG 3b)
 # ---------------------------------------------------------------------------
 
@@ -617,3 +633,123 @@ class TestStampInlineComplete:
         assert state["total"] == 0
 
 
+# ---------------------------------------------------------------------------
+# self_heal_pending_embeddings (2.0.4, BUG 3b)
+# ---------------------------------------------------------------------------
+
+
+class TestSelfHeal:
+    def _open_rw(self, db_path: Path) -> LadybugBackend:
+        storage = LadybugBackend()
+        storage.initialize(db_path, read_only=False)
+        return storage
+
+    def test_noop_without_state_file(self, indexed_repo) -> None:
+        _, data_dir, db_path = indexed_repo
+        storage = self._open_rw(db_path)
+        try:
+            assert lazy_worker.self_heal_pending_embeddings(data_dir, storage) is None
+        finally:
+            storage.close()
+
+    def test_noop_for_complete_state(self, indexed_repo) -> None:
+        _, data_dir, db_path = indexed_repo
+        lazy_worker.write_state(data_dir, "complete", done=3, total=3)
+        storage = self._open_rw(db_path)
+        try:
+            assert lazy_worker.self_heal_pending_embeddings(data_dir, storage) is None
+        finally:
+            storage.close()
+
+    def test_noop_when_encoding_worker_still_alive(self, indexed_repo) -> None:
+        """A live worker (this test's own pid) must never be fought."""
+        _, data_dir, db_path = indexed_repo
+        lazy_worker.write_state(data_dir, "encoding", done=1, total=3, pid=os.getpid())
+        storage = self._open_rw(db_path)
+        try:
+            assert lazy_worker.self_heal_pending_embeddings(data_dir, storage) is None
+            assert storage.load_embeddings() == {}  # nothing touched
+        finally:
+            storage.close()
+        assert lazy_worker.read_state(data_dir)["state"] == "encoding"  # untouched
+
+    def test_noop_when_meta_already_caught_up(self, indexed_repo) -> None:
+        """meta already reflects the vectors the state file was waiting for
+        — nothing pending, so there is nothing to heal."""
+        _, data_dir, db_path = indexed_repo
+        lazy_worker.write_state(data_dir, "deferred", total=3, detail="index locked")
+        lazy_worker._update_meta_embeddings(data_dir, 3, expect_anchor=None)
+        storage = self._open_rw(db_path)
+        try:
+            assert lazy_worker.self_heal_pending_embeddings(data_dir, storage) is None
+        finally:
+            storage.close()
+
+    def test_heals_deferred_state(self, indexed_repo) -> None:
+        repo, data_dir, db_path = indexed_repo
+        storage = self._open_rw(db_path)
+        try:
+            expected_total = embeddable_node_count(storage.load_graph())
+            assert expected_total > 0  # sanity: the fixture repo has embeddable nodes
+            lazy_worker.write_state(
+                data_dir,
+                "deferred",
+                total=expected_total,
+                detail="index locked; re-run `synaptiq analyze` to encode",
+            )
+            healed = lazy_worker.self_heal_pending_embeddings(data_dir, storage)
+            assert healed == expected_total
+            stored = storage.load_embeddings()
+            assert len(stored) == expected_total
+        finally:
+            storage.close()
+        state = lazy_worker.read_state(data_dir)
+        assert state["state"] == "complete"
+        assert state["total"] == expected_total
+        assert _read_meta(data_dir)["stats"]["embeddings"] == expected_total
+
+    def test_heals_failed_state(self, indexed_repo) -> None:
+        repo, data_dir, db_path = indexed_repo
+        storage = self._open_rw(db_path)
+        try:
+            expected_total = embeddable_node_count(storage.load_graph())
+            lazy_worker.write_state(data_dir, "failed", total=expected_total, error="onnx exploded")
+            healed = lazy_worker.self_heal_pending_embeddings(data_dir, storage)
+            assert healed == expected_total
+        finally:
+            storage.close()
+        assert lazy_worker.read_state(data_dir)["state"] == "complete"
+
+    def test_heals_encoding_state_with_dead_pid(self, indexed_repo) -> None:
+        repo, data_dir, db_path = indexed_repo
+        storage = self._open_rw(db_path)
+        try:
+            expected_total = embeddable_node_count(storage.load_graph())
+            lazy_worker.write_state(
+                data_dir, "encoding", done=1, total=expected_total, pid=99999999
+            )
+            healed = lazy_worker.self_heal_pending_embeddings(data_dir, storage)
+            assert healed == expected_total
+        finally:
+            storage.close()
+        assert lazy_worker.read_state(data_dir)["state"] == "complete"
+
+    def test_never_raises_and_leaves_sentinel_on_internal_failure(
+        self, indexed_repo, monkeypatch
+    ) -> None:
+        repo, data_dir, db_path = indexed_repo
+        storage = self._open_rw(db_path)
+        try:
+            expected_total = embeddable_node_count(storage.load_graph())
+            lazy_worker.write_state(data_dir, "deferred", total=expected_total, detail="x")
+
+            def boom(*a, **k):
+                raise RuntimeError("onnx exploded")
+
+            monkeypatch.setattr("synaptiq.core.embeddings.embedder.embed_graph", boom)
+            assert lazy_worker.self_heal_pending_embeddings(data_dir, storage) is None
+        finally:
+            storage.close()
+        # The sentinel is left exactly as it was — the next analyze/worker run
+        # picks it up, same as today's behaviour.
+        assert lazy_worker.read_state(data_dir)["state"] == "deferred"

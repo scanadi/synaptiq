@@ -1038,6 +1038,10 @@ def watch() -> None:
 
     try:
         storage = _init_storage_with_index(repo_path, data_dir)
+        # 2.0.4 (BUG 3b): self-heal a pending embed a dead lazy worker left
+        # behind before watching for changes — no rwlock needed here, nothing
+        # else can be touching storage yet at this point in startup.
+        asyncio.run(_self_heal_embeddings_on_startup(data_dir, storage))
         console.print(f"[bold]Watching[/bold] {repo_path} for changes (Ctrl+C to stop)")
 
         try:
@@ -1209,6 +1213,43 @@ def _init_storage_with_index(repo_path: Path, data_dir: Path, *, output=console)
         _write_meta(data_dir, repo_path, result)
 
     return storage
+
+
+async def _self_heal_embeddings_on_startup(data_dir: Path, storage, rwlock=None) -> None:
+    """Daemon-startup embedding self-heal (2.0.4, BUG 3b) — see
+    ``lazy_worker.self_heal_pending_embeddings`` for the actual reconcile
+    logic; this just wires it into the async daemon lifecycle and reports
+    the outcome. Shared by ``_PrimaryRuntime.start()`` (``serve --watch``,
+    and the proxy-promotion path that reuses it) and the standalone
+    ``watch`` command.
+
+    *rwlock*, when given, is held for the (usually no-op) encode+store the
+    same way any other synchronous embed-store in this codebase is — the
+    standalone ``watch`` command has no rwlock at this point in its startup
+    (nothing else can be touching storage yet), so ``None`` skips it.
+
+    Failures are caught and logged here too, on top of the helper's own
+    internal guard — belt and suspenders: this must never prevent
+    ``serve``/``watch`` from starting.
+    """
+    import asyncio
+    import logging
+
+    from synaptiq.core.embeddings.lazy_worker import self_heal_pending_embeddings
+
+    try:
+        if rwlock is not None:
+            async with rwlock.writer():
+                healed = await asyncio.to_thread(self_heal_pending_embeddings, data_dir, storage)
+        else:
+            healed = await asyncio.to_thread(self_heal_pending_embeddings, data_dir, storage)
+    except Exception:
+        logging.getLogger(__name__).warning("Embedding self-heal failed at startup", exc_info=True)
+        return
+    if healed:
+        _stderr_console.print(
+            f"[green]Self-healed[/green] {healed:,} pending embedding(s) from a previous run."
+        )
 
 
 def _reindex_via_server(
@@ -1414,6 +1455,15 @@ class _PrimaryRuntime:
         rwlock = AsyncRWLock()
         set_storage(storage)
         set_rwlock(rwlock)
+
+        # 2.0.4 (BUG 3b): self-heal a background embed a dead/stuck lazy
+        # worker left pending, before serving any traffic — so a stale
+        # deferred/failed/dead-pid-encoding sentinel never survives an entire
+        # daemon lifetime unnoticed. Runs under the writer lock like any
+        # other synchronous embed-store; guarded so a failure here can never
+        # prevent serve/watch from starting (self_heal_pending_embeddings
+        # itself never raises, but this is cheap insurance).
+        await _self_heal_embeddings_on_startup(data_dir, storage, rwlock)
 
         # Single-flight guard shared with the watcher's global phase so a
         # socket reindex and the watcher can never run two full CPU builds
