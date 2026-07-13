@@ -35,6 +35,27 @@ class EmbeddingsMode(str, Enum):
     off = "off"
 
 
+class EmbeddingModelTier(str, Enum):
+    """Which embedding model `analyze` encodes vectors with (W4.4).
+
+    * ``quality`` (default) — BAAI/bge-small-en-v1.5 (fastembed/ONNX,
+      384-dim). The highest-quality vectors; measured ~235 texts/sec.
+    * ``fast`` — minishlab/potion-base-8M (model2vec static embeddings,
+      256-dim; optional ``synaptiq[fast-embeddings]`` dependency). Measured
+      ~180x faster to encode (~43k texts/sec, no ONNX) at some quality
+      trade-off — suited to CI and low-power machines.
+
+    The two tiers are NOT interchangeable: an index built with one can only
+    be queried with vectors from the same one (see
+    ``LadybugBackend.vector_search``'s dimension guard), so switching tiers
+    on a rebuild always forces a full re-encode rather than mixing vector
+    widths in the same index.
+    """
+
+    quality = "quality"
+    fast = "fast"
+
+
 def _write_meta(data_dir: Path, repo_path: Path, result: object) -> None:
     """Write meta.json with index stats (shared implementation in pipeline)."""
     from synaptiq.core.ingestion.pipeline import write_meta
@@ -224,6 +245,17 @@ def analyze(
         hidden=True,
         help="Deprecated alias for `--embeddings off`.",
     ),
+    embedding_model: EmbeddingModelTier = typer.Option(
+        EmbeddingModelTier.quality,
+        "--embedding-model",
+        help=(
+            "Embedding model tier. quality (default): BAAI/bge-small-en-v1.5, "
+            "384-dim, fastembed/ONNX. fast: minishlab/potion-base-8M, 256-dim, "
+            "model2vec static embeddings — ~180x faster to encode, some quality "
+            "trade-off; requires `synaptiq\\[fast-embeddings]`. Not interchangeable "
+            "with quality — switching tiers forces a full re-encode on this run."
+        ),
+    ),
     profile: bool = typer.Option(
         False, "--profile", help="Print a per-phase timing breakdown after indexing."
     ),
@@ -245,7 +277,12 @@ def analyze(
 ) -> None:
     """Index a repository into a knowledge graph."""
     from synaptiq.core.daemon.lock import LockManager
-    from synaptiq.core.embeddings.embedder import embeddable_node_count, partition_embeddings
+    from synaptiq.core.embeddings.embedder import (
+        DEFAULT_TIER_NAME,
+        embeddable_node_count,
+        ensure_tier_available,
+        partition_embeddings,
+    )
     from synaptiq.core.embeddings.lazy_worker import spawn_lazy_worker
     from synaptiq.core.ingestion.pipeline import (
         PipelineResult,
@@ -279,6 +316,25 @@ def analyze(
     # worker, off skips entirely.
     skip_inline_embeddings = mode is not EmbeddingsMode.sync
 
+    tier_name = embedding_model.value
+    if mode is not EmbeddingsMode.off:
+        # Fail fast, before the (potentially long) pipeline runs, when the
+        # requested tier's optional dependency isn't installed — e.g. `fast`
+        # without `synaptiq[fast-embeddings]`. Skipped for `--embeddings off`
+        # since no encoding happens at all in that mode, so a missing
+        # dependency for a tier the user isn't even using shouldn't block them.
+        try:
+            ensure_tier_available(tier_name)
+        except ImportError as exc:
+            # rich.markup.escape: the message contains a literal
+            # `synaptiq[fast-embeddings]` — unescaped, Rich would parse
+            # "[fast-embeddings]" as a (nonexistent) style tag and silently
+            # drop it from the rendered output instead of printing it.
+            from rich.markup import escape
+
+            _stderr_console.print(f"[red]Error:[/red] {escape(str(exc))}")
+            raise typer.Exit(code=1) from exc
+
     data_dir = repo_path / ".synaptiq"
     data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -299,6 +355,7 @@ def analyze(
                 full=full,
                 skip_embeddings=(mode is EmbeddingsMode.off),
                 profile=profile,
+                embedding_model=tier_name,
             )
             return
         # Stale lock — clean up and retry.
@@ -349,6 +406,7 @@ def analyze(
                 full=full,
                 progress_callback=on_progress,
                 skip_embeddings=skip_inline_embeddings,
+                embedding_tier=tier_name,
             )
 
         # Lazy mode: split into vectors we can reuse immediately (unchanged
@@ -360,12 +418,18 @@ def analyze(
         # previous_embeddings is still empty (first-ever analyze) the
         # partition would find nothing to reuse anyway, so skip straight to
         # the cheap node count — zero added overhead on the cold path.
+        # Passing `tier_name` here matters as much as it does to run_pipeline
+        # above: previous_embeddings may have been built with a different
+        # tier (--embedding-model switched since the last analyze), and
+        # partition_embeddings' tier-salted text_sha comparison is what
+        # makes that switch invalidate reuse instead of mixing vector widths
+        # (see embedder._partition_texts).
         reused_embeddings: list = []
         pending_embeddings = 0
         if mode is EmbeddingsMode.lazy:
             if previous_embeddings:
                 reused_embeddings, pending_embeddings = partition_embeddings(
-                    graph, previous_embeddings
+                    graph, previous_embeddings, tier=tier_name
                 )
                 if reused_embeddings:
                     storage.store_embeddings(reused_embeddings)
@@ -392,7 +456,8 @@ def analyze(
         if result.coupled_pairs > 0:
             console.print(f"  Coupled pairs:  {result.coupled_pairs}")
         if result.embeddings > 0:
-            console.print(f"  Embeddings:     {result.embeddings}")
+            tier_suffix = f" ({tier_name})" if tier_name != DEFAULT_TIER_NAME else ""
+            console.print(f"  Embeddings:     {result.embeddings}{tier_suffix}")
         console.print(f"  Duration:       {result.duration_seconds:.2f}s")
 
         if profile and result.phase_timings:
@@ -481,7 +546,16 @@ def _format_embeddings_status(data_dir: Path, stats: dict) -> str | None:
             count = stats.get("embeddings", state.get("total", 0))
             return f"{count:,} (complete)"
         if kind == "failed":
-            return f"[red]failed[/red]: {state.get('error', 'unknown error')}"
+            # rich.markup.escape: `error` is str(exc) from an arbitrary
+            # worker-side failure — e.g. the fast-tier's missing-dependency
+            # message contains a literal `synaptiq[fast-embeddings]`, which
+            # unescaped Rich would parse as a (nonexistent) style tag and
+            # silently drop instead of printing (see the `analyze` command's
+            # own ensure_tier_available error handling for the same fix).
+            from rich.markup import escape
+
+            error_text = escape(str(state.get("error", "unknown error")))
+            return f"[red]failed[/red]: {error_text}"
         if kind == "deferred":
             detail = state.get("detail", "re-run `synaptiq analyze` to encode")
             return f"[yellow]deferred[/yellow] ({detail})"
@@ -856,7 +930,12 @@ def _init_storage_with_index(repo_path: Path, data_dir: Path, *, output=console)
 
 
 def _reindex_via_server(
-    socket_path: str, *, full: bool = True, skip_embeddings: bool = False, profile: bool = False
+    socket_path: str,
+    *,
+    full: bool = True,
+    skip_embeddings: bool = False,
+    profile: bool = False,
+    embedding_model: str | None = None,
 ) -> None:
     """Send a reindex request to a running synaptiq server via its Unix socket."""
     import asyncio
@@ -867,7 +946,9 @@ def _reindex_via_server(
         client = SocketClient(Path(socket_path))
         await client.connect()
         try:
-            return await client.reindex(full=full, skip_embeddings=skip_embeddings)
+            return await client.reindex(
+                full=full, skip_embeddings=skip_embeddings, embedding_model=embedding_model
+            )
         finally:
             await client.close()
 
@@ -1104,6 +1185,10 @@ class _PrimaryRuntime:
                     full=params.get("full", True),
                     skip_embeddings=skip_embeddings,
                     previous_embeddings=previous,
+                    # An explicit override from a socket-delegated `analyze
+                    # --embedding-model` (W4.4); None re-derives from
+                    # meta.json, same as the watcher's own routine rebuilds.
+                    tier=params.get("embedding_model"),
                 )
 
                 async def _locked_commit() -> None:

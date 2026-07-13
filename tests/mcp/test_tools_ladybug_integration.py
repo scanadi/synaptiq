@@ -151,7 +151,7 @@ def storage(tmp_path_factory: pytest.TempPathFactory) -> LadybugBackend:
 def _no_query_embedding(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep handle_query hermetic — no embedding model download."""
     monkeypatch.setattr(
-        "synaptiq.mcp.tools._get_query_embedding", lambda _q: None
+        "synaptiq.mcp.tools._get_query_embedding", lambda _q, _s: None
     )
 
 

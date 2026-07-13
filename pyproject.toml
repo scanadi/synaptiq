@@ -56,6 +56,12 @@ neo4j = ["neo4j>=5.0.0"]
 # core dependency, so `synaptiq[fast-load]` is redundant but kept so existing
 # install commands / lockfiles don't break. See W2.3 / W4.1.
 fast-load = []
+# The "fast" embedding tier (`analyze --embedding-model fast`): model2vec static
+# embeddings (minishlab/potion-base-8M, 256-dim) measured ~180x faster to encode
+# than the default fastembed/ONNX "quality" tier, and the package pulls in only
+# numpy + tokenizers + safetensors — no torch, no onnxruntime — so it stays an
+# opt-in extra rather than a core dependency (W4.4).
+fast-embeddings = ["model2vec>=0.8.0,<1.0"]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",

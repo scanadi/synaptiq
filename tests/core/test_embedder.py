@@ -1,27 +1,39 @@
-"""Tests for the batch embedding pipeline (Task 24).
+"""Tests for the batch embedding pipeline (Task 24) and the W4.4 tier registry.
 
 Verifies that ``embed_graph`` correctly:
 - Filters nodes to only embeddable labels (skipping Folder, Community, Process)
 - Generates text via ``generate_text`` for each eligible node
-- Passes texts through fastembed's ``TextEmbedding`` model in batches
+- Passes texts through the selected tier's model in batches
 - Returns properly structured ``NodeEmbedding`` objects
-- Handles edge cases: empty graphs, custom model names, batch sizes
+- Handles edge cases: empty graphs, tier selection, batch sizes
 
-IMPORTANT: All tests mock ``TextEmbedding`` to avoid slow model downloads.
+IMPORTANT: All tests mock ``TextEmbedding``/``StaticModel`` to avoid slow
+model downloads, EXCEPT the ``TestFastTierRealModel2Vec`` class, which
+exercises the real (lightweight, no-ONNX) model2vec package end-to-end —
+see its docstring.
 """
 
 from __future__ import annotations
 
+import json
+import sys
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 
 from synaptiq.core.embeddings.embedder import (
+    DEFAULT_TIER_NAME,
     EMBEDDABLE_LABELS,
+    MODEL_TIERS,
+    _check_model2vec_available,
     _get_model,
     embed_graph,
+    encode_query,
+    ensure_tier_available,
     partition_embeddings,
+    resolve_tier,
+    tier_from_meta,
 )
 from synaptiq.core.graph.graph import KnowledgeGraph
 from synaptiq.core.graph.model import GraphNode, NodeLabel
@@ -374,20 +386,24 @@ class TestEmbedGraphModelConfig:
             model_name="BAAI/bge-small-en-v1.5", threads=_expected_threads()
         )
 
-    @patch("fastembed.TextEmbedding")
-    def test_custom_model_name(self, mock_te_cls: MagicMock, sample_graph: KnowledgeGraph) -> None:
-        """A custom model name is forwarded to TextEmbedding."""
+    @patch("model2vec.StaticModel")
+    def test_fast_tier_loads_model2vec(
+        self, mock_static_cls: MagicMock, sample_graph: KnowledgeGraph
+    ) -> None:
+        """tier="fast" dispatches to model2vec.StaticModel, not fastembed."""
         mock_model = MagicMock()
-        mock_model.embed.return_value = iter(
-            [np.array([0.1, 0.2, 0.3]), np.array([0.4, 0.5, 0.6])]
-        )
-        mock_te_cls.return_value = mock_model
+        mock_model.encode.return_value = np.array([[0.1, 0.2], [0.4, 0.5]])
+        mock_static_cls.from_pretrained.return_value = mock_model
 
-        embed_graph(sample_graph, model_name="BAAI/bge-base-en-v1.5")
+        embed_graph(sample_graph, tier="fast")
 
-        mock_te_cls.assert_called_once_with(
-            model_name="BAAI/bge-base-en-v1.5", threads=_expected_threads()
-        )
+        mock_static_cls.from_pretrained.assert_called_once_with("minishlab/potion-base-8M")
+
+    def test_unknown_tier_raises(self, sample_graph: KnowledgeGraph) -> None:
+        """An unrecognised tier name raises ValueError rather than silently
+        falling back to a different tier than the caller asked for."""
+        with pytest.raises(ValueError, match="Unknown embedding tier"):
+            embed_graph(sample_graph, tier="ultra-quality")
 
     @patch("fastembed.TextEmbedding")
     def test_custom_batch_size_passed_to_embed(
@@ -721,3 +737,324 @@ class TestPartitionEmbeddings:
         assert pending_count == 2
         assert len(reused) == embeddable_count - 2
         assert len(reused) + pending_count == embeddable_count
+
+
+# ---------------------------------------------------------------------------
+# Tests — model tier registry (W4.4)
+# ---------------------------------------------------------------------------
+
+
+class TestModelTierRegistry:
+    """resolve_tier / MODEL_TIERS / DEFAULT_TIER_NAME."""
+
+    def test_default_tier_name_is_quality(self) -> None:
+        assert DEFAULT_TIER_NAME == "quality"
+
+    def test_registry_has_quality_and_fast(self) -> None:
+        assert set(MODEL_TIERS) == {"quality", "fast"}
+
+    def test_tier_name_matches_its_own_dict_key(self) -> None:
+        """Registry invariant other code relies on — e.g. meta.json's
+        stats.embedding_model stores tier.name directly as the dict key,
+        so a mismatch here would silently break tier_from_meta lookups."""
+        for key, tier in MODEL_TIERS.items():
+            assert tier.name == key
+
+    def test_quality_tier_shape(self) -> None:
+        tier = MODEL_TIERS["quality"]
+        assert tier.model_id == "BAAI/bge-small-en-v1.5"
+        assert tier.dim == 384
+        assert tier.backend == "fastembed"
+
+    def test_fast_tier_shape(self) -> None:
+        tier = MODEL_TIERS["fast"]
+        assert tier.model_id == "minishlab/potion-base-8M"
+        assert tier.dim == 256
+        assert tier.backend == "model2vec"
+
+    def test_quality_and_fast_have_different_dims(self) -> None:
+        """The whole point of the dimension guard downstream — if these
+        ever matched, LadybugBackend.vector_search's mismatch check would
+        never fire and a tier switch could silently mix vector widths."""
+        assert MODEL_TIERS["quality"].dim != MODEL_TIERS["fast"].dim
+
+    def test_resolve_none_returns_default(self) -> None:
+        assert resolve_tier(None).name == DEFAULT_TIER_NAME
+
+    def test_resolve_empty_string_returns_default(self) -> None:
+        assert resolve_tier("").name == DEFAULT_TIER_NAME
+
+    def test_resolve_known_name(self) -> None:
+        assert resolve_tier("fast").name == "fast"
+        assert resolve_tier("quality").name == "quality"
+
+    def test_resolve_unknown_name_raises(self) -> None:
+        with pytest.raises(ValueError, match="Unknown embedding tier"):
+            resolve_tier("nonexistent")
+
+    def test_resolve_unknown_name_lists_choices(self) -> None:
+        with pytest.raises(ValueError, match="fast") as exc_info:
+            resolve_tier("nonexistent")
+        assert "quality" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# Tests — tier_from_meta (reading the persisted tier back from meta.json)
+# ---------------------------------------------------------------------------
+
+
+class TestTierFromMeta:
+    """Resolves the tier an index was built with — never raises."""
+
+    def test_none_data_dir_returns_default(self) -> None:
+        assert tier_from_meta(None).name == DEFAULT_TIER_NAME
+
+    def test_missing_meta_json_returns_default(self, tmp_path) -> None:
+        assert tier_from_meta(tmp_path).name == DEFAULT_TIER_NAME
+
+    def test_nonexistent_data_dir_returns_default(self, tmp_path) -> None:
+        assert tier_from_meta(tmp_path / "does-not-exist").name == DEFAULT_TIER_NAME
+
+    def test_reads_persisted_fast_tier(self, tmp_path) -> None:
+        (tmp_path / "meta.json").write_text(json.dumps({"stats": {"embedding_model": "fast"}}))
+        assert tier_from_meta(tmp_path).name == "fast"
+
+    def test_reads_persisted_quality_tier(self, tmp_path) -> None:
+        (tmp_path / "meta.json").write_text(
+            json.dumps({"stats": {"embedding_model": "quality"}})
+        )
+        assert tier_from_meta(tmp_path).name == "quality"
+
+    def test_unknown_tier_in_meta_falls_back_to_default(self, tmp_path) -> None:
+        """A tier name from a future synaptiq version this build doesn't
+        know about (or a hand-edited meta.json) degrades gracefully rather
+        than crashing the query path."""
+        (tmp_path / "meta.json").write_text(
+            json.dumps({"stats": {"embedding_model": "ultra-2027"}})
+        )
+        assert tier_from_meta(tmp_path).name == DEFAULT_TIER_NAME
+
+    def test_missing_stats_key_returns_default(self, tmp_path) -> None:
+        (tmp_path / "meta.json").write_text(json.dumps({"version": "1.0"}))
+        assert tier_from_meta(tmp_path).name == DEFAULT_TIER_NAME
+
+    def test_corrupt_json_returns_default(self, tmp_path) -> None:
+        (tmp_path / "meta.json").write_text("{not valid json")
+        assert tier_from_meta(tmp_path).name == DEFAULT_TIER_NAME
+
+
+# ---------------------------------------------------------------------------
+# Tests — tier switch invalidates text_sha reuse (W4.4)
+# ---------------------------------------------------------------------------
+
+
+class TestTierSwitchInvalidatesReuse:
+    """A different tier must never reuse another tier's vectors — they have
+    different widths, so "reusing" one across a tier switch would corrupt
+    the Embedding table's single FLOAT[dim] column (the store path always
+    (re)creates that column at the width of whatever it's given — see
+    ladybug_backend.store_embeddings). embedder._partition_texts salts
+    text_sha with the tier's model id specifically to prevent this.
+    """
+
+    @patch("fastembed.TextEmbedding")
+    def test_switching_quality_to_fast_reuses_nothing(
+        self, mock_te_cls: MagicMock, sample_graph: KnowledgeGraph
+    ) -> None:
+        mock_model = MagicMock()
+        mock_model.embed.return_value = iter(
+            [np.array([0.1, 0.2, 0.3]), np.array([0.4, 0.5, 0.6])]
+        )
+        mock_te_cls.return_value = mock_model
+
+        quality_first = embed_graph(sample_graph, tier="quality")
+        previous = {e.node_id: (e.text_sha, e.embedding) for e in quality_first}
+
+        reused, pending_count = partition_embeddings(sample_graph, previous, tier="fast")
+
+        assert reused == []
+        assert pending_count == len(quality_first) == 2
+
+    @patch("model2vec.StaticModel")
+    def test_switching_fast_to_quality_reuses_nothing(
+        self, mock_static_cls: MagicMock, sample_graph: KnowledgeGraph
+    ) -> None:
+        mock_model = MagicMock()
+        mock_model.encode.return_value = np.array([[0.1, 0.2], [0.4, 0.5]])
+        mock_static_cls.from_pretrained.return_value = mock_model
+
+        fast_first = embed_graph(sample_graph, tier="fast")
+        previous = {e.node_id: (e.text_sha, e.embedding) for e in fast_first}
+
+        reused, pending_count = partition_embeddings(sample_graph, previous, tier="quality")
+
+        assert reused == []
+        assert pending_count == len(fast_first) == 2
+
+    @patch("fastembed.TextEmbedding")
+    def test_same_tier_still_reuses(
+        self, mock_te_cls: MagicMock, sample_graph: KnowledgeGraph
+    ) -> None:
+        """Regression guard: the tier salt must not break normal same-tier
+        reuse — only an actual tier CHANGE should invalidate it."""
+        mock_model = MagicMock()
+        mock_model.embed.return_value = iter(
+            [np.array([0.1, 0.2, 0.3]), np.array([0.4, 0.5, 0.6])]
+        )
+        mock_te_cls.return_value = mock_model
+
+        first = embed_graph(sample_graph, tier="quality")
+        previous = {e.node_id: (e.text_sha, e.embedding) for e in first}
+
+        reused, pending_count = partition_embeddings(sample_graph, previous, tier="quality")
+
+        assert pending_count == 0
+        assert len(reused) == len(first)
+
+    @patch("fastembed.TextEmbedding")
+    def test_default_tier_arg_matches_explicit_quality(
+        self, mock_te_cls: MagicMock, sample_graph: KnowledgeGraph
+    ) -> None:
+        """Omitting `tier` (defaults to "quality") and passing tier="quality"
+        explicitly must salt identically — the default is not a distinct
+        pseudo-tier that also invalidates reuse."""
+        mock_model = MagicMock()
+        mock_model.embed.return_value = iter(
+            [np.array([0.1, 0.2, 0.3]), np.array([0.4, 0.5, 0.6])]
+        )
+        mock_te_cls.return_value = mock_model
+
+        first = embed_graph(sample_graph)  # no tier= at all
+        previous = {e.node_id: (e.text_sha, e.embedding) for e in first}
+
+        reused, pending_count = partition_embeddings(sample_graph, previous, tier="quality")
+
+        assert pending_count == 0
+        assert len(reused) == len(first)
+
+
+# ---------------------------------------------------------------------------
+# Tests — missing optional dependency (model2vec) error path (W4.4)
+# ---------------------------------------------------------------------------
+
+
+class TestMissingModel2VecDependency:
+    """Simulates model2vec not being installed via ``sys.modules``.
+
+    Setting a module name to ``None`` in ``sys.modules`` is the standard way
+    to make ``import X`` raise ``ImportError`` even though the package is
+    actually installed (see the ``importlib`` docs) — so these tests
+    exercise the real "not installed" branch without needing a separate,
+    dependency-stripped virtualenv.
+    """
+
+    def test_ensure_tier_available_quality_never_raises(self) -> None:
+        """fastembed (quality's backend) is a core dependency — nothing to
+        check, regardless of whether model2vec happens to be installed."""
+        ensure_tier_available("quality")  # must not raise
+
+    def test_ensure_tier_available_fast_raises_when_missing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setitem(sys.modules, "model2vec", None)
+        with pytest.raises(ImportError, match="fast-embeddings"):
+            ensure_tier_available("fast")
+
+    def test_get_model_fast_raises_when_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setitem(sys.modules, "model2vec", None)
+        with pytest.raises(ImportError, match="fast-embeddings"):
+            _get_model("fast")
+
+    def test_embed_graph_fast_raises_when_missing(
+        self, monkeypatch: pytest.MonkeyPatch, sample_graph: KnowledgeGraph
+    ) -> None:
+        monkeypatch.setitem(sys.modules, "model2vec", None)
+        with pytest.raises(ImportError, match="fast-embeddings"):
+            embed_graph(sample_graph, tier="fast")
+
+    def test_error_message_is_actionable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setitem(sys.modules, "model2vec", None)
+        with pytest.raises(ImportError) as exc_info:
+            _check_model2vec_available("fast")
+        message = str(exc_info.value)
+        assert "pip install" in message
+        assert "synaptiq[fast-embeddings]" in message
+        assert "'fast'" in message
+
+    def test_partition_embeddings_never_touches_model2vec(
+        self, monkeypatch: pytest.MonkeyPatch, sample_graph: KnowledgeGraph
+    ) -> None:
+        """partition_embeddings only compares text_sha — it must not load
+        any model, so a missing model2vec must not break it even when
+        tier="fast" is requested (the caller only wants to know what
+        changed, not to encode anything yet)."""
+        monkeypatch.setitem(sys.modules, "model2vec", None)
+        reused, pending_count = partition_embeddings(sample_graph, tier="fast")
+        assert reused == []
+        assert pending_count == 2
+
+    def test_recovers_after_dependency_becomes_available(self) -> None:
+        """lru_cache must not poison _get_model with a cached failure —
+        confirms a subsequent call can still succeed (e.g. a later test, or
+        a `pip install` performed mid-session)."""
+        _get_model.cache_clear()
+        with patch("model2vec.StaticModel") as mock_static_cls:
+            mock_static_cls.from_pretrained.return_value = MagicMock()
+            _get_model("fast")
+            mock_static_cls.from_pretrained.assert_called_once_with("minishlab/potion-base-8M")
+
+
+# ---------------------------------------------------------------------------
+# Tests — real model2vec end-to-end (no mocking) — W4.4 spike verification
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def real_fast_model() -> None:
+    """Skip this class when potion-base-8M can't be loaded (offline CI, no
+    cached weights) — mirrors tests/e2e/test_lazy_embeddings.py's
+    `embedding_model` fixture, which does the same for the "quality" tier.
+    """
+    try:
+        from model2vec import StaticModel
+
+        StaticModel.from_pretrained("minishlab/potion-base-8M")
+    except Exception as exc:  # pragma: no cover - environment dependent
+        pytest.skip(f"model2vec fast-tier model unavailable: {exc}")
+
+
+class TestFastTierRealModel2Vec:
+    """Exercises the real model2vec package end-to-end — no mocking.
+
+    model2vec is pure Python + numpy (no torch, no onnxruntime — confirmed
+    by the W4.4 spike), so unlike fastembed/ONNX it is cheap enough to run
+    for real in the unit test suite instead of always mocking it.
+    """
+
+    def test_real_encode_returns_256dim_normalized_vectors(
+        self, real_fast_model: None, sample_graph: KnowledgeGraph
+    ) -> None:
+        results = embed_graph(sample_graph, tier="fast")
+
+        assert len(results) == 2  # function + class in sample_graph
+        for r in results:
+            assert len(r.embedding) == 256
+            norm = sum(v * v for v in r.embedding) ** 0.5
+            assert norm == pytest.approx(1.0, abs=1e-3)
+
+    def test_real_encode_is_deterministic(
+        self, real_fast_model: None, sample_graph: KnowledgeGraph
+    ) -> None:
+        """Same text -> same vector: static embeddings have no dropout or
+        sampling, unlike a stateful ONNX session this needs no seeding."""
+        first = embed_graph(sample_graph, tier="fast")
+        _get_model.cache_clear()
+        second = embed_graph(sample_graph, tier="fast")
+
+        assert {e.node_id: e.embedding for e in first} == {
+            e.node_id: e.embedding for e in second
+        }
+
+    def test_real_encode_query_matches_registered_dim(self, real_fast_model: None) -> None:
+        vector = encode_query("fast", "a search query about authentication")
+        assert len(vector) == MODEL_TIERS["fast"].dim == 256

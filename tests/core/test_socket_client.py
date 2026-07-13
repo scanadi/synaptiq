@@ -98,6 +98,58 @@ class TestSocketClient:
         assert await client.ping() is True
 
 
+class TestSocketClientReindex:
+    """SocketClient.reindex forwards an embedding-tier override (W4.4) — an
+    `analyze --embedding-model` delegated to a running `serve --watch`
+    primary must not silently ignore the flag."""
+
+    async def test_reindex_sends_embedding_model(self, socket_path: Path) -> None:
+        import json
+
+        received: dict = {}
+
+        async def reindex_handler(params: dict) -> str:
+            received.update(params)
+            return json.dumps({"stats": {}})
+
+        srv = SocketServer(socket_path, mock_dispatch, async_handlers={"reindex": reindex_handler})
+        await srv.start()
+        cli = SocketClient(socket_path)
+        await cli.connect()
+        try:
+            await cli.reindex(full=True, skip_embeddings=False, embedding_model="fast")
+        finally:
+            await cli.close()
+            await srv.stop()
+
+        assert received["embedding_model"] == "fast"
+        assert received["full"] is True
+        assert received["skip_embeddings"] is False
+
+    async def test_reindex_defaults_embedding_model_to_none(self, socket_path: Path) -> None:
+        """None means "no override" — the primary self-derives the tier
+        from meta.json, same as its own routine watcher-triggered rebuilds."""
+        import json
+
+        received: dict = {}
+
+        async def reindex_handler(params: dict) -> str:
+            received.update(params)
+            return json.dumps({"stats": {}})
+
+        srv = SocketServer(socket_path, mock_dispatch, async_handlers={"reindex": reindex_handler})
+        await srv.start()
+        cli = SocketClient(socket_path)
+        await cli.connect()
+        try:
+            await cli.reindex()
+        finally:
+            await cli.close()
+            await srv.stop()
+
+        assert received["embedding_model"] is None
+
+
 def _alive_lock_info(socket: Path) -> LockInfo:
     return LockInfo(
         pid=os.getpid(),

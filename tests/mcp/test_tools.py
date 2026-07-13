@@ -173,6 +173,119 @@ class TestHandleQuery:
 
 
 # ---------------------------------------------------------------------------
+# 2b. _get_query_embedding tier resolution (W4.4)
+# ---------------------------------------------------------------------------
+
+
+class TestGetQueryEmbedding:
+    """_get_query_embedding resolves the tier from storage.data_dir and
+    encodes the query with the matching model — an index built with "fast"
+    must never be queried with "quality" vectors, and vice versa."""
+
+    def test_uses_default_tier_when_data_dir_none(self, monkeypatch):
+        from synaptiq.mcp.tools import _get_query_embedding
+
+        calls = []
+        monkeypatch.setattr(
+            "synaptiq.core.embeddings.embedder.encode_query",
+            lambda tier, text: calls.append((tier, text)) or [0.1] * 384,
+        )
+        storage = MagicMock()
+        storage.data_dir = None
+
+        result = _get_query_embedding("hello", storage)
+
+        assert result == [0.1] * 384
+        assert calls == [("quality", "hello")]
+
+    def test_uses_tier_persisted_in_meta_json(self, tmp_path, monkeypatch):
+        from synaptiq.mcp.tools import _get_query_embedding
+
+        (tmp_path / "meta.json").write_text(json.dumps({"stats": {"embedding_model": "fast"}}))
+        calls = []
+        monkeypatch.setattr(
+            "synaptiq.core.embeddings.embedder.encode_query",
+            lambda tier, text: calls.append((tier, text)) or [0.2] * 256,
+        )
+        storage = MagicMock()
+        storage.data_dir = tmp_path
+
+        result = _get_query_embedding("hello", storage)
+
+        assert result == [0.2] * 256
+        assert calls == [("fast", "hello")]
+
+    def test_storage_without_data_dir_falls_back_to_default_tier(self, monkeypatch):
+        """A backend that doesn't expose `data_dir` at all — duck-typed,
+        not every StorageBackend implementation has a filesystem concept —
+        must not crash; getattr(..., None) degrades to the default tier."""
+        from synaptiq.mcp.tools import _get_query_embedding
+
+        class _NoDataDirStorage:
+            pass
+
+        calls = []
+        monkeypatch.setattr(
+            "synaptiq.core.embeddings.embedder.encode_query",
+            lambda tier, text: calls.append(tier) or [0.3],
+        )
+
+        result = _get_query_embedding("hello", _NoDataDirStorage())
+
+        assert result == [0.3]
+        assert calls == ["quality"]
+
+    def test_returns_none_on_encode_failure(self, monkeypatch):
+        from synaptiq.mcp.tools import _get_query_embedding
+
+        def _boom(tier, text):
+            raise RuntimeError("model unavailable")
+
+        monkeypatch.setattr("synaptiq.core.embeddings.embedder.encode_query", _boom)
+        storage = MagicMock()
+        storage.data_dir = None
+
+        assert _get_query_embedding("hello", storage) is None
+
+
+# ---------------------------------------------------------------------------
+# 2c. handle_query surfaces the vector-search dimension guard (W4.4)
+# ---------------------------------------------------------------------------
+
+
+class TestHandleQueryDimensionMismatch:
+    """storage.vector_search raises RuntimeError on a tier/dimension
+    mismatch (see LadybugBackend) — handle_query must surface it as the
+    tool's text result rather than letting it propagate, matching
+    handle_cypher's existing error-to-text pattern."""
+
+    def test_dimension_mismatch_becomes_friendly_text(self, mock_storage, monkeypatch):
+        monkeypatch.setattr("synaptiq.mcp.tools._get_query_embedding", lambda q, s: [0.1] * 384)
+        mock_storage.vector_search.side_effect = RuntimeError(
+            "Query embedding is 384-dim but the stored index holds 256-dim vectors "
+            "(it was likely built with a different --embedding-model tier). "
+            "Re-run `synaptiq analyze` to rebuild the index, or query with the "
+            "matching tier."
+        )
+
+        result = handle_query(mock_storage, "validate")
+
+        assert "384-dim" in result
+        assert "256-dim" in result
+        assert "synaptiq analyze" in result
+
+    def test_no_embedding_never_reaches_vector_search(self, mock_storage, monkeypatch):
+        """When the query embedding itself is unavailable (None), hybrid
+        search must not even attempt vector_search — keyword-only results,
+        no mismatch possible."""
+        monkeypatch.setattr("synaptiq.mcp.tools._get_query_embedding", lambda q, s: None)
+
+        handle_query(mock_storage, "validate")
+
+        mock_storage.vector_search.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # 3. synaptiq_context
 # ---------------------------------------------------------------------------
 

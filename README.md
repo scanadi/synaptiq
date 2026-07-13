@@ -85,7 +85,8 @@ Synaptiq doesn't just parse your code — it builds a deep structural understand
 Three search strategies fused with Reciprocal Rank Fusion:
 
 - **BM25 full-text search** — fast exact name and keyword matching via LadybugDB FTS
-- **Semantic vector search** — conceptual queries via 384-dim embeddings (BAAI/bge-small-en-v1.5)
+- **Semantic vector search** — conceptual queries via embeddings; two selectable model tiers
+  (see "Embedding model tiers" below), 384-dim `quality` (default) or 256-dim `fast`
 - **Fuzzy name search** — Levenshtein fallback for typos and partial matches
 
 Test files are automatically down-ranked (0.5x), source-level functions/classes boosted (1.2x).
@@ -195,6 +196,9 @@ uv add synaptiq
 
 # With Neo4j backend support
 pip install synaptiq[neo4j]
+
+# With the fast embedding tier (--embedding-model fast)
+pip install synaptiq[fast-embeddings]
 ```
 
 Requires **Python 3.11+**.
@@ -259,6 +263,11 @@ synaptiq analyze [PATH]          Index a repository (default: current directory)
                                   encode vectors in the background; sync: encode
                                   inline before returning; off: skip vectors.
                                   (--no-embeddings is a deprecated alias for off.)
+    --embedding-model TIER       quality (default): BAAI/bge-small-en-v1.5, 384-dim,
+                                  fastembed/ONNX. fast: minishlab/potion-base-8M,
+                                  256-dim, model2vec static embeddings — ~180x faster
+                                  to encode; requires `synaptiq[fast-embeddings]`. See
+                                  "Embedding model tiers" below.
     --jobs / -j N                Cap LadybugDB threads, ONNX embedding threads,
                                   and walk/parse worker pools to N (0 = explicit
                                   all-cores). See "CPU usage" below.
@@ -342,6 +351,47 @@ synaptiq status               # → Embeddings: encoding 12,431/26,203
   everything: only symbols whose text actually changed hit the ONNX model, so
   a small edit re-encodes a handful of vectors in the background — or none at
   all, in which case no background worker even starts.
+
+### Embedding model tiers (`--embedding-model`)
+
+Two named tiers trade encode speed for representation quality — pick whichever
+fits the machine you're indexing on:
+
+| Tier | Model | Dim | Backend | Measured encode rate\* | Dependency |
+|------|-------|-----|---------|-------------------------|------------|
+| `quality` (default) | BAAI/bge-small-en-v1.5 | 384 | fastembed/ONNX | ~235 texts/sec | core (`fastembed`) |
+| `fast` | minishlab/potion-base-8M | 256 | [model2vec](https://github.com/MinishLab/model2vec) (static embeddings) | ~43,000 texts/sec (~180x) | `synaptiq[fast-embeddings]` |
+
+\* CPU, single-threaded, measured on ~2k synthetic code-description texts of the
+shape `embed_graph` generates. `fast` has no transformer forward pass at all
+(token lookup + mean-pool, no ONNX) — it trades some retrieval quality for an
+order-of-magnitude speedup, which matters most on CI runners and low-power
+machines where even a lightweight ONNX session is expensive.
+
+```bash
+# Install the optional fast-tier dependency (pure Python + numpy — no torch,
+# no onnxruntime):
+uv sync --extra fast-embeddings          # or: pip install 'synaptiq[fast-embeddings]'
+
+synaptiq analyze . --embedding-model fast
+```
+
+- The tier is **recorded per index** (`meta.json`'s `stats.embedding_model`) —
+  every later `analyze`, background worker cycle, and query automatically uses
+  the same model the index was built with. A query is never encoded with a
+  different tier than the one that produced the stored vectors (they have
+  different vector widths — LadybugDB raises a clear error, telling you to
+  re-analyze, rather than silently returning wrong or zero results).
+- Omitting `--embedding-model` always defaults to `quality`, even on a repo
+  previously indexed with `fast` — pass the flag explicitly on every `analyze`
+  call if you want to stay on `fast`.
+- Switching tiers always forces a **full re-encode** on that run: vectors from
+  one tier are never reused for another (they're different-width, differently
+  distilled models), so cached-vector reuse (see above) intentionally treats a
+  tier switch like every symbol's text changed at once.
+- `serve --watch` has no per-cycle flag — its routine rebuilds and the
+  `analyze --embeddings lazy` background worker always keep using whatever
+  tier the index's `meta.json` already records.
 
 ---
 
@@ -671,7 +721,7 @@ flowchart TB
 | Parsing | [tree-sitter](https://tree-sitter.github.io/) | Language-agnostic AST extraction |
 | Graph Storage | [LadybugDB](https://ladybugdb.com/) | Embedded graph database (KuzuDB successor) with Cypher, FTS, and vector support |
 | Graph Algorithms | [igraph](https://igraph.org/) + [leidenalg](https://leidenalg.readthedocs.io/) | Leiden community detection |
-| Embeddings | [fastembed](https://github.com/qdrant/fastembed) | ONNX-based 384-dim vectors (~100MB, no PyTorch) |
+| Embeddings | [fastembed](https://github.com/qdrant/fastembed) (`quality`) / [model2vec](https://github.com/MinishLab/model2vec) (`fast`, optional) | ONNX 384-dim vectors, or static (no-ONNX) 256-dim vectors ~180x faster to encode — see "Embedding model tiers" |
 | MCP Protocol | [mcp SDK](https://modelcontextprotocol.io/) | AI agent communication via stdio and HTTP |
 | CLI | [Typer](https://typer.tiangolo.com/) + [Rich](https://rich.readthedocs.io/) | Terminal interface with progress bars |
 | File Watching | [watchfiles](https://github.com/samuelcolvin/watchfiles) | Rust-based file system watcher |

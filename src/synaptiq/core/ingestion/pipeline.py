@@ -31,6 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from synaptiq.config.ignore import load_gitignore
+from synaptiq.core.embeddings.embedder import DEFAULT_TIER_NAME
 from synaptiq.core.graph.graph import KnowledgeGraph
 from synaptiq.core.graph.model import NodeLabel
 from synaptiq.core.ingestion.calls import process_calls
@@ -66,6 +67,15 @@ class PipelineResult:
     coupled_pairs: int = 0
     rest_links: int = 0
     embeddings: int = 0
+    # Embedding tier name ("quality" / "fast") this run encoded (or would
+    # encode) with, set unconditionally from run_pipeline's `embedding_tier`
+    # argument (default "quality") — persisted into meta.json's
+    # stats.embedding_model by write_meta so the query side and later
+    # rebuilds know which model produced the stored vectors (W4.4). Set even
+    # on a run that skipped embedding generation entirely (e.g. `analyze
+    # --embeddings off`): the Embedding table ends up empty in that case, so
+    # there is nothing stored to mismatch it against.
+    embedding_model: str = ""
     duration_seconds: float = 0.0
     incremental: bool = False
     changed_files: int = 0
@@ -90,6 +100,7 @@ def run_pipeline(
     full: bool = False,
     progress_callback: Callable[[str, float], None] | None = None,
     skip_embeddings: bool = False,
+    embedding_tier: str = DEFAULT_TIER_NAME,
 ) -> tuple[KnowledgeGraph, PipelineResult]:
     """Run phases 1-11 of the ingestion pipeline.
 
@@ -113,6 +124,15 @@ def run_pipeline(
     skip_embeddings:
         When ``True``, skip embedding generation after storage loading.
         Useful for faster iteration when vector search is not needed.
+    embedding_tier:
+        Embedding tier name (``"quality"`` or ``"fast"``, see
+        ``core/embeddings/embedder.py``) to encode with when *storage* is
+        given and *skip_embeddings* is ``False``. Ignored otherwise.
+        Recorded into ``result.embedding_model`` regardless, so
+        :func:`write_meta` persists the caller's requested tier even on a
+        run that didn't itself encode (e.g. ``--embeddings off``) — the
+        Embedding table ends up empty in that case, so there is nothing to
+        mismatch it against.
 
     Returns
     -------
@@ -230,6 +250,8 @@ def run_pipeline(
             git_future.cancel()
         git_log_executor.shutdown(wait=False, cancel_futures=True)
 
+    result.embedding_model = embedding_tier
+
     if storage is not None:
         # Snapshot before bulk_load — it resets the whole database,
         # embedding table included.
@@ -242,7 +264,7 @@ def run_pipeline(
             with timed_phase("Generating embeddings"):
                 from synaptiq.core.embeddings.embedder import embed_graph
 
-                embeddings = embed_graph(graph, previous=previous_embeddings)
+                embeddings = embed_graph(graph, tier=embedding_tier, previous=previous_embeddings)
                 if embeddings:
                     storage.store_embeddings(embeddings)
                 result.embeddings = len(embeddings)
@@ -367,6 +389,7 @@ def build_full_index(
     full: bool = True,
     skip_embeddings: bool = False,
     previous_embeddings: dict | None = None,
+    tier: str | None = None,
 ):
     """CPU phase of a full rebuild: pipeline + embeddings, no DB access.
 
@@ -384,18 +407,35 @@ def build_full_index(
     :func:`load_previous_embeddings`) lets the embed step reuse vectors
     for symbols whose text did not change.
 
+    *tier* is the embedding tier name to encode with. ``None`` (default)
+    re-derives it from ``repo_path/.synaptiq/meta.json`` via
+    :func:`~synaptiq.core.embeddings.embedder.tier_from_meta`: the daemon
+    rebuild paths that call this (the watcher's global phase, the primary's
+    socket ``reindex`` handler) have no per-cycle CLI flag to take it from,
+    so they must keep following whatever tier the index already claims
+    rather than drifting back to the default on every rebuild — the same
+    "re-derive from meta, don't guess" rule the lazy worker follows. Pass an
+    explicit tier to override (e.g. tests).
+
     Returns ``(graph, embeddings, result)``.  Shared by the watcher's
     global phase and the server-side reindex so the build/commit split
     has exactly one implementation.
     """
     graph, result = run_pipeline(repo_path, None, full=full)
 
+    resolved_tier = tier
+    if resolved_tier is None:
+        from synaptiq.core.embeddings.embedder import tier_from_meta
+
+        resolved_tier = tier_from_meta(repo_path / ".synaptiq").name
+    result.embedding_model = resolved_tier
+
     embeddings: list = []
     if not skip_embeddings:
         try:
             from synaptiq.core.embeddings.embedder import embed_graph
 
-            embeddings = embed_graph(graph, previous=previous_embeddings)
+            embeddings = embed_graph(graph, tier=resolved_tier, previous=previous_embeddings)
             result.embeddings = len(embeddings)
         except Exception:
             logger.warning(
@@ -434,6 +474,10 @@ def write_meta(data_dir: Path, repo_path: Path, result: PipelineResult) -> None:
             "dead_code": result.dead_code,
             "coupled_pairs": result.coupled_pairs,
             "embeddings": result.embeddings,
+            # Tier ("quality" / "fast") the stored vectors were encoded with
+            # (W4.4) — read back by tier_from_meta() so the query side and
+            # later rebuilds always match the model that produced them.
+            "embedding_model": result.embedding_model,
             "phase_timings": result.phase_timings,
         },
         "last_indexed_at": datetime.now(tz=timezone.utc).isoformat(),

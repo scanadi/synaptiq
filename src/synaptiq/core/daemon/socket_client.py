@@ -384,10 +384,28 @@ class SocketClient:
         """Forward a resource read to the primary daemon."""
         return await self._request("resource", {"uri": uri})
 
-    async def reindex(self, *, full: bool = True, skip_embeddings: bool = False) -> str:
-        """Request a full reindex from the primary daemon."""
+    async def reindex(
+        self,
+        *,
+        full: bool = True,
+        skip_embeddings: bool = False,
+        embedding_model: str | None = None,
+    ) -> str:
+        """Request a full reindex from the primary daemon.
+
+        *embedding_model* (a tier name, e.g. ``"quality"``/``"fast"``) is an
+        explicit override for this one request — the primary's own routine
+        watcher-triggered rebuilds always re-derive the tier from
+        ``meta.json`` instead (see ``pipeline.build_full_index``), since
+        those have no per-cycle flag to take an override from. ``None``
+        (default) lets the primary do the same self-derivation here too.
+        """
         return await self._request(
             "reindex",
-            {"full": full, "skip_embeddings": skip_embeddings},
+            {
+                "full": full,
+                "skip_embeddings": skip_embeddings,
+                "embedding_model": embedding_model,
+            },
             timeout=REINDEX_TIMEOUT,
         )

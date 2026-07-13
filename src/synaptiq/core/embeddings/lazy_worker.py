@@ -17,11 +17,12 @@ Lifecycle (one worker process)::
               │ held? → exit 0 (another worker is on it)
               ▼
             anchor = meta.last_indexed_at                       (staleness anchor)
+            tier   = meta.stats.embedding_model  (W4.4 — "quality"/"fast"; never a CLI arg)
               ▼
       ┌── open DB read-only → load_graph + snapshot vectors → CLOSE
       │     │ open fails (daemon holds it / corrupt) → abort quietly, never wipe
       │     ▼
-      │   encode (fastembed, polite thread cap) → embeddings_state.json per batch
+      │   encode (tier's model, polite thread cap) → embeddings_state.json per batch
       │     ▼
       │   meta.last_indexed_at changed since anchor?
       └────── yes → re-encode the newer graph (bounded) ; no ↓
@@ -338,10 +339,22 @@ def run_lazy_embedding_worker(repo_path: Path) -> int:
 
 def _encode_and_store(data_dir: Path, db_path: Path, started_at: str) -> None:
     """The staleness-guarded encode → store loop (holds the single-instance lock)."""
-    from synaptiq.core.embeddings.embedder import embed_graph, embeddable_node_count
+    from synaptiq.core.embeddings.embedder import (
+        embed_graph,
+        embeddable_node_count,
+        tier_from_meta,
+    )
 
     for generation in range(_MAX_GENERATIONS):
         anchor = _read_meta_timestamp(data_dir)  # (b) staleness anchor
+        # W4.4: re-derive the embedding tier from meta.json every generation
+        # rather than taking it as a CLI arg — this is a detached subprocess
+        # with no CLI args to take it from, and `analyze` already stamps the
+        # tier into meta.json (stats.embedding_model) before spawning this
+        # worker. Reading it alongside the staleness anchor means a racing
+        # `analyze --embedding-model` that changes tier mid-encode is picked
+        # up on the worker's next generation too, not just the timestamp.
+        tier = tier_from_meta(data_dir)
 
         loaded = _load_graph_and_previous(db_path)  # (c) read-only load, then close
         if loaded is None:
@@ -367,7 +380,9 @@ def _encode_and_store(data_dir: Path, db_path: Path, started_at: str) -> None:
         def _on_progress(done: int, tot: int) -> None:
             write_state(data_dir, "encoding", done=done, total=tot, started_at=started_at)
 
-        embeddings = embed_graph(graph, previous=previous, progress_callback=_on_progress)  # (d)
+        embeddings = embed_graph(
+            graph, tier=tier.name, previous=previous, progress_callback=_on_progress
+        )  # (d)
 
         # (e) Staleness guard: a newer analyze committed a fresh graph while we
         # encoded. Don't store stale vectors — re-encode the current graph.
