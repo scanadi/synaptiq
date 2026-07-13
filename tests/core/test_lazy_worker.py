@@ -555,3 +555,28 @@ class TestSpawn:
 
         monkeypatch.setattr(lazy_worker.subprocess, "Popen", boom)
         assert lazy_worker.spawn_lazy_worker(tmp_path) is None
+
+
+# ---------------------------------------------------------------------------
+# pid_alive (2.0.4, BUG 1 / BUG 3b)
+# ---------------------------------------------------------------------------
+
+
+class TestPidAlive:
+    def test_current_process_is_alive(self) -> None:
+        assert lazy_worker.pid_alive(os.getpid()) is True
+
+    def test_dead_pid_is_not_alive(self) -> None:
+        assert lazy_worker.pid_alive(99999999) is False  # very unlikely to be a real pid
+
+    def test_none_is_not_alive(self) -> None:
+        assert lazy_worker.pid_alive(None) is False
+
+    def test_non_int_is_not_alive(self) -> None:
+        assert lazy_worker.pid_alive("not-a-pid") is False
+
+    def test_zero_or_negative_is_not_alive(self) -> None:
+        assert lazy_worker.pid_alive(0) is False
+        assert lazy_worker.pid_alive(-5) is False
+
+

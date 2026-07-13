@@ -129,6 +129,53 @@ def read_state(data_dir: Path) -> dict | None:
         return None
 
 
+def pid_alive(pid: object) -> bool:
+    """Best-effort liveness probe for *pid* (2.0.4, BUG 1/3b).
+
+    Mirrors ``daemon.lock.LockInfo.is_stale``'s convention: a
+    ``ProcessLookupError`` means the process is gone; a ``PermissionError``
+    means it exists but this process can't signal it (treated as alive, same
+    as the primary/proxy lock file's own check). Anything else — a missing,
+    non-int, or non-positive pid — is treated as dead so a corrupt or absent
+    state-file pid can never wedge status reporting or the daemon self-heal.
+    """
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def stamp_inline_complete(data_dir: Path, count: int) -> None:
+    """Stamp ``embeddings_state.json`` complete after a successful INLINE
+    embed-store — i.e. any embed-then-store that does NOT go through
+    :func:`run_lazy_embedding_worker` (2.0.4, BUG 2).
+
+    Only the lazy worker used to write this file, so a synchronous embed —
+    ``analyze --embeddings sync``, the CLI lazy path when every vector was
+    already reused (nothing pending, so no worker gets spawned), or a
+    daemon/watcher global rebuild's synchronous embed — left whatever
+    ``deferred``/``failed``/``encoding`` sentinel a PRIOR lazy worker run had
+    written completely untouched, byte-identical, even though the vectors it
+    describes are long since superseded by the store that just succeeded.
+
+    Call this right after ``storage.store_embeddings(...)`` succeeds (or is
+    skipped because there was nothing new to store — everything was already
+    reused) on every path that embeds outside the lazy worker, so the
+    sentinel always reflects the store that actually just happened. *count*
+    is the total number of vectors now known-current (reused + freshly
+    encoded) — used for both ``done`` and ``total``, since there is no
+    "pending" concept left once this is called: the store already happened.
+    """
+    write_state(data_dir, "complete", done=count, total=count)
+
+
 def _read_meta_timestamp(data_dir: Path) -> str | None:
     """Return ``meta.json``'s ``last_indexed_at`` — the staleness anchor."""
     try:

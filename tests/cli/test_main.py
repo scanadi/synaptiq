@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -747,7 +748,12 @@ class TestStatus:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.chdir(tmp_path)
-        self._write_index(tmp_path, {"state": "encoding", "done": 12431, "total": 26203})
+        # A live pid (this test process itself) — a real state file always has
+        # one (write_state defaults it to os.getpid()); see the reconciliation
+        # tests below for the dead-pid "stalled" case this would otherwise hit.
+        self._write_index(
+            tmp_path, {"state": "encoding", "done": 12431, "total": 26203, "pid": os.getpid()}
+        )
         result = runner.invoke(app, ["status"])
         assert result.exit_code == 0
         assert "encoding 12,431/26,203" in _plain(result.output)
@@ -800,6 +806,88 @@ class TestStatus:
         result = runner.invoke(app, ["status"])
         assert "Embeddings:" in _plain(result.output)
         assert "17" in _plain(result.output)
+
+    # -----------------------------------------------------------------
+    # 2.0.4 (BUG 1): reconciliation against meta.json ground truth —
+    # field-verified: a dead worker's stale sentinel must never outrank a
+    # meta.json that has already caught up to what it was waiting for.
+    # -----------------------------------------------------------------
+
+    def test_status_reconciles_stale_deferred_when_meta_caught_up(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Empirical repro: state says `deferred` (dead pid, hours-old
+        updated_at) while meta.stats.embeddings == state.total — every
+        vector is actually present. Status must say complete, not lie."""
+        monkeypatch.chdir(tmp_path)
+        data_dir = self._write_index(
+            tmp_path,
+            {
+                "state": "deferred",
+                "detail": "index locked; re-run `synaptiq analyze` to encode",
+                "total": 42,
+                "pid": 99999999,
+                "updated_at": "2020-01-01T00:00:00+00:00",
+            },
+            embeddings=42,
+        )
+        result = runner.invoke(app, ["status"])
+        assert result.exit_code == 0
+        output = _plain(result.output)
+        assert "42 (complete)" in output
+        assert "deferred" not in output.lower()
+
+        # CLI-only self-heal: the stale sentinel is rewritten on disk too, so
+        # a later call (or the read-only MCP freshness reader) sees complete
+        # directly without needing to reconcile again.
+        state = json.loads((data_dir / "embeddings_state.json").read_text())
+        assert state["state"] == "complete"
+
+    def test_status_reconciles_stale_failed_when_meta_caught_up(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        self._write_index(
+            tmp_path,
+            {"state": "failed", "error": "onnx exploded", "total": 10},
+            embeddings=10,
+        )
+        result = runner.invoke(app, ["status"])
+        output = _plain(result.output)
+        assert "10 (complete)" in output
+        assert "onnx exploded" not in output
+
+    def test_status_reports_stalled_when_encoding_pid_dead_and_meta_short(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A dead worker frozen mid-encode must not show a progress line
+        that can never move again."""
+        monkeypatch.chdir(tmp_path)
+        self._write_index(
+            tmp_path,
+            {"state": "encoding", "done": 10, "total": 100, "pid": 99999999},
+            embeddings=10,
+        )
+        result = runner.invoke(app, ["status"])
+        output = _plain(result.output)
+        assert "stalled" in output
+        assert "encoding 10/100" not in output
+
+    def test_status_encoding_with_live_pid_and_short_meta_is_unchanged(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A worker genuinely still running must never be second-guessed —
+        unchanged behaviour even though meta hasn't caught up yet."""
+        monkeypatch.chdir(tmp_path)
+        self._write_index(
+            tmp_path,
+            {"state": "encoding", "done": 10, "total": 100, "pid": os.getpid()},
+            embeddings=10,
+        )
+        result = runner.invoke(app, ["status"])
+        output = _plain(result.output)
+        assert "encoding 10/100" in output
+        assert "stalled" not in output.lower()
 
 
 class TestListRepos:

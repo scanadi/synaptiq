@@ -758,15 +758,42 @@ def _format_embeddings_status(data_dir: Path, stats: dict) -> str | None:
     Prefers the live worker state file (``embeddings_state.json``); falls back
     to the stored count in ``meta.json``.  Returns ``None`` when there is
     nothing meaningful to show.
-    """
-    from synaptiq.core.embeddings.lazy_worker import read_state
 
+    2.0.4 (BUG 1): reconciles the state file against ``meta.json`` before
+    honoring a ``deferred``/``failed``/``encoding`` sentinel. A lazy worker
+    that died mid-store (or lost a lock race and was never retried far
+    enough — see ``_STORE_RETRY_BACKOFF``) can leave a state file that
+    permanently under-reports a graph whose vectors are, in fact, fully
+    present: every inline embed-store since (a sync analyze, a daemon's
+    synchronous rebuild, ...) keeps ``meta.json`` current regardless of what
+    that worker last wrote. So: once meta's stored count has caught up to
+    what the state file was waiting for, meta wins — the stale sentinel is
+    rewritten to ``complete`` here (self-healing the file for next time; safe
+    in this reader only — the MCP freshness reader stays strictly read-only).
+    A live ``encoding`` worker is left alone; a dead one reports ``stalled``
+    instead of a progress line frozen mid-run forever.
+    """
+    from synaptiq.core.embeddings.lazy_worker import pid_alive, read_state, stamp_inline_complete
+
+    meta_count = stats.get("embeddings", 0)
     state = read_state(data_dir)
     if state is not None:
         kind = state.get("state")
+        total = state.get("total", 0)
+        if (
+            kind in ("deferred", "failed", "encoding")
+            and isinstance(total, int)
+            and total > 0
+            and meta_count >= total
+        ):
+            # The vectors this run was waiting for are already in meta — a
+            # dead/losing worker's sentinel no longer describes reality.
+            stamp_inline_complete(data_dir, meta_count)
+            kind = "complete"
         if kind == "encoding":
             done = state.get("done", 0)
-            total = state.get("total", 0)
+            if not pid_alive(state.get("pid")) and meta_count < total:
+                return "[red]stalled[/red] (worker died; re-run `synaptiq analyze` to encode)"
             return f"encoding {done:,}/{total:,}"
         if kind == "complete":
             count = stats.get("embeddings", state.get("total", 0))
