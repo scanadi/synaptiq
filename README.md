@@ -668,7 +668,6 @@ Unix domain socket paths are limited to 104 bytes on macOS. When the `.synaptiq/
 | `IMPLEMENTS` | Class -> Interface it implements | — |
 | `MIXES_IN` | Class/Module -> Ruby module it mixes in (`include`/`extend`/`prepend`) | — |
 | `USES_TYPE` | Symbol -> Type it references | `role` (param/return/variable) |
-| `EXPORTS` | File -> Symbol it exports | — |
 | `MEMBER_OF` | Symbol -> Community it belongs to | — |
 | `STEP_IN_PROCESS` | Symbol -> Process it participates in | `step_number` |
 | `COUPLED_WITH` | File -> File that co-changes with it | `strength`, `co_changes` |
