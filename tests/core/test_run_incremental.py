@@ -18,6 +18,7 @@ from synaptiq.core.ingestion.incremental import (
 from synaptiq.core.ingestion.pipeline import (
     REASON_FORCED_FULL,
     REASON_NO_MANIFEST,
+    _count_manifest_symbols,
     run_incremental,
     run_pipeline,
     stamp_full_manifest,
@@ -84,8 +85,13 @@ def _full_index(root, tmp_path, name: str) -> LadybugBackend:
 
 _FRINGE = frozenset({NodeLabel.COMMUNITY, NodeLabel.PROCESS})
 _STRICT_EDGES = (
-    RelType.CONTAINS, RelType.DEFINES, RelType.IMPORTS,
-    RelType.EXTENDS, RelType.IMPLEMENTS, RelType.MIXES_IN, RelType.USES_TYPE,
+    RelType.CONTAINS,
+    RelType.DEFINES,
+    RelType.IMPORTS,
+    RelType.EXTENDS,
+    RelType.IMPLEMENTS,
+    RelType.MIXES_IN,
+    RelType.USES_TYPE,
 )
 
 
@@ -228,6 +234,52 @@ def test_repeated_incremental_keeps_manifest_complete(tmp_path):
         assert man.index.pending.applies_since_consolidation == 2
         assert man.index.pending.changed_files == 2
         assert man.index.pending.fts_dirty and man.index.pending.hnsw_dirty
+    finally:
+        backend.close()
+
+
+# ---------------------------------------------------------------------------
+# meta.json symbol count: full == incremental == graph truth (Bug 3 regression)
+# ---------------------------------------------------------------------------
+
+
+def test_meta_symbols_full_equals_incremental_with_monster_file(tmp_path):
+    """meta.symbols must be identical across a full build, an incremental apply,
+    and the in-memory graph truth — even with a 200+-symbol file whose manifest
+    row is exactly the one the pre-2.0.3 storage round trip used to truncate.
+
+    ``meta.symbols`` comes from ``result.symbols``: a label count over the graph
+    on the full path, and ``_count_manifest_symbols(new_manifest)`` on the
+    incremental path. If the persisted manifest lost a big file's provenance
+    (Bug 1), the incremental count would silently drop below the truth — and the
+    carry-forward rewrite would compound it. This pins them together."""
+    monster = "".join(f"def sym_{i:04d}(a, b, c):\n    return a + b + c\n\n\n" for i in range(240))
+    files = {"pkg/monster.py": monster, "pkg/models.py": _MODELS, **_fillers(6)}
+    root = _repo(tmp_path, files)
+
+    # Graph truth = exactly what the full path stamps into meta.symbols.
+    _full_graph, full_result = run_pipeline(root, None, skip_embeddings=True)
+    truth = full_result.symbols
+    assert truth > 200, "monster file alone contributes 240 symbols"
+
+    backend = _full_index(root, tmp_path, "meta_monster_db")
+    try:
+        # Full build's persisted manifest → the incremental counter must agree
+        # with the graph truth (proves the 240-symbol row survived write→read).
+        assert _count_manifest_symbols(backend.read_manifest()) == truth
+
+        # Incremental apply touching only a SMALL file: the monster row is
+        # carried forward untouched. A body-only edit changes no symbol count.
+        _write(root, "pkg/f0.py", "def fn0():\n    return 0  # edit\n")
+        outcome = run_incremental(root, backend, tool_version="test")
+        assert not outcome.full_rebuild_required
+        assert outcome.new_manifest is not None
+        assert _count_manifest_symbols(outcome.new_manifest) == truth
+        assert _count_manifest_symbols(backend.read_manifest()) == truth
+
+        # A second (no-change) apply keeps the count stable — no compounding loss.
+        run_incremental(root, backend, tool_version="test")
+        assert _count_manifest_symbols(backend.read_manifest()) == truth
     finally:
         backend.close()
 

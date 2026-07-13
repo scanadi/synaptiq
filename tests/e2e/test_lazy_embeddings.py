@@ -277,12 +277,21 @@ class TestLazyCrossRebuildReuse:
                 storage.close()
 
             # The background worker (handling the small delta) finishes and
-            # settles the index at the new, larger total.
+            # settles the index at the new, larger total. Its progress state
+            # reports the PENDING delta it actually encoded (here: util.py's
+            # FILE node, whose `defines:` list changed, plus the brand-new
+            # function) — NOT the full embeddable count. Before the 2.0.3
+            # honest-progress fix this showed "encoding 0/<full count>" for a
+            # tiny delta; `first_total` (a cold start, nothing reusable) keeps
+            # pending == full count, so its meaning above is unchanged.
             state = _poll_state(data_dir, expect_pid=spawned_pids[1])
             assert state is not None, "worker never published a state file"
             worker_pid = state.get("pid", worker_pid)
             assert state["state"] == "complete", state
-            assert state["total"] == state["done"] == first_total + 1
+            assert state["total"] == state["done"]
+            assert 0 < state["total"] < first_total, (
+                "worker progress must report the pending delta, not the full embeddable count"
+            )
 
             storage = LadybugBackend()
             storage.initialize(data_dir / "kuzu", read_only=True)

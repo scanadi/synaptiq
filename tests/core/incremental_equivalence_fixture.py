@@ -316,6 +316,13 @@ def _seed_leaves() -> dict[str, Leaf]:
     # Ruby.
     add(Leaf("rb", "prov_r", ["Fn0", "Fn1"], salt=1))
     add(Leaf("rb", "cons_r", ["Fn2"], salt=1, calls=[("rb/prov_r.rb", "Fn0")]))
+    # A "monster" module: 200 symbols in one file, so its single FileManifest
+    # row is by far the largest in the corpus — the exact shape the pre-2.0.3
+    # storage round trip silently truncated. It rides every build and is carried
+    # forward across edit steps, so the persisted-manifest provenance assertion
+    # (assert_manifest_provenance) exercises a large row surviving write -> read
+    # on every step of the equivalence run.
+    add(Leaf("py", "monster", [f"Fn{i}" for i in range(200)], salt=1))
     return leaves
 
 
