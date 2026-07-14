@@ -19,10 +19,15 @@ external ``AsyncRWLock``.
 from __future__ import annotations
 
 import csv
+import fcntl
 import hashlib
 import json
 import logging
+import os
 import shutil
+import signal
+import subprocess
+import sys
 import tempfile
 import threading
 import warnings
@@ -228,6 +233,120 @@ _INDEX_MANIFEST_DDL = (
 # Maximum number of read connections to keep in the pool.
 _MAX_POOL_SIZE = 8
 
+_WAL_PROBE_TIMEOUT_SECONDS = 30
+_WAL_PROBE_EXCEPTION_EXIT = 70
+_WAL_RECOVERY_FAILED_SUFFIX = ".wal-recovery-failed"
+_WAL_RECOVERY_LOCK_SUFFIX = ".wal-recovery.lock"
+_WAL_PROBE_SCRIPT = f"""
+import json
+import sys
+
+import ladybug
+
+try:
+    database = ladybug.Database(sys.argv[1])
+    database.close()
+except BaseException as exc:
+    print(json.dumps({{"type": type(exc).__name__, "message": str(exc)}}))
+    raise SystemExit({_WAL_PROBE_EXCEPTION_EXIT})
+"""
+
+
+class NativeWALRecoveryError(RuntimeError):
+    """LadybugDB crashed while replaying an orphan write-ahead log."""
+
+
+@contextmanager
+def _wal_recovery_lock(db_path: Path) -> Iterator[None]:
+    """Serialize WAL probes across CLI processes for one database."""
+    lock_path = Path(str(db_path) + _WAL_RECOVERY_LOCK_SUFFIX)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _probe_wal_recovery(db_path: Path) -> None:
+    """Contain native crashes while LadybugDB replays an orphan WAL.
+
+    LadybugDB normally removes ``.wal`` after a successful checkpoint. An
+    orphan WAL therefore needs replay on the next open, and a malformed replay
+    can terminate the interpreter with SIGSEGV before Python can catch an
+    exception. The child contains that failure. A marker prevents concurrent
+    CLI readers from each repeating the same native crash while the recovery
+    wrapper removes the derived index.
+    """
+    wal_path = Path(str(db_path) + ".wal")
+    failed_path = Path(str(db_path) + _WAL_RECOVERY_FAILED_SUFFIX)
+    if not wal_path.exists() and not failed_path.exists():
+        return
+
+    with _wal_recovery_lock(db_path):
+        if failed_path.exists():
+            raise NativeWALRecoveryError(f"LadybugDB previously crashed while replaying {wal_path}")
+        if not wal_path.exists():
+            return
+
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", _WAL_PROBE_SCRIPT, str(db_path)],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=_WAL_PROBE_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"Timed out while checking write-ahead log recovery for {db_path}; "
+                "the index was left untouched"
+            ) from exc
+        except OSError as exc:
+            raise RuntimeError(
+                f"Could not start write-ahead log recovery check for {db_path}; "
+                "the index was left untouched"
+            ) from exc
+
+        if result.returncode == 0:
+            failed_path.unlink(missing_ok=True)
+            return
+
+        access_violation_codes = {-1073741819, 3221225477}
+        if result.returncode == -signal.SIGSEGV or result.returncode in access_violation_codes:
+            try:
+                failed_path.write_text(
+                    json.dumps({"returncode": result.returncode}), encoding="utf-8"
+                )
+            except OSError:
+                logger.warning("Could not persist WAL recovery failure marker", exc_info=True)
+            raise NativeWALRecoveryError(
+                f"LadybugDB crashed while replaying {wal_path} (return code {result.returncode})"
+            )
+
+        if result.returncode < 0:
+            raise RuntimeError(
+                f"Write-ahead log recovery check for {db_path} was terminated by "
+                f"signal {-result.returncode}; the index was left untouched"
+            )
+
+        payload: dict[str, Any] = {}
+        output_lines = [line for line in result.stdout.splitlines() if line.strip()]
+        if output_lines:
+            try:
+                parsed = json.loads(output_lines[-1])
+                if isinstance(parsed, dict):
+                    payload = parsed
+            except json.JSONDecodeError:
+                pass
+        message = str(payload.get("message") or "LadybugDB WAL recovery probe failed")
+        if payload.get("type") == "IndexError":
+            raise IndexError(message)
+        raise RuntimeError(message)
+
 
 def is_lock_error(exc: BaseException) -> bool:
     """True for a LadybugDB file-lock conflict — another live process owns the DB.
@@ -275,7 +394,7 @@ def is_recoverable_corruption(exc: BaseException) -> bool:
     * ``"Database path cannot be a directory"`` — an index directory written by
       the former KuzuDB backend (LadybugDB uses a single-file format).
     """
-    if isinstance(exc, IndexError):
+    if isinstance(exc, (IndexError, NativeWALRecoveryError)):
         return True
     msg = str(exc).lower()
     return any(sig in msg for sig in _RECOVERABLE_CORRUPTION_SIGNATURES)
@@ -296,6 +415,7 @@ def open_with_recovery(
 
     * corruption from a mid-write kill (duplicate primary key, partial file),
     * a stale-WAL / partially written read (``unordered_map::at`` → IndexError),
+    * a native crash during WAL replay, isolated in a child process,
     * an index directory left behind by the former **KuzuDB** backend —
       LadybugDB uses a single-file on-disk format and rejects a directory path
       with "Database path cannot be a directory", so an upgraded install
@@ -455,6 +575,7 @@ class LadybugBackend:
 
         limits = current_limits()
         self._db_path = path
+        _probe_wal_recovery(path)
         # 0 for either cap means the engine's library default (all cores /
         # default buffer pool) — the interactive profile resolves to that.
         self._db = ladybug.Database(
@@ -1661,7 +1782,7 @@ class LadybugBackend:
             db_path.unlink(missing_ok=True)
         # str-concat, not with_suffix: the path may already carry a suffix
         # (e.g. a ``.rebuild`` swap file) that with_suffix would replace.
-        for suffix in (".wal", ".shadow"):
+        for suffix in (".wal", ".shadow", _WAL_RECOVERY_FAILED_SUFFIX):
             Path(str(db_path) + suffix).unlink(missing_ok=True)
 
     def bulk_load(self, graph: KnowledgeGraph) -> None:
@@ -2435,7 +2556,7 @@ class LadybugBackend:
         stmt = (
             f"CREATE (m:{_MANIFEST_FILE_TABLE} {{path: $path, content_sha: $content_sha, "
             "language: $language, symbol_ids: $symbol_ids, symbol_sigs: $symbol_sigs, "
-            "out_edges: $out_edges, unresolved_imports: $unresolved_imports}})"
+            "out_edges: $out_edges, unresolved_imports: $unresolved_imports})"
         )
         for row in rows:
             self._conn.execute(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -156,6 +157,28 @@ class TestAnalyzeProfile:
         meta = json.loads((repo / ".synaptiq" / "meta.json").read_text())
         assert "phase_timings" in meta["stats"]
         assert "Walking files" in meta["stats"]["phase_timings"]
+
+
+class TestAnalyzeResourceCleanup:
+    def test_incremental_early_return_closes_storage(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The incremental fast path checkpoints before releasing its lock."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        storage = MagicMock()
+        outcome = MagicMock(full_rebuild_required=False)
+
+        monkeypatch.setattr(
+            "synaptiq.core.storage.ladybug_backend.open_with_recovery",
+            lambda *args, **kwargs: storage,
+        )
+        monkeypatch.setattr("synaptiq.cli.main._run_analyze_incremental", lambda *a, **k: outcome)
+
+        result = runner.invoke(app, ["analyze", str(repo), "--embeddings", "off"])
+
+        assert result.exit_code == 0, result.output
+        storage.close.assert_called_once_with()
 
 
 class TestAnalyzeJobsFlag:
@@ -1027,6 +1050,31 @@ class TestQuery:
         result = runner.invoke(app, ["query", "find classes"])
         assert result.exit_code == 1
         assert "No index found" in _plain(result.output)
+
+    def test_query_contains_native_wal_crash_and_requests_rebuild(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A corrupt WAL produces an actionable exit, not process code 139."""
+        monkeypatch.chdir(tmp_path)
+        data_dir = tmp_path / ".synaptiq"
+        data_dir.mkdir()
+        db = data_dir / "kuzu"
+        db.write_bytes(b"checkpoint")
+        (data_dir / "kuzu.wal").write_bytes(b"corrupt wal")
+        (data_dir / "meta.json").write_text("{}", encoding="utf-8")
+
+        probe_result = MagicMock(returncode=-signal.SIGSEGV, stdout="", stderr="")
+        monkeypatch.setattr(
+            "synaptiq.core.storage.ladybug_backend.subprocess.run",
+            lambda *args, **kwargs: probe_result,
+        )
+
+        result = runner.invoke(app, ["query", "find classes"])
+
+        assert result.exit_code == 1
+        assert "Run 'synaptiq analyze' to rebuild it" in _plain(result.output)
+        assert not db.exists()
+        assert not (data_dir / "meta.json").exists()
 
     def test_query_with_storage(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Query should call handle_query with loaded storage."""

@@ -289,7 +289,7 @@ def _print_phase_timing_table(phase_timings: dict, total_seconds: float) -> None
 
 def _load_storage(repo_path: Path | None = None) -> "LadybugBackend":  # noqa: F821
     """Load the LadybugDB backend for the given or current repo."""
-    from synaptiq.core.storage.ladybug_backend import LadybugBackend, is_lock_error
+    from synaptiq.core.storage.ladybug_backend import is_lock_error, open_with_recovery
 
     target = (repo_path or Path.cwd()).resolve()
     # The on-disk index path is kept as ``.synaptiq/kuzu`` deliberately: an
@@ -303,9 +303,12 @@ def _load_storage(repo_path: Path | None = None) -> "LadybugBackend":  # noqa: F
         )
         raise typer.Exit(code=1)
 
-    storage = LadybugBackend()
     try:
-        storage.initialize(db_path, read_only=True)
+        storage = open_with_recovery(
+            db_path,
+            target / ".synaptiq" / "meta.json",
+            read_only=True,
+        )
     except RuntimeError as exc:
         if is_lock_error(exc):
             console.print(
@@ -578,6 +581,7 @@ def analyze(
             )
             raise typer.Exit(code=1)
 
+    storage = None
     try:
         console.print(f"[bold]Indexing[/bold] {repo_path}")
 
@@ -700,6 +704,7 @@ def analyze(
         # Release the DB handle BEFORE spawning the worker so its read-only open
         # (to load the graph) never collides with this process's write handle.
         storage.close()
+        storage = None
 
         if mode is EmbeddingsMode.lazy:
             if pending_embeddings > 0:
@@ -737,7 +742,11 @@ def analyze(
                     "nothing to encode."
                 )
     finally:
-        lock_mgr.release()
+        try:
+            if storage is not None:
+                storage.close()
+        finally:
+            lock_mgr.release()
 
 
 @app.command(name="_embed-worker", hidden=True)

@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import signal
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -408,7 +412,12 @@ class TestRecoveryAndRebuildSafety:
         the fresh file by the engine and corrupts it (unordered_map::at).
         """
         db = tmp_path / "kuzu.rebuild"
-        for p in (db, Path(str(db) + ".wal"), Path(str(db) + ".shadow")):
+        for p in (
+            db,
+            Path(str(db) + ".wal"),
+            Path(str(db) + ".shadow"),
+            Path(str(db) + ".wal-recovery-failed"),
+        ):
             p.write_bytes(b"x")
 
         LadybugBackend._remove_db_files(db)
@@ -416,6 +425,102 @@ class TestRecoveryAndRebuildSafety:
         assert not db.exists()
         assert not Path(str(db) + ".wal").exists()
         assert not Path(str(db) + ".shadow").exists()
+        assert not Path(str(db) + ".wal-recovery-failed").exists()
+
+    def test_native_wal_sigsegv_is_contained_and_rebuilt(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A native WAL replay crash kills only the probe, then rebuilds."""
+        from synaptiq.core.storage.ladybug_backend import open_with_recovery
+
+        db = tmp_path / "kuzu"
+        wal = tmp_path / "kuzu.wal"
+        meta = tmp_path / "meta.json"
+        db.write_bytes(b"checkpoint")
+        wal.write_bytes(b"corrupt wal")
+        meta.write_text("{}", encoding="utf-8")
+
+        monkeypatch.setattr(
+            "synaptiq.core.storage.ladybug_backend.subprocess.run",
+            lambda *args, **kwargs: subprocess.CompletedProcess(
+                args=args, returncode=-signal.SIGSEGV, stdout="", stderr=""
+            ),
+        )
+
+        storage = open_with_recovery(db, meta, build_fts_indexes=False)
+        try:
+            assert storage._db is not None
+        finally:
+            storage.close()
+        assert db.exists()
+        assert not wal.exists()
+        assert not meta.exists()
+        assert not Path(str(db) + ".wal-recovery-failed").exists()
+
+    def test_valid_orphan_wal_is_checkpointed_by_probe(self, tmp_path: Path) -> None:
+        """The child completes valid recovery so the parent opens without a WAL."""
+        from synaptiq.core.storage import ladybug_backend
+
+        db = tmp_path / "kuzu"
+        database = ladybug_backend.ladybug.Database(str(db))
+        connection = ladybug_backend.ladybug.Connection(database)
+        connection.execute("CREATE NODE TABLE Item(id STRING, PRIMARY KEY(id))")
+        connection.close()
+        database.close()
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import ladybug, os, sys; "
+                    "db = ladybug.Database(sys.argv[1]); "
+                    "connection = ladybug.Connection(db); "
+                    'connection.execute(\"CREATE (n:Item {id: \\\"one\\\"})\"); '
+                    "os._exit(0)"
+                ),
+                str(db),
+            ],
+            check=False,
+        )
+        assert result.returncode == 0
+        wal = Path(str(db) + ".wal")
+        assert wal.exists()
+
+        ladybug_backend._probe_wal_recovery(db)
+
+        assert not wal.exists()
+
+    def test_native_wal_lock_error_never_wipes_live_index(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A probe blocked by a live writer preserves every index artifact."""
+        from synaptiq.core.storage.ladybug_backend import open_with_recovery
+
+        db = tmp_path / "kuzu"
+        wal = tmp_path / "kuzu.wal"
+        meta = tmp_path / "meta.json"
+        db.write_bytes(b"checkpoint")
+        wal.write_bytes(b"pending")
+        meta.write_text("{}", encoding="utf-8")
+        message = "Could not set lock on file. Lock is held by PID 999."
+
+        monkeypatch.setattr(
+            "synaptiq.core.storage.ladybug_backend.subprocess.run",
+            lambda *args, **kwargs: subprocess.CompletedProcess(
+                args=args,
+                returncode=70,
+                stdout=json.dumps({"type": "RuntimeError", "message": message}),
+                stderr="",
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="Lock is held"):
+            open_with_recovery(db, meta, read_only=True)
+
+        assert db.exists()
+        assert wal.exists()
+        assert meta.exists()
 
     def test_open_with_recovery_handles_native_map_error(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
