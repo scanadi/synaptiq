@@ -2,6 +2,8 @@
 
 **Graph-powered code intelligence engine** — indexes your codebase into a knowledge graph and exposes it via MCP tools for AI agents and a CLI for developers.
 
+[![Synaptiq MCP server](https://mcprush.com/badge/synaptiq-mcp/card.svg)](https://mcprush.com/to/synaptiq-mcp?ref=badge)
+
 [![PyPI version](https://img.shields.io/pypi/v/synaptiq)](https://pypi.org/project/synaptiq/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://pypi.org/project/synaptiq/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
